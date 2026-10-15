@@ -1,0 +1,364 @@
+use std::sync::Arc;
+use tauri::State;
+
+use crate::db::models::{AddDownloadRequest, AppSettings, DownloadTask, SiteCredential, UrlProbeResult};
+use crate::engine::manager::DownloadManager;
+use crate::engine::probe::probe_url;
+
+pub type AppState = Arc<DownloadManager>;
+
+#[tauri::command]
+pub async fn probe_url_cmd(state: State<'_, AppState>, url: String) -> Result<UrlProbeResult, String> {
+    let client = crate::engine::create_http_client(std::time::Duration::from_secs(15));
+
+    let probe = probe_url(&client, &url).await?;
+    let settings = state.get_settings();
+
+    Ok(UrlProbeResult {
+        url: probe.url,
+        filename: probe.filename,
+        total_bytes: probe.total_bytes,
+        resumable: probe.resumable,
+        mime_type: probe.mime_type,
+        category: probe.category,
+        default_destination: settings.default_destination,
+    })
+}
+
+#[tauri::command]
+pub async fn add_download_cmd(
+    state: State<'_, AppState>,
+    req: AddDownloadRequest,
+) -> Result<DownloadTask, String> {
+    state.add_download(req).await
+}
+
+#[tauri::command]
+pub async fn batch_add_downloads_cmd(
+    state: State<'_, AppState>,
+    reqs: Vec<AddDownloadRequest>,
+) -> Result<Vec<DownloadTask>, String> {
+    let mut tasks = Vec::new();
+    for req in reqs {
+        match state.add_download(req).await {
+            Ok(task) => tasks.push(task),
+            Err(e) => log::error!("Failed to add batch item: {e}"),
+        }
+    }
+    Ok(tasks)
+}
+
+#[tauri::command]
+pub async fn pause_download_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.pause_download(&id)
+}
+
+#[tauri::command]
+pub async fn resume_download_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.resume_download(&id).await
+}
+
+#[tauri::command]
+pub async fn retry_download_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.retry_download(&id).await
+}
+
+#[tauri::command]
+pub async fn cancel_download_cmd(
+    state: State<'_, AppState>,
+    id: String,
+    delete_file: bool,
+) -> Result<(), String> {
+    state.cancel_download(&id, delete_file)
+}
+
+#[tauri::command]
+pub async fn delete_download_cmd(
+    state: State<'_, AppState>,
+    id: String,
+    delete_file: bool,
+) -> Result<(), String> {
+    state.delete_download(&id, delete_file)
+}
+
+#[tauri::command]
+pub async fn get_all_downloads_cmd(
+    state: State<'_, AppState>,
+) -> Result<Vec<DownloadTask>, String> {
+    state.get_all_downloads()
+}
+
+#[tauri::command]
+pub async fn get_download_cmd(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<DownloadTask>, String> {
+    state.get_download(&id)
+}
+
+#[tauri::command]
+pub async fn get_settings_cmd(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    Ok(state.get_settings())
+}
+
+#[tauri::command]
+pub async fn update_settings_cmd(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<(), String> {
+    state.save_settings(&settings)
+}
+
+#[tauri::command]
+pub async fn open_file_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.open_file(&id)
+}
+
+#[tauri::command]
+pub async fn reveal_file_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.reveal_file(&id)
+}
+
+#[tauri::command]
+pub async fn get_default_download_dir_cmd() -> Result<String, String> {
+    dirs::download_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not determine Downloads directory".to_string())
+}
+
+#[tauri::command]
+pub async fn verify_checksum_cmd(
+    state: State<'_, AppState>,
+    id: String,
+    algorithm: String,
+    expected: Option<String>,
+) -> Result<crate::db::models::ChecksumResult, String> {
+    let task = state
+        .get_download(&id)?
+        .ok_or_else(|| "Download task not found".to_string())?;
+
+    let path = std::path::Path::new(&task.destination_path).join(&task.filename);
+    if !path.exists() {
+        return Err("Downloaded file does not exist on disk".to_string());
+    }
+
+    crate::engine::verify_file_checksum(&path, &algorithm, expected.as_deref())
+}
+
+#[tauri::command]
+pub async fn calculate_file_hash_cmd(
+    file_path: String,
+    algorithm: String,
+) -> Result<crate::db::models::ChecksumResult, String> {
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Err("File does not exist on disk".to_string());
+    }
+    crate::engine::verify_file_checksum(path, &algorithm, None)
+}
+
+#[tauri::command]
+pub async fn get_curl_command_cmd(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let task = state
+        .get_download(&id)?
+        .ok_or_else(|| "Download not found".to_string())?;
+
+    let mut curl = format!("curl -C - -L -o \"{}\"", task.filename);
+    if let Some(ref ua) = task.user_agent {
+        curl.push_str(&format!(" -A \"{}\"", ua));
+    }
+    if let Some(ref ref_url) = task.referer {
+        curl.push_str(&format!(" -e \"{}\"", ref_url));
+    }
+    curl.push_str(&format!(" \"{}\"", task.url));
+    Ok(curl)
+}
+
+#[tauri::command]
+pub async fn export_downloads_cmd(state: State<'_, AppState>) -> Result<String, String> {
+    let all = state.get_all_downloads()?;
+    serde_json::to_string_pretty(&all).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_site_credentials_cmd(
+    state: State<'_, AppState>,
+) -> Result<Vec<SiteCredential>, String> {
+    state.get_all_site_credentials()
+}
+
+#[tauri::command]
+pub async fn save_site_credential_cmd(
+    state: State<'_, AppState>,
+    cred: SiteCredential,
+) -> Result<(), String> {
+    state.save_site_credential(cred)
+}
+
+#[tauri::command]
+pub async fn delete_site_credential_cmd(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    state.delete_site_credential(&id)
+}
+
+#[tauri::command]
+pub async fn export_checksum_file_cmd(
+    state: State<'_, AppState>,
+    id: String,
+    algorithm: String,
+) -> Result<String, String> {
+    let task = state
+        .get_download(&id)?
+        .ok_or_else(|| "Download task not found".to_string())?;
+
+    let file_path = std::path::Path::new(&task.destination_path).join(&task.filename);
+    if !file_path.exists() {
+        return Err("Downloaded file does not exist on disk".to_string());
+    }
+
+    let (sha256, md5) = crate::engine::compute_checksums(&file_path)
+        .map_err(|e| format!("Failed to compute checksums: {e}"))?;
+
+    let algo_lower = algorithm.to_lowercase();
+    let (hash, ext) = if algo_lower == "md5" {
+        (md5, "md5")
+    } else {
+        (sha256, "sha256")
+    };
+
+    let target_checksum_path = std::path::Path::new(&task.destination_path).join(format!("{}.{}", task.filename, ext));
+    let content = format!("{} *{}\n", hash, task.filename);
+    std::fs::write(&target_checksum_path, content)
+        .map_err(|e| format!("Failed to write checksum file: {e}"))?;
+
+    Ok(target_checksum_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, String> {
+    let trimmed = curl.trim();
+    if !trimmed.starts_with("curl") {
+        return Err("Command must start with 'curl'".to_string());
+    }
+
+    let mut url: Option<String> = None;
+    let mut filename: Option<String> = None;
+    let mut user_agent: Option<String> = None;
+    let mut referer: Option<String> = None;
+    let mut custom_proxy_url: Option<String> = None;
+    let mut proxy_mode: Option<String> = None;
+
+    let tokens = tokenize_command(trimmed);
+    let mut iter = tokens.into_iter().peekable();
+    let _ = iter.next(); // Skip 'curl'
+
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "-H" | "--header" => {
+                if let Some(header_val) = iter.next() {
+                    let mut parts = header_val.splitn(2, ':');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        let key = k.trim().to_lowercase();
+                        let val = v.trim().to_string();
+                        if key == "user-agent" {
+                            user_agent = Some(val);
+                        } else if key == "referer" {
+                            referer = Some(val);
+                        }
+                    }
+                }
+            }
+            "-A" | "--user-agent" => {
+                user_agent = iter.next();
+            }
+            "-e" | "--referer" => {
+                referer = iter.next();
+            }
+            "-o" | "--output" => {
+                filename = iter.next();
+            }
+            "-x" | "--proxy" => {
+                custom_proxy_url = iter.next();
+                proxy_mode = Some("custom".to_string());
+            }
+            "--url" => {
+                url = iter.next();
+            }
+            arg => {
+                if (arg.starts_with("http://") || arg.starts_with("https://")) && url.is_none() {
+                    url = Some(arg.to_string());
+                }
+            }
+        }
+    }
+
+    let final_url = url.ok_or_else(|| "Could not find a valid HTTP/HTTPS URL in the curl command".to_string())?;
+
+    Ok(AddDownloadRequest {
+        url: final_url,
+        filename,
+        destination_path: None,
+        connections: None,
+        speed_limit: None,
+        priority: None,
+        scheduled_time: None,
+        user_agent,
+        referer,
+        custom_headers: None,
+        expected_checksum: None,
+        mirrors: None,
+        min_chunk_size: None,
+        proxy_mode,
+        custom_proxy_url,
+    })
+}
+
+fn tokenize_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for c in cmd.chars() {
+        if escape {
+            current.push(c);
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if c.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(current);
+                current = String::new();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[tauri::command]
+pub async fn grab_page_links_cmd(url: String) -> Result<Vec<crate::grabber_server::GrabbedLink>, String> {
+    crate::grabber_server::extract_links_from_page(&url).await
+}

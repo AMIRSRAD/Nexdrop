@@ -1,0 +1,43 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Nexdrop",
+  "version": "0.1.0",
+  "identifier": "com.nexdrop.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": null,
+    "beforeDevCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Nexdrop",
+        "url": "index.html",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 840,
+        "minHeight": 560,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-bypass-list=\"<-loopback>;<local>;localhost;127.0.0.1;*.localhost;tauri.localhost\""
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

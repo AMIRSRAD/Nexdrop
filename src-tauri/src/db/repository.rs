@@ -1,0 +1,707 @@
+use rusqlite::{params, Connection, Result};
+use std::path::Path;
+use crate::db::models::{AppSettings, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, SiteCredential};
+
+pub struct Repository;
+
+impl Repository {
+    pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Connection> {
+        if let Some(parent) = path.as_ref().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;"
+        )?;
+        Self::create_tables(&conn)?;
+        Ok(conn)
+    }
+
+    pub fn create_tables(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS downloads (
+                id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                final_url TEXT,
+                filename TEXT NOT NULL,
+                destination_path TEXT NOT NULL,
+                temp_path TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                resumable INTEGER NOT NULL DEFAULT 0,
+                etag TEXT,
+                last_modified TEXT,
+                mime_type TEXT,
+                category TEXT NOT NULL,
+                connections INTEGER NOT NULL DEFAULT 1,
+                speed_limit INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
+                speed_bps INTEGER NOT NULL DEFAULT 0,
+                eta_seconds INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                error_message TEXT,
+                scheduled_time INTEGER,
+                checksum_sha256 TEXT,
+                checksum_md5 TEXT,
+                user_agent TEXT,
+                referer TEXT,
+                mirrors TEXT,
+                min_chunk_size INTEGER NOT NULL DEFAULT 1048576,
+                proxy_mode TEXT,
+                custom_proxy_url TEXT,
+                antivirus_status TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
+            CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                download_id TEXT NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
+                segment_index INTEGER NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                UNIQUE(download_id, segment_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_segments_download_id ON segments(download_id);
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS site_credentials (
+                id TEXT PRIMARY KEY,
+                domain TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT,
+                token TEXT,
+                notes TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_site_credentials_domain ON site_credentials(domain);"
+        )?;
+
+        // Run non-destructive column additions for existing databases
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN checksum_sha256 TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN checksum_md5 TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN user_agent TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN referer TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN mirrors TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN min_chunk_size INTEGER DEFAULT 1048576", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN proxy_mode TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN custom_proxy_url TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN antivirus_status TEXT", []);
+
+        Ok(())
+    }
+
+    pub fn save_download(conn: &Connection, task: &DownloadTask) -> Result<()> {
+        conn.execute(
+            "INSERT INTO downloads (
+                id, url, final_url, filename, destination_path, temp_path,
+                total_bytes, downloaded_bytes, status, resumable, etag,
+                last_modified, mime_type, category, connections, speed_limit,
+                priority, speed_bps, eta_seconds, created_at, updated_at,
+                completed_at, error_message, scheduled_time, checksum_sha256,
+                checksum_md5, user_agent, referer, mirrors, min_chunk_size,
+                proxy_mode, custom_proxy_url, antivirus_status
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21,
+                ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+                ?29, ?30, ?31, ?32, ?33
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                final_url = excluded.final_url,
+                filename = excluded.filename,
+                destination_path = excluded.destination_path,
+                temp_path = excluded.temp_path,
+                total_bytes = excluded.total_bytes,
+                downloaded_bytes = excluded.downloaded_bytes,
+                status = excluded.status,
+                resumable = excluded.resumable,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                mime_type = excluded.mime_type,
+                category = excluded.category,
+                connections = excluded.connections,
+                speed_limit = excluded.speed_limit,
+                priority = excluded.priority,
+                speed_bps = excluded.speed_bps,
+                eta_seconds = excluded.eta_seconds,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at,
+                error_message = excluded.error_message,
+                scheduled_time = excluded.scheduled_time,
+                checksum_sha256 = excluded.checksum_sha256,
+                checksum_md5 = excluded.checksum_md5,
+                user_agent = excluded.user_agent,
+                referer = excluded.referer,
+                mirrors = excluded.mirrors,
+                min_chunk_size = excluded.min_chunk_size,
+                proxy_mode = excluded.proxy_mode,
+                custom_proxy_url = excluded.custom_proxy_url,
+                antivirus_status = excluded.antivirus_status;",
+            params![
+                task.id,
+                task.url,
+                task.final_url,
+                task.filename,
+                task.destination_path,
+                task.temp_path,
+                task.total_bytes,
+                task.downloaded_bytes,
+                task.status.as_str(),
+                if task.resumable { 1 } else { 0 },
+                task.etag,
+                task.last_modified,
+                task.mime_type,
+                task.category.as_str(),
+                task.connections as i64,
+                task.speed_limit as i64,
+                task.priority,
+                task.speed_bps as i64,
+                task.eta_seconds.map(|e| e as i64),
+                task.created_at,
+                task.updated_at,
+                task.completed_at,
+                task.error_message,
+                task.scheduled_time,
+                task.checksum_sha256,
+                task.checksum_md5,
+                task.user_agent,
+                task.referer,
+                serde_json::to_string(&task.mirrors).unwrap_or_else(|_| "[]".to_string()),
+                task.min_chunk_size as i64,
+                task.proxy_mode,
+                task.custom_proxy_url,
+                task.antivirus_status,
+            ],
+        )?;
+
+        if !task.segments.is_empty() {
+            Self::save_segments(conn, &task.id, &task.segments)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn update_progress(
+        conn: &Connection,
+        id: &str,
+        downloaded_bytes: i64,
+        status: DownloadStatus,
+        speed_bps: u64,
+        eta_seconds: Option<u64>,
+        now: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads 
+             SET downloaded_bytes = ?1, status = ?2, speed_bps = ?3, eta_seconds = ?4, updated_at = ?5 
+             WHERE id = ?6",
+            params![
+                downloaded_bytes,
+                status.as_str(),
+                speed_bps as i64,
+                eta_seconds.map(|e| e as i64),
+                now,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_status(
+        conn: &Connection,
+        id: &str,
+        status: DownloadStatus,
+        error_message: Option<&str>,
+        completed_at: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads 
+             SET status = ?1, error_message = ?2, completed_at = ?3, speed_bps = 0, eta_seconds = NULL, updated_at = ?4 
+             WHERE id = ?5",
+            params![
+                status.as_str(),
+                error_message,
+                completed_at,
+                now,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_segments(conn: &Connection, download_id: &str, segments: &[DownloadSegment]) -> Result<()> {
+        for seg in segments {
+            conn.execute(
+                "INSERT INTO segments (download_id, segment_index, start_byte, end_byte, downloaded_bytes, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(download_id, segment_index) DO UPDATE SET
+                    downloaded_bytes = excluded.downloaded_bytes,
+                    status = excluded.status;",
+                params![
+                    download_id,
+                    seg.segment_index as i64,
+                    seg.start_byte as i64,
+                    seg.end_byte as i64,
+                    seg.downloaded_bytes as i64,
+                    seg.status
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_segments(conn: &Connection, download_id: &str) -> Result<Vec<DownloadSegment>> {
+        let mut stmt = conn.prepare(
+            "SELECT segment_index, start_byte, end_byte, downloaded_bytes, status 
+             FROM segments 
+             WHERE download_id = ?1 
+             ORDER BY segment_index ASC",
+        )?;
+
+        let rows = stmt.query_map(params![download_id], |row| {
+            let start_byte: i64 = row.get(1)?;
+            let end_byte: i64 = row.get(2)?;
+            let total_bytes = if end_byte >= start_byte {
+                (end_byte - start_byte + 1) as u64
+            } else {
+                0
+            };
+
+            Ok(DownloadSegment {
+                segment_index: row.get::<_, i64>(0)? as usize,
+                start_byte: start_byte as u64,
+                end_byte: end_byte as u64,
+                downloaded_bytes: row.get::<_, i64>(3)? as u64,
+                total_bytes,
+                status: row.get(4)?,
+            })
+        })?;
+
+        let mut segments = Vec::new();
+        for r in rows {
+            segments.push(r?);
+        }
+        Ok(segments)
+    }
+
+    pub fn get_all_downloads(conn: &Connection) -> Result<Vec<DownloadTask>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, url, final_url, filename, destination_path, temp_path,
+                    total_bytes, downloaded_bytes, status, resumable, etag,
+                    last_modified, mime_type, category, connections, speed_limit,
+                    priority, speed_bps, eta_seconds, created_at, updated_at,
+                    completed_at, error_message, scheduled_time, checksum_sha256,
+                    checksum_md5, user_agent, referer, mirrors, min_chunk_size,
+                    proxy_mode, custom_proxy_url, antivirus_status
+             FROM downloads
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(8)?;
+            let resumable_int: i32 = row.get(9)?;
+            let category_str: String = row.get(13)?;
+            let connections_int: i64 = row.get(14)?;
+            let speed_limit_int: i64 = row.get(15)?;
+            let speed_bps_int: i64 = row.get(17)?;
+            let eta_sec_int: Option<i64> = row.get(18)?;
+
+            let mirrors_str: Option<String> = row.get(28).unwrap_or(None);
+            let mirrors: Vec<String> = mirrors_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let min_chunk_size: i64 = row.get(29).unwrap_or(1024 * 1024);
+            let proxy_mode: Option<String> = row.get(30).unwrap_or(None);
+            let custom_proxy_url: Option<String> = row.get(31).unwrap_or(None);
+            let antivirus_status: Option<String> = row.get(32).unwrap_or(None);
+
+            Ok(DownloadTask {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                final_url: row.get(2)?,
+                filename: row.get(3)?,
+                destination_path: row.get(4)?,
+                temp_path: row.get(5)?,
+                total_bytes: row.get(6)?,
+                downloaded_bytes: row.get(7)?,
+                status: DownloadStatus::from_str(&status_str),
+                resumable: resumable_int == 1,
+                etag: row.get(10)?,
+                last_modified: row.get(11)?,
+                mime_type: row.get(12)?,
+                category: FileCategory::from_str(&category_str),
+                connections: connections_int as usize,
+                speed_limit: speed_limit_int as u64,
+                priority: row.get(16)?,
+                speed_bps: speed_bps_int as u64,
+                eta_seconds: eta_sec_int.map(|e| e as u64),
+                segments: Vec::new(),
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
+                completed_at: row.get(21)?,
+                error_message: row.get(22)?,
+                scheduled_time: row.get(23)?,
+                checksum_sha256: row.get(24).unwrap_or(None),
+                checksum_md5: row.get(25).unwrap_or(None),
+                user_agent: row.get(26).unwrap_or(None),
+                referer: row.get(27).unwrap_or(None),
+                mirrors,
+                min_chunk_size: if min_chunk_size <= 0 { 1024 * 1024 } else { min_chunk_size as u64 },
+                proxy_mode,
+                custom_proxy_url,
+                antivirus_status,
+            })
+        })?;
+
+        let mut tasks = Vec::new();
+        for r in rows {
+            let mut task = r?;
+            task.segments = Self::get_segments(conn, &task.id).unwrap_or_default();
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    pub fn get_download(conn: &Connection, id: &str) -> Result<Option<DownloadTask>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, url, final_url, filename, destination_path, temp_path,
+                    total_bytes, downloaded_bytes, status, resumable, etag,
+                    last_modified, mime_type, category, connections, speed_limit,
+                    priority, speed_bps, eta_seconds, created_at, updated_at,
+                    completed_at, error_message, scheduled_time, checksum_sha256,
+                    checksum_md5, user_agent, referer, mirrors, min_chunk_size,
+                    proxy_mode, custom_proxy_url, antivirus_status
+             FROM downloads
+             WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![id], |row| {
+            let status_str: String = row.get(8)?;
+            let resumable_int: i32 = row.get(9)?;
+            let category_str: String = row.get(13)?;
+            let connections_int: i64 = row.get(14)?;
+            let speed_limit_int: i64 = row.get(15)?;
+            let speed_bps_int: i64 = row.get(17)?;
+            let eta_sec_int: Option<i64> = row.get(18)?;
+
+            let mirrors_str: Option<String> = row.get(28).unwrap_or(None);
+            let mirrors: Vec<String> = mirrors_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let min_chunk_size: i64 = row.get(29).unwrap_or(1024 * 1024);
+            let proxy_mode: Option<String> = row.get(30).unwrap_or(None);
+            let custom_proxy_url: Option<String> = row.get(31).unwrap_or(None);
+            let antivirus_status: Option<String> = row.get(32).unwrap_or(None);
+
+            Ok(DownloadTask {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                final_url: row.get(2)?,
+                filename: row.get(3)?,
+                destination_path: row.get(4)?,
+                temp_path: row.get(5)?,
+                total_bytes: row.get(6)?,
+                downloaded_bytes: row.get(7)?,
+                status: DownloadStatus::from_str(&status_str),
+                resumable: resumable_int == 1,
+                etag: row.get(10)?,
+                last_modified: row.get(11)?,
+                mime_type: row.get(12)?,
+                category: FileCategory::from_str(&category_str),
+                connections: connections_int as usize,
+                speed_limit: speed_limit_int as u64,
+                priority: row.get(16)?,
+                speed_bps: speed_bps_int as u64,
+                eta_seconds: eta_sec_int.map(|e| e as u64),
+                segments: Vec::new(),
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
+                completed_at: row.get(21)?,
+                error_message: row.get(22)?,
+                scheduled_time: row.get(23)?,
+                checksum_sha256: row.get(24).unwrap_or(None),
+                checksum_md5: row.get(25).unwrap_or(None),
+                user_agent: row.get(26).unwrap_or(None),
+                referer: row.get(27).unwrap_or(None),
+                mirrors,
+                min_chunk_size: if min_chunk_size <= 0 { 1024 * 1024 } else { min_chunk_size as u64 },
+                proxy_mode,
+                custom_proxy_url,
+                antivirus_status,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            let mut task = r?;
+            task.segments = Self::get_segments(conn, &task.id).unwrap_or_default();
+            Ok(Some(task))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_antivirus_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
+        conn.execute("UPDATE downloads SET antivirus_status = ?1 WHERE id = ?2", params![status, id])?;
+        Ok(())
+    }
+
+    pub fn save_site_credential(conn: &Connection, cred: &SiteCredential) -> Result<()> {
+        conn.execute(
+            "INSERT INTO site_credentials (id, domain, username, password, token, notes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(domain) DO UPDATE SET
+                username = excluded.username,
+                password = excluded.password,
+                token = excluded.token,
+                notes = excluded.notes;",
+            params![cred.id, cred.domain.to_lowercase().trim(), cred.username, cred.password, cred.token, cred.notes],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_all_site_credentials(conn: &Connection) -> Result<Vec<SiteCredential>> {
+        let mut stmt = conn.prepare("SELECT id, domain, username, password, token, notes FROM site_credentials ORDER BY domain ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SiteCredential {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                username: row.get(2)?,
+                password: row.get(3)?,
+                token: row.get(4)?,
+                notes: row.get(5)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_site_credential_for_domain(conn: &Connection, domain: &str) -> Result<Option<SiteCredential>> {
+        let clean_domain = domain.to_lowercase().trim().to_string();
+        let mut stmt = conn.prepare("SELECT id, domain, username, password, token, notes FROM site_credentials WHERE domain = ?1 OR ?1 LIKE '%' || domain LIMIT 1")?;
+        let mut rows = stmt.query_map(params![clean_domain], |row| {
+            Ok(SiteCredential {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                username: row.get(2)?,
+                password: row.get(3)?,
+                token: row.get(4)?,
+                notes: row.get(5)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_site_credential(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute("DELETE FROM site_credentials WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn update_checksum(
+        conn: &Connection,
+        id: &str,
+        sha256: Option<&str>,
+        md5: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads SET checksum_sha256 = ?1, checksum_md5 = ?2 WHERE id = ?3",
+            params![sha256, md5, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_download(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute("DELETE FROM downloads WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn load_settings(conn: &Connection) -> Result<AppSettings> {
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = 'app_settings'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let json_str: String = row.get(0)?;
+            if let Ok(settings) = serde_json::from_str::<AppSettings>(&json_str) {
+                return Ok(settings);
+            }
+        }
+        let default_settings = AppSettings::default();
+        let _ = Self::save_settings(conn, &default_settings);
+        Ok(default_settings)
+    }
+
+    pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
+        let json_str = serde_json::to_string(settings).unwrap_or_default();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![json_str],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use crate::db::models::{DownloadSegment, DownloadStatus, DownloadTask, FileCategory};
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        Repository::create_tables(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_task_crud_and_status_transitions() {
+        let conn = setup_test_db();
+        let task = DownloadTask {
+            id: "test-uuid-1".to_string(),
+            url: "https://example.com/test.zip".to_string(),
+            final_url: Some("https://example.com/test.zip".to_string()),
+            filename: "test.zip".to_string(),
+            destination_path: "C:/Downloads".to_string(),
+            temp_path: "C:/Downloads/test.zip.nexpart".to_string(),
+            total_bytes: 10485760,
+            downloaded_bytes: 0,
+            status: DownloadStatus::Queued,
+            resumable: true,
+            etag: Some("\"etag123\"".to_string()),
+            last_modified: None,
+            mime_type: Some("application/zip".to_string()),
+            category: FileCategory::Compressed,
+            connections: 4,
+            speed_limit: 0,
+            priority: 1,
+            speed_bps: 0,
+            eta_seconds: None,
+            segments: vec![
+                DownloadSegment {
+                    segment_index: 0,
+                    start_byte: 0,
+                    end_byte: 2621439,
+                    downloaded_bytes: 0,
+                    total_bytes: 2621440,
+                    status: "pending".to_string(),
+                },
+                DownloadSegment {
+                    segment_index: 1,
+                    start_byte: 2621440,
+                    end_byte: 5242879,
+                    downloaded_bytes: 0,
+                    total_bytes: 2621440,
+                    status: "pending".to_string(),
+                },
+            ],
+            created_at: 1000,
+            updated_at: 1000,
+            completed_at: None,
+            error_message: None,
+            scheduled_time: None,
+            checksum_sha256: None,
+            checksum_md5: None,
+            user_agent: None,
+            referer: None,
+            mirrors: vec!["https://mirror1.example.com/test.zip".to_string()],
+            min_chunk_size: 1024 * 1024,
+            proxy_mode: Some("direct".to_string()),
+            custom_proxy_url: None,
+            antivirus_status: None,
+        };
+
+        // 1. Save
+        Repository::save_download(&conn, &task).unwrap();
+
+        // 2. Fetch
+        let fetched = Repository::get_download(&conn, "test-uuid-1").unwrap().expect("Task should exist");
+        assert_eq!(fetched.filename, "test.zip");
+        assert_eq!(fetched.status, DownloadStatus::Queued);
+        assert_eq!(fetched.segments.len(), 2);
+
+        // 3. Progress update
+        Repository::update_progress(&conn, "test-uuid-1", 5000000, DownloadStatus::Downloading, 1024000, Some(5), 1050).unwrap();
+        let fetched2 = Repository::get_download(&conn, "test-uuid-1").unwrap().unwrap();
+        assert_eq!(fetched2.downloaded_bytes, 5000000);
+        assert_eq!(fetched2.status, DownloadStatus::Downloading);
+        assert_eq!(fetched2.speed_bps, 1024000);
+        assert_eq!(fetched2.eta_seconds, Some(5));
+
+        // 4. Status update to Completed
+        Repository::update_status(&conn, "test-uuid-1", DownloadStatus::Completed, None, Some(1100), 1100).unwrap();
+        let fetched3 = Repository::get_download(&conn, "test-uuid-1").unwrap().unwrap();
+        assert_eq!(fetched3.status, DownloadStatus::Completed);
+        assert_eq!(fetched3.completed_at, Some(1100));
+
+        // 5. Delete
+        Repository::delete_download(&conn, "test-uuid-1").unwrap();
+        let fetched_del = Repository::get_download(&conn, "test-uuid-1").unwrap();
+        assert!(fetched_del.is_none());
+    }
+
+    #[test]
+    fn test_settings_persistence() {
+        let conn = setup_test_db();
+        let mut settings = Repository::load_settings(&conn).unwrap();
+        assert_eq!(settings.max_active_downloads, 3);
+
+        settings.max_active_downloads = 5;
+        settings.default_connections = 16;
+        settings.theme = "light".to_string();
+
+        Repository::save_settings(&conn, &settings).unwrap();
+        let reloaded = Repository::load_settings(&conn).unwrap();
+        assert_eq!(reloaded.max_active_downloads, 5);
+        assert_eq!(reloaded.default_connections, 16);
+        assert_eq!(reloaded.theme, "light");
+    }
+
+    #[test]
+    fn test_site_credentials_crud() {
+        let conn = setup_test_db();
+        let cred = SiteCredential {
+            id: "cred-1".to_string(),
+            domain: "example.com".to_string(),
+            username: "admin".to_string(),
+            password: Some("secret123".to_string()),
+            token: None,
+            notes: Some("Test note".to_string()),
+        };
+
+        Repository::save_site_credential(&conn, &cred).unwrap();
+
+        let list = Repository::get_all_site_credentials(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].domain, "example.com");
+
+        let fetched = Repository::get_site_credential_for_domain(&conn, "sub.example.com").unwrap().unwrap();
+        assert_eq!(fetched.username, "admin");
+
+        Repository::delete_site_credential(&conn, "cred-1").unwrap();
+        let list_empty = Repository::get_all_site_credentials(&conn).unwrap();
+        assert_eq!(list_empty.len(), 0);
+    }
+}
+
