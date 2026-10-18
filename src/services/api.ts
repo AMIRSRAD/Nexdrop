@@ -94,6 +94,65 @@ let mockDownloads: DownloadTask[] = [
     updated_at: Date.now() - 14000000,
     segments: [],
   },
+  {
+    id: 'mock-4',
+    url: 'https://dl.google.com/android/studio/install/2024.2/android-studio-2024.2-windows.exe',
+    filename: 'android-studio-2024.2-windows.exe',
+    destination_path: 'C:/Downloads',
+    temp_path: 'C:/Downloads/android-studio-2024.2-windows.exe.nexpart',
+    total_bytes: 1288490188,
+    downloaded_bytes: 0,
+    status: 'queued',
+    resumable: true,
+    category: 'programs',
+    connections: 8,
+    speed_limit: 0,
+    priority: 0,
+    speed_bps: 0,
+    created_at: Date.now() - 60000,
+    updated_at: Date.now(),
+    segments: [],
+  },
+  {
+    id: 'mock-5',
+    url: 'https://cdn.example.org/podcasts/episode-142-final-mix.mp3',
+    filename: 'episode-142-final-mix.mp3',
+    destination_path: 'C:/Downloads',
+    temp_path: 'C:/Downloads/episode-142-final-mix.mp3.nexpart',
+    total_bytes: 94371840,
+    downloaded_bytes: 41943040,
+    status: 'failed',
+    resumable: true,
+    category: 'music',
+    connections: 4,
+    speed_limit: 0,
+    priority: 0,
+    speed_bps: 0,
+    created_at: Date.now() - 86400000,
+    updated_at: Date.now() - 86000000,
+    error_message: 'Connection reset by peer (os error 10054)',
+    segments: [],
+  },
+  {
+    id: 'mock-6',
+    url: 'https://arxiv.org/pdf/2401.00001v2.pdf',
+    filename: 'attention-survey-2024.pdf',
+    destination_path: 'C:/Downloads',
+    temp_path: 'C:/Downloads/attention-survey-2024.pdf.nexpart',
+    total_bytes: 4718592,
+    downloaded_bytes: 0,
+    status: 'scheduled',
+    resumable: true,
+    category: 'documents',
+    connections: 2,
+    speed_limit: 0,
+    priority: 0,
+    speed_bps: 0,
+    created_at: Date.now() - 1800000,
+    updated_at: Date.now(),
+    scheduled_time: Math.floor((Date.now() + 9 * 3600000) / 1000),
+    segments: [],
+  },
 ];
 
 let mockSettings: AppSettings = {
@@ -229,14 +288,14 @@ export const api = {
     if (isTauri()) {
       return await invoke('open_file_cmd', { id });
     }
-    alert(`Open file: ${id}`);
+    console.info(`[mock] open file ${id}`);
   },
 
   async revealFile(id: string): Promise<void> {
     if (isTauri()) {
       return await invoke('reveal_file_cmd', { id });
     }
-    alert(`Reveal file: ${id}`);
+    console.info(`[mock] reveal file ${id}`);
   },
 
   async getSettings(): Promise<AppSettings> {
@@ -374,7 +433,42 @@ export const api = {
     if (isTauri()) {
       return listen<DownloadProgressEvent>('download-progress', (e) => callback(e.payload));
     }
-    return Promise.resolve(() => {});
+    // Browser preview: simulate the engine so the UI can be developed without Tauri
+    const timer = window.setInterval(() => {
+      mockDownloads = mockDownloads.map((t) => {
+        if (t.status === 'queued') {
+          const busy = mockDownloads.filter((d) => d.status === 'downloading').length;
+          if (busy < mockSettings.max_active_downloads) return { ...t, status: 'downloading' };
+          return t;
+        }
+        if (t.status !== 'downloading') return t;
+        const speed = 6_000_000 + Math.random() * 12_000_000;
+        const step = speed / 2;
+        const downloaded = Math.min(t.total_bytes, t.downloaded_bytes + step);
+        const segments = t.segments.map((seg) =>
+          seg.status === 'completed'
+            ? seg
+            : {
+                ...seg,
+                downloaded_bytes: Math.min(seg.total_bytes, seg.downloaded_bytes + step / Math.max(1, t.segments.filter((x) => x.status !== 'completed').length)),
+                status: seg.downloaded_bytes >= seg.total_bytes ? 'completed' : 'downloading',
+              },
+        );
+        const done = downloaded >= t.total_bytes;
+        const next: DownloadTask = {
+          ...t,
+          downloaded_bytes: downloaded,
+          speed_bps: done ? 0 : speed,
+          eta_seconds: done ? undefined : (t.total_bytes - downloaded) / speed,
+          status: done ? 'completed' : 'downloading',
+          completed_at: done ? Date.now() : undefined,
+          segments,
+        };
+        callback({ id: t.id, downloaded_bytes: next.downloaded_bytes, total_bytes: next.total_bytes, speed_bps: next.speed_bps, eta_seconds: next.eta_seconds, status: next.status, segments });
+        return next;
+      });
+    }, 500);
+    return Promise.resolve(() => window.clearInterval(timer));
   },
 
   onCompleted(callback: (task: DownloadTask) => void): Promise<UnlistenFn> {
