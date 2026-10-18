@@ -1,541 +1,546 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { Download } from 'lucide-react';
 import { api } from './services/api';
-import {
-  AddDownloadRequest,
-  AppSettings,
-  DownloadProgressEvent,
-  DownloadTask,
-  FileCategory,
-} from './types/download';
-import { Sidebar } from './components/layout/Sidebar';
-import { Header } from './components/layout/Header';
-import { DownloadCard } from './components/downloads/DownloadCard';
-import { DownloadRow } from './components/downloads/DownloadRow';
-import { EmptyState } from './components/downloads/EmptyState';
-import { NewDownloadModal } from './components/modals/NewDownloadModal';
-import { BatchDownloadModal } from './components/modals/BatchDownloadModal';
-import { LinkGrabberModal } from './components/modals/LinkGrabberModal';
-import { SettingsModal } from './components/modals/SettingsModal';
-import { DownloadInspector } from './components/downloads/DownloadInspector';
-import { AnalyticsView } from './components/analytics/AnalyticsView';
-import { Zap, X } from 'lucide-react';
-import { isTauri } from './services/api';
-import { listen } from '@tauri-apps/api/event';
+import type { AddDownloadRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
+import { useDownloads, errText } from './hooks/useDownloads';
+import { useSpeedHistory } from './hooks/useSpeedHistory';
+import { useTheme } from './hooks/useTheme';
+import { hasOpenLayer } from './lib/layers';
+import { STATUS_FILTERS, categoryMeta, extractUrls, looksLikeCurl, matchesStatus, progressOf, type StatusFilter } from './lib/meta';
+import { plural } from './utils/format';
+import { useToast } from './components/ui/Toast';
+import { Menu } from './components/ui/Menu';
+import { TitleBar } from './components/shell/TitleBar';
+import { FilterBar } from './components/shell/FilterBar';
+import { StatusBar } from './components/shell/StatusBar';
+import { TransferList, type SortKey, type SortState } from './components/transfers/TransferList';
+import { EmptyState } from './components/transfers/EmptyState';
+import { buildTaskMenu, canPause, canResume, canRetry, type TaskHandlers } from './components/transfers/taskMenu';
+import { AddDownloadDialog } from './components/dialogs/AddDownloadDialog';
+import { AddMultipleDialog, type AddMultipleTab } from './components/dialogs/AddMultipleDialog';
+import { RemoveDialog } from './components/dialogs/RemoveDialog';
+import { StatsDialog } from './components/dialogs/StatsDialog';
+import { SettingsView, type SettingsSection } from './components/settings/SettingsView';
+
+const DEFAULT_SETTINGS: AppSettings = {
+  default_destination: 'Downloads',
+  max_active_downloads: 3,
+  default_connections: 8,
+  max_connections_per_server: 8,
+  min_chunk_size: 1048576,
+  global_speed_limit: 0,
+  auto_resume_on_launch: true,
+  notify_on_complete: true,
+  theme: 'dark',
+  clipboard_watch: false,
+  auto_categorize: false,
+  proxy_mode: 'system',
+  custom_proxy_url: undefined,
+  on_complete_action: 'notify',
+  sound_enabled: true,
+  scheduler_enabled: false,
+  scheduler_start_time: '02:00',
+  scheduler_stop_time: '07:00',
+  scheduler_days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+  scheduler_speed_limit: 0,
+  scheduler_action: 'none',
+  scan_with_antivirus: true,
+  antivirus_path: undefined,
+};
+
+const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|xz|bz2|iso|img|exe|msi|dmg|pkg|deb|rpm|apk|mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|pdf|epub|bin)(\?|#|$)/i;
 
 export default function App() {
-  const [downloads, setDownloads] = useState<DownloadTask[]>([]);
-  const [settings, setSettings] = useState<AppSettings>({
-    default_destination: 'Downloads',
-    max_active_downloads: 3,
-    default_connections: 8,
-    max_connections_per_server: 8,
-    min_chunk_size: 1048576,
-    global_speed_limit: 0,
-    auto_resume_on_launch: true,
-    notify_on_complete: true,
-    theme: 'dark',
-    clipboard_watch: false,
-    auto_categorize: false,
-    proxy_mode: 'system',
-    custom_proxy_url: undefined,
-    on_complete_action: 'notify',
-    sound_enabled: true,
-    scheduler_enabled: false,
-    scheduler_start_time: '02:00',
-    scheduler_stop_time: '07:00',
-    scheduler_days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
-    scheduler_speed_limit: 0,
-    scheduler_action: 'none',
-    scan_with_antivirus: true,
-    antivirus_path: undefined,
-  });
+  const toast = useToast();
 
-  const [currentTab, setCurrentTab] = useState<string>('all');
-  const [selectedCategory, setSelectedCategory] = useState<FileCategory>('all');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
-  const [sortBy, setSortBy] = useState<'date' | 'size' | 'name' | 'speed'>('date');
+  /* ── dialogs & views ─────────────────────────────── */
+  const [addState, setAddState] = useState<{ open: boolean; text: string }>({ open: false, text: '' });
+  const [multiState, setMultiState] = useState<{ open: boolean; tab: AddMultipleTab; text: string }>({ open: false, tab: 'paste', text: '' });
+  const [removeIds, setRemoveIds] = useState<string[]>([]);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [settingsView, setSettingsView] = useState<{ open: boolean; section: SettingsSection }>({ open: false, section: 'general' });
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
 
-  // Modal and drawer states
-  const [isNewModalOpen, setIsNewModalOpen] = useState(false);
-  const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
-  const [isLinkGrabberModalOpen, setIsLinkGrabberModalOpen] = useState(false);
-  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
-  const [newModalInitialUrl, setNewModalInitialUrl] = useState('');
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [clipboardDetectedUrl, setClipboardDetectedUrl] = useState<string | null>(null);
+  const openAdd = useCallback((text = '') => setAddState({ open: true, text }), []);
+  const openMultiple = useCallback((tab: AddMultipleTab = 'paste', text = '') => setMultiState({ open: true, tab, text }), []);
 
-  // Initial load
-  const loadInitialData = useCallback(async () => {
-    try {
-      const [allDownloads, currentSettings] = await Promise.all([
-        api.getAllDownloads(),
-        api.getSettings(),
-      ]);
-      setDownloads(allDownloads);
-      setSettings(currentSettings);
-    } catch (err) {
-      console.error('Failed to load initial data:', err);
-    }
+  /* ── data ────────────────────────────────────────── */
+  const { downloads, loaded, actions } = useDownloads(() => openAdd());
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const saveTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => setSettings({ ...DEFAULT_SETTINGS, ...s }))
+      .catch((err) => console.error('Failed to load settings', err));
   }, []);
 
-  useEffect(() => {
-    loadInitialData();
-  }, [loadInitialData]);
+  useTheme(settings.theme);
 
-  // Global Keyboard Shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
-        if (e.key === 'Escape') {
-          target.blur();
+  const changeSettings = useCallback(
+    (patch: Partial<AppSettings>) => {
+      setSettings((prev) => ({ ...prev, ...patch }));
+      setSaveState('saving');
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(async () => {
+        try {
+          await api.updateSettings(settingsRef.current);
+          setSaveState('saved');
+        } catch (err) {
+          setSaveState('idle');
+          toast.show({ tone: 'error', title: "Couldn't save settings", description: errText(err) });
         }
-        return;
-      }
+      }, 450);
+    },
+    [toast],
+  );
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
-        e.preventDefault();
-        setNewModalInitialUrl('');
-        setIsNewModalOpen(true);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        setIsBatchModalOpen(true);
-      } else if ((e.ctrlKey || e.metaKey) && e.key === ',') {
-        e.preventDefault();
-        setIsSettingsModalOpen(true);
-      } else if (e.key === 'Escape') {
-        setIsNewModalOpen(false);
-        setIsBatchModalOpen(false);
-        setIsSettingsModalOpen(false);
-        setSelectedTaskId(null);
+  /* ── filtering & sorting ─────────────────────────── */
+  const [status, setStatus] = useState<StatusFilter>('all');
+  const [category, setCategory] = useState<FileCategory>('all');
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<SortState>({ key: 'added', dir: 'desc' });
+
+  const statusCounts = useMemo(() => {
+    const counts = Object.fromEntries(STATUS_FILTERS.map((f) => [f.id, 0])) as Record<StatusFilter, number>;
+    for (const d of downloads) for (const f of STATUS_FILTERS) if (matchesStatus(d.status, f.id)) counts[f.id]++;
+    return counts;
+  }, [downloads]);
+
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: 0 };
+    for (const d of downloads) {
+      if (!matchesStatus(d.status, status)) continue;
+      counts.all++;
+      const id = categoryMeta(d.category).id;
+      counts[id] = (counts[id] ?? 0) + 1;
+    }
+    return counts;
+  }, [downloads, status]);
+
+  const visible = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const list = downloads.filter(
+      (d) =>
+        matchesStatus(d.status, status) &&
+        (category === 'all' || categoryMeta(d.category).id === category) &&
+        (!q || d.filename.toLowerCase().includes(q) || d.url.toLowerCase().includes(q)),
+    );
+    const dir = sort.dir === 'asc' ? 1 : -1;
+    const val = (d: DownloadTask): number | string => {
+      switch (sort.key) {
+        case 'name':
+          return d.filename.toLowerCase();
+        case 'size':
+          return d.total_bytes;
+        case 'progress':
+          return d.status === 'completed' ? 1 : progressOf(d);
+        case 'speed':
+          return d.status === 'downloading' ? d.speed_bps : -1;
+        case 'eta':
+          return d.status === 'downloading' && d.eta_seconds ? d.eta_seconds : Number.MAX_SAFE_INTEGER * (dir === 1 ? 1 : -1);
+        default:
+          return d.created_at;
       }
     };
+    return list.sort((a, b) => {
+      const va = val(a);
+      const vb = val(b);
+      if (typeof va === 'string' && typeof vb === 'string') return va.localeCompare(vb) * dir;
+      return ((va as number) - (vb as number)) * dir || b.created_at - a.created_at;
+    });
+  }, [downloads, status, category, search, sort]);
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+  const onSort = useCallback(
+    (key: SortKey) =>
+      setSort((prev) => (prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'name' || key === 'eta' ? 'asc' : 'desc' })),
+    [],
+  );
+
+  /* ── selection, focus, expansion ─────────────────── */
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const anchorRef = useRef<string | null>(null);
+
+  // Drop selection entries that no longer exist
+  useEffect(() => {
+    const ids = new Set(downloads.map((d) => d.id));
+    setSelection((prev) => {
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+    if (expandedId && !ids.has(expandedId)) setExpandedId(null);
+  }, [downloads, expandedId]);
+
+  const selectAll = useCallback((select: boolean) => {
+    setSelection(select ? new Set(visibleRef.current.map((t) => t.id)) : new Set());
   }, []);
 
-  // Clipboard URL Detection
+  /* ── shared task handlers (stable across renders) ── */
+  const handlers: TaskHandlers = useMemo(
+    () => ({
+      pause: (id) => actions.pause([id]),
+      resume: (id) => actions.resume([id]),
+      retry: (id) => actions.retry([id]),
+      open: (id) => actions.open(id),
+      reveal: (id) => actions.reveal(id),
+      copyLink: (task) =>
+        navigator.clipboard.writeText(task.url).then(() => toast.show({ id: 'copied', tone: 'success', title: 'Link copied', duration: 1800 })),
+      copyCurl: async (task) => {
+        let cmd: string;
+        try {
+          cmd = await api.getCurlCommand(task.id);
+        } catch {
+          cmd = `curl -L -C - -o "${task.filename}" "${task.url}"`;
+        }
+        await navigator.clipboard.writeText(cmd);
+        toast.show({ id: 'copied', tone: 'success', title: 'cURL command copied', duration: 1800 });
+      },
+      requestRemove: (ids) => setRemoveIds(ids),
+      toggleExpand: (id) => setExpandedId((cur) => (cur === id ? null : id)),
+      toggleSelect: (id, range) => {
+        setSelection((prev) => {
+          const next = new Set(prev);
+          const list = visibleRef.current;
+          if (range && anchorRef.current) {
+            const a = list.findIndex((t) => t.id === anchorRef.current);
+            const b = list.findIndex((t) => t.id === id);
+            if (a >= 0 && b >= 0) {
+              for (let i = Math.min(a, b); i <= Math.max(a, b); i++) next.add(list[i].id);
+              return next;
+            }
+          }
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          anchorRef.current = id;
+          return next;
+        });
+      },
+      focus: (id) => setFocusedId(id),
+      contextMenu: (task, x, y) => setMenu({ id: task.id, x, y }),
+    }),
+    [actions, toast],
+  );
+
+  const menuTask = menu ? downloads.find((d) => d.id === menu.id) : undefined;
+
+  /* ── bulk actions ────────────────────────────────── */
+  const selectedTasks = useMemo(() => downloads.filter((d) => selection.has(d.id)), [downloads, selection]);
+  const bulkCan = useMemo(
+    () => ({
+      pause: selectedTasks.some(canPause),
+      resume: selectedTasks.some(canResume),
+      retry: selectedTasks.some(canRetry),
+    }),
+    [selectedTasks],
+  );
+
+  const activeIds = downloads.filter(canPause).map((d) => d.id);
+  const pausedIds = downloads.filter((d) => d.status === 'paused').map((d) => d.id);
+
+  /* ── routing pasted / dropped / typed text ───────── */
+  const routeText = useCallback(
+    (raw: string) => {
+      const text = raw.trim();
+      if (!text) return;
+      if (looksLikeCurl(text)) return openAdd(text);
+      const urls = extractUrls(text);
+      if (urls.length > 1) return openMultiple('paste', urls.join('\n'));
+      if (urls.length === 1) return openAdd(urls[0]);
+      if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(text)) return openAdd(`https://${text}`);
+      toast.show({ id: 'not-a-link', tone: 'error', title: 'That doesn’t look like a link', description: 'Links start with http:// or https://' });
+    },
+    [openAdd, openMultiple, toast],
+  );
+
+  const addOne = useCallback(
+    async (req: AddDownloadRequest) => {
+      const task = await actions.add(req);
+      toast.show({
+        id: `added-${task.id}`,
+        tone: 'success',
+        title: req.scheduled_time ? 'Download scheduled' : 'Download added',
+        description: task.filename,
+      });
+      setStatus((s) => (s === 'all' || matchesStatus(task.status, s) ? s : 'all'));
+    },
+    [actions, toast],
+  );
+
+  const addMany = useCallback(
+    async (reqs: AddDownloadRequest[]) => {
+      const created = await actions.addMany(reqs);
+      toast.show({ tone: 'success', title: `Added ${plural(created.length, 'download')}` });
+      setStatus('all');
+    },
+    [actions, toast],
+  );
+
+  /* ── global keyboard, paste, clipboard, drag & drop ─ */
+  const omniboxRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (hasOpenLayer()) return;
+      const mod = e.ctrlKey || e.metaKey;
+      const typing = (e.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"]');
+      const k = e.key.toLowerCase();
+      if (mod && k === 'n') {
+        e.preventDefault();
+        openAdd();
+      } else if (mod && k === 'b') {
+        e.preventDefault();
+        openMultiple();
+      } else if (mod && e.key === ',') {
+        e.preventDefault();
+        setSettingsView((v) => ({ ...v, open: !v.open }));
+      } else if (mod && k === 'l') {
+        e.preventDefault();
+        omniboxRef.current?.focus();
+      } else if (mod && k === 'f') {
+        e.preventDefault();
+        setSettingsView((v) => ({ ...v, open: false }));
+        requestAnimationFrame(() => searchRef.current?.focus());
+      } else if (e.key === 'Escape' && !typing) {
+        if (settingsView.open) setSettingsView((v) => ({ ...v, open: false }));
+        else if (selection.size) setSelection(new Set());
+        else if (expandedId) setExpandedId(null);
+      }
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (hasOpenLayer()) return;
+      const target = e.target as HTMLElement;
+      if (target.closest('input, textarea, [contenteditable="true"]')) return;
+      const text = e.clipboardData?.getData('text') ?? '';
+      if (text.trim()) {
+        e.preventDefault();
+        routeText(text);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('paste', onPaste);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('paste', onPaste);
+    };
+  }, [openAdd, openMultiple, routeText, settingsView.open, selection.size, expandedId]);
+
+  // Offer copied file links when the window regains focus
+  const lastClip = useRef('');
+  const downloadsRef = useRef(downloads);
+  downloadsRef.current = downloads;
   useEffect(() => {
     if (!settings.clipboard_watch) return;
-
-    const checkClipboard = async () => {
+    const check = async () => {
       try {
-        const text = await navigator.clipboard.readText();
-        const trimmed = text.trim();
-        if (
-          (trimmed.startsWith('http://') || trimmed.startsWith('https://')) &&
-          trimmed !== clipboardDetectedUrl &&
-          !downloads.some((d) => d.url === trimmed)
-        ) {
-          const match = /\.(zip|rar|7z|tar|gz|iso|exe|msi|dmg|mp4|mkv|mp3|pdf|bin)(\?|$)/i.test(trimmed);
-          if (match) {
-            setClipboardDetectedUrl(trimmed);
-          }
-        }
+        const text = (await navigator.clipboard.readText()).trim();
+        if (!text || text === lastClip.current) return;
+        lastClip.current = text;
+        const [url] = extractUrls(text);
+        if (!url || url !== text || !FILE_LINK_RE.test(url) || downloadsRef.current.some((d) => d.url === url)) return;
+        toast.show({
+          id: 'clipboard',
+          title: 'Link copied to clipboard',
+          description: url,
+          duration: 12000,
+          icon: <Download size={17} className="text-accent" />,
+          action: { label: 'Download', onClick: () => openAdd(url) },
+        });
       } catch {
-        // clipboard access not granted
+        /* clipboard not available */
       }
     };
+    window.addEventListener('focus', check);
+    return () => window.removeEventListener('focus', check);
+  }, [settings.clipboard_watch, toast, openAdd]);
 
-    window.addEventListener('focus', checkClipboard);
-    return () => window.removeEventListener('focus', checkClipboard);
-  }, [settings.clipboard_watch, clipboardDetectedUrl, downloads]);
-
-  // Event listeners for Tauri backend
-  useEffect(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenCompleted: (() => void) | undefined;
-    let unlistenStatus: (() => void) | undefined;
-
-    api.onProgress((event: DownloadProgressEvent) => {
-      setDownloads((prev) =>
-        prev.map((item) => {
-          if (item.id === event.id) {
-            return {
-              ...item,
-              downloaded_bytes: event.downloaded_bytes,
-              speed_bps: event.speed_bps,
-              eta_seconds: event.eta_seconds,
-              status: event.status,
-              segments: event.segments?.length ? event.segments : item.segments,
-              updated_at: Date.now(),
-            };
-          }
-          return item;
-        })
-      );
-    }).then((unlisten) => {
-      unlistenProgress = unlisten;
-    });
-
-    api.onCompleted((completedTask: DownloadTask) => {
-      setDownloads((prev) =>
-        prev.map((item) => (item.id === completedTask.id ? completedTask : item))
-      );
-    }).then((unlisten) => {
-      unlistenCompleted = unlisten;
-    });
-
-    api.onStatusChanged(() => {
-      api.getAllDownloads().then((tasks) => setDownloads(tasks));
-    }).then((unlisten) => {
-      unlistenStatus = unlisten;
-    });
-
-    let unlistenOpenNew: (() => void) | undefined;
-    let unlistenIntercepted: (() => void) | undefined;
-
-    if (isTauri()) {
-      listen('open-new-download', () => {
-        setIsNewModalOpen(true);
-      }).then((unlisten) => {
-        unlistenOpenNew = unlisten;
-      });
-
-      listen('download-intercepted', () => {
-        api.getAllDownloads().then((tasks) => setDownloads(tasks));
-      }).then((unlisten) => {
-        unlistenIntercepted = unlisten;
-      });
-    }
-
-    return () => {
-      if (unlistenProgress) unlistenProgress();
-      if (unlistenCompleted) unlistenCompleted();
-      if (unlistenStatus) unlistenStatus();
-      if (unlistenOpenNew) unlistenOpenNew();
-      if (unlistenIntercepted) unlistenIntercepted();
-    };
-  }, []);
-
-  // Action Handlers
-  const handleAddDownload = async (req: AddDownloadRequest) => {
-    try {
-      const created = await api.addDownload(req);
-      setDownloads((prev) => [created, ...prev]);
-    } catch (err) {
-      console.error('Failed to add download:', err);
-      alert(`Download failed: ${err}`);
-    }
+  const dragDepth = useRef(0);
+  const isLinkDrag = (e: React.DragEvent) => {
+    const types = Array.from(e.dataTransfer.types);
+    return types.includes('text/uri-list') || (types.includes('text/plain') && !types.includes('Files'));
   };
 
-  const handleBatchAdd = async (reqs: AddDownloadRequest[]) => {
-    try {
-      const createdList = await api.batchAdd(reqs);
-      setDownloads((prev) => [...createdList, ...prev]);
-    } catch (err) {
-      console.error('Failed to batch add downloads:', err);
-    }
-  };
-
-  const handlePause = async (id: string) => {
-    try {
-      await api.pauseDownload(id);
-      setDownloads((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, status: 'paused', speed_bps: 0 } : d))
-      );
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleResume = async (id: string) => {
-    try {
-      await api.resumeDownload(id);
-      setDownloads((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, status: 'downloading' } : d))
-      );
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleRetry = async (id: string) => {
-    try {
-      await api.retryDownload(id);
-      setDownloads((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, status: 'downloading', error_message: undefined } : d))
-      );
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleDelete = async (id: string, deleteFile = false) => {
-    try {
-      await api.deleteDownload(id, deleteFile);
-      setDownloads((prev) => prev.filter((d) => d.id !== id));
-      if (selectedTaskId === id) {
-        setSelectedTaskId(null);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handlePauseAll = async () => {
-    const downloading = downloads.filter((d) => d.status === 'downloading');
-    for (const d of downloading) {
-      await handlePause(d.id);
-    }
-  };
-
-  const handleResumeAll = async () => {
-    const paused = downloads.filter((d) => d.status === 'paused');
-    for (const d of paused) {
-      await handleResume(d.id);
-    }
-  };
-
-  const handleOpen = async (id: string) => {
-    try {
-      await api.openFile(id);
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleReveal = async (id: string) => {
-    try {
-      await api.revealFile(id);
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleSaveSettings = async (newSettings: AppSettings) => {
-    try {
-      await api.updateSettings(newSettings);
-      setSettings(newSettings);
-    } catch (err) {
-      console.error('Failed to update settings:', err);
-    }
-  };
-
-  // Filtered & Sorted downloads
-  const filteredDownloads = useMemo(() => {
-    return downloads
-      .filter((task) => {
-        // Tab filter
-        if (currentTab !== 'all' && task.status !== currentTab) {
-          return false;
-        }
-
-        // Category filter
-        if (selectedCategory !== 'all' && task.category !== selectedCategory) {
-          return false;
-        }
-
-        // Search query
-        if (searchQuery.trim()) {
-          const query = searchQuery.toLowerCase();
-          const matchName = task.filename.toLowerCase().includes(query);
-          const matchUrl = task.url.toLowerCase().includes(query);
-          if (!matchName && !matchUrl) return false;
-        }
-
-        return true;
-      })
-      .sort((a, b) => {
-        if (sortBy === 'date') {
-          return b.created_at - a.created_at;
-        }
-        if (sortBy === 'size') {
-          return b.total_bytes - a.total_bytes;
-        }
-        if (sortBy === 'name') {
-          return a.filename.localeCompare(b.filename);
-        }
-        if (sortBy === 'speed') {
-          return (b.speed_bps || 0) - (a.speed_bps || 0);
-        }
-        return 0;
-      });
-  }, [downloads, currentTab, selectedCategory, searchQuery, sortBy]);
-
-  // Aggregate download speed across all downloading tasks
-  const aggregateSpeed = useMemo(() => {
-    return downloads
-      .filter((d) => d.status === 'downloading')
-      .reduce((acc, curr) => acc + (curr.speed_bps || 0), 0);
-  }, [downloads]);
-
-  // Sidebar count indicators
-  const counts = useMemo(() => {
-    return {
-      all: downloads.length,
-      downloading: downloads.filter((d) => d.status === 'downloading').length,
-      completed: downloads.filter((d) => d.status === 'completed').length,
-      paused: downloads.filter((d) => d.status === 'paused').length,
-      scheduled: downloads.filter((d) => d.status === 'scheduled').length,
-      failed: downloads.filter((d) => d.status === 'failed').length,
-    };
-  }, [downloads]);
-
-  const selectedTask = downloads.find((d) => d.id === selectedTaskId) || null;
+  /* ── render ──────────────────────────────────────── */
+  const totalSpeed = useMemo(() => downloads.reduce((a, d) => a + (d.status === 'downloading' ? d.speed_bps || 0 : 0), 0), [downloads]);
+  const { history, peak } = useSpeedHistory(totalSpeed);
+  const downloadingCount = downloads.filter((d) => d.status === 'downloading').length;
+  const queuedCount = downloads.filter((d) => d.status === 'queued').length;
+  const filtersActive = status !== 'all' || category !== 'all' || search.trim() !== '';
 
   return (
-    <div className="flex h-screen w-screen bg-[#0c0d12] text-slate-100 font-sans antialiased overflow-hidden">
-      {/* Sidebar Navigation */}
-      <Sidebar
-        currentTab={currentTab}
-        onSelectTab={setCurrentTab}
-        selectedCategory={selectedCategory}
-        onSelectCategory={setSelectedCategory}
-        counts={counts}
-        aggregateSpeed={aggregateSpeed}
-        onOpenSettings={() => setIsSettingsModalOpen(true)}
+    <div
+      className="flex h-full flex-col bg-canvas text-fg"
+      onDragEnter={(e) => {
+        if (!isLinkDrag(e)) return;
+        dragDepth.current++;
+        setDragging(true);
+      }}
+      onDragOver={(e) => {
+        if (isLinkDrag(e)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }
+      }}
+      onDragLeave={() => {
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDragging(false);
+      }}
+      onDrop={(e) => {
+        dragDepth.current = 0;
+        setDragging(false);
+        const text = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+        if (text) {
+          e.preventDefault();
+          routeText(text.split('\n').filter((l) => !l.startsWith('#')).join('\n'));
+        }
+      }}
+    >
+      <TitleBar
+        omniboxRef={omniboxRef}
+        onSubmitLink={routeText}
+        onAddMultiple={() => openMultiple()}
+        onStats={() => setStatsOpen(true)}
+        onSettings={() => setSettingsView((v) => ({ ...v, open: !v.open }))}
+        onPauseAll={() => actions.pause(activeIds)}
+        onResumeAll={() => actions.resume(pausedIds)}
+        canPauseAll={activeIds.length > 0}
+        canResumeAll={pausedIds.length > 0}
+        settingsOpen={settingsView.open}
       />
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col h-full min-w-0 overflow-hidden bg-slate-950/40">
-        {/* Top Header */}
-        <Header
-          searchQuery={searchQuery}
-          onSearchChange={setSearchQuery}
-          viewMode={viewMode}
-          onViewModeChange={setViewMode}
-          sortBy={sortBy}
-          onSortByChange={setSortBy}
-          onOpenNewDownload={() => {
-            setNewModalInitialUrl('');
-            setIsNewModalOpen(true);
-          }}
-          onOpenBatchDownload={() => setIsBatchModalOpen(true)}
-          onOpenLinkGrabber={() => setIsLinkGrabberModalOpen(true)}
-          onPauseAll={handlePauseAll}
-          onResumeAll={handleResumeAll}
-          hasActiveDownloads={counts.downloading > 0}
-          hasPausedDownloads={counts.paused > 0}
-        />
-
-        {/* Main Content Area: Analytics or Downloads List */}
-        {currentTab === 'analytics' ? (
-          <AnalyticsView
-            downloads={downloads}
-            onOpenFile={handleOpen}
-            onRevealFile={handleReveal}
-          />
+      <main className="relative flex min-h-0 flex-1 flex-col">
+        {loaded && downloads.length === 0 ? (
+          <EmptyState variant="empty" onAdd={() => openAdd()} onAddMultiple={() => openMultiple()} onClearFilters={() => {}} />
         ) : (
-          <div className="flex-1 overflow-y-auto px-6 py-5">
-            {filteredDownloads.length === 0 ? (
+          <>
+            <FilterBar
+              status={status}
+              onStatus={(s) => {
+                setStatus(s);
+                setSelection(new Set());
+              }}
+              statusCounts={statusCounts}
+              category={category}
+              onCategory={setCategory}
+              categoryCounts={categoryCounts}
+              search={search}
+              onSearch={setSearch}
+              searchRef={searchRef}
+              selectionCount={selection.size}
+              onClearSelection={() => setSelection(new Set())}
+              onBulkPause={() => actions.pause(selectedTasks.filter(canPause).map((t) => t.id))}
+              onBulkResume={() => actions.resume(selectedTasks.filter(canResume).map((t) => t.id))}
+              onBulkRetry={() => actions.retry(selectedTasks.filter(canRetry).map((t) => t.id))}
+              onBulkRemove={() => setRemoveIds([...selection])}
+              bulkCan={bulkCan}
+            />
+            {visible.length === 0 && loaded ? (
               <EmptyState
-                tabName={currentTab}
-                onOpenNewDownload={(initialUrl) => {
-                  setNewModalInitialUrl(initialUrl || '');
-                  setIsNewModalOpen(true);
+                variant="filtered"
+                onAdd={() => openAdd()}
+                onAddMultiple={() => openMultiple()}
+                onClearFilters={() => {
+                  setStatus('all');
+                  setCategory('all');
+                  setSearch('');
                 }}
+                filterLabel={filtersActive ? undefined : 'No downloads yet.'}
               />
-            ) : viewMode === 'grid' ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filteredDownloads.map((task) => (
-                  <DownloadCard
-                    key={task.id}
-                    task={task}
-                    onPause={handlePause}
-                    onResume={handleResume}
-                    onRetry={handleRetry}
-                    onDelete={handleDelete}
-                    onOpen={handleOpen}
-                    onReveal={handleReveal}
-                    onSelect={(t) => setSelectedTaskId(t.id)}
-                  />
-                ))}
-              </div>
             ) : (
-              <div className="rounded-2xl border border-white/5 bg-slate-900/30 overflow-hidden divide-y divide-white/5">
-                {filteredDownloads.map((task) => (
-                  <DownloadRow
-                    key={task.id}
-                    task={task}
-                    onPause={handlePause}
-                    onResume={handleResume}
-                    onRetry={handleRetry}
-                    onDelete={handleDelete}
-                    onOpen={handleOpen}
-                    onReveal={handleReveal}
-                    onSelect={(t) => setSelectedTaskId(t.id)}
-                  />
-                ))}
-              </div>
+              <TransferList
+                tasks={visible}
+                sort={sort}
+                onSort={onSort}
+                expandedId={expandedId}
+                focusedId={focusedId}
+                selection={selection}
+                onSelectAll={selectAll}
+                handlers={handlers}
+              />
             )}
-          </div>
+          </>
         )}
+
+        <AnimatePresence>
+          {settingsView.open && (
+            <SettingsView
+              settings={settings}
+              onChange={changeSettings}
+              onClose={() => setSettingsView((v) => ({ ...v, open: false }))}
+              section={settingsView.section}
+              onSection={(section) => setSettingsView({ open: true, section })}
+              saveState={saveState}
+            />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {dragging && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.12 }}
+              className="pointer-events-none absolute inset-3 z-30 flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-accent bg-accent-soft"
+            >
+              <Download size={28} className="text-accent" />
+              <div className="mt-2 text-[14px] font-medium text-fg">Drop to download</div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
 
-      {/* Download Inspector Drawer */}
-      {selectedTask && (
-        <DownloadInspector
-          task={selectedTask}
-          onClose={() => setSelectedTaskId(null)}
-          onPause={handlePause}
-          onResume={handleResume}
-          onRetry={handleRetry}
-          onOpenFile={handleOpen}
-          onRevealFile={handleReveal}
-        />
-      )}
-
-      {/* Floating Clipboard Notification Toast */}
-      {clipboardDetectedUrl && (
-        <div className="fixed bottom-6 right-6 z-50 p-4 bg-slate-900/95 border border-indigo-500/30 rounded-2xl shadow-2xl backdrop-blur-xl flex items-center gap-3 animate-in fade-in slide-in-from-bottom duration-200 max-w-md">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-indigo-500/20 text-indigo-400 shrink-0">
-            <Zap size={16} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="text-xs font-semibold text-slate-200">Download Link Detected</div>
-            <div className="text-[11px] text-slate-400 truncate font-mono">{clipboardDetectedUrl}</div>
-          </div>
-          <button
-            onClick={() => {
-              setNewModalInitialUrl(clipboardDetectedUrl);
-              setClipboardDetectedUrl(null);
-              setIsNewModalOpen(true);
-            }}
-            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-lg transition-colors shrink-0"
-          >
-            Download
-          </button>
-          <button
-            onClick={() => setClipboardDetectedUrl(null)}
-            className="p-1 text-slate-500 hover:text-slate-300 rounded-lg hover:bg-white/5 transition-colors"
-          >
-            <X size={14} />
-          </button>
-        </div>
-      )}
-
-      {/* Modals */}
-      <NewDownloadModal
-        isOpen={isNewModalOpen}
-        onClose={() => setIsNewModalOpen(false)}
-        onAdd={handleAddDownload}
-        initialUrl={newModalInitialUrl}
-        defaultDestination={settings.default_destination}
-      />
-
-      <BatchDownloadModal
-        isOpen={isBatchModalOpen}
-        onClose={() => setIsBatchModalOpen(false)}
-        onBatchAdd={handleBatchAdd}
-        defaultDestination={settings.default_destination}
-      />
-
-      <LinkGrabberModal
-        isOpen={isLinkGrabberModalOpen}
-        onClose={() => setIsLinkGrabberModalOpen(false)}
-        onBatchAdd={handleBatchAdd}
-        defaultDestination={settings.default_destination}
-      />
-
-      <SettingsModal
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
+      <StatusBar
+        speed={totalSpeed}
+        history={history}
+        downloading={downloadingCount}
+        queued={queuedCount}
         settings={settings}
-        onSave={handleSaveSettings}
+        onChangeSettings={changeSettings}
+        onOpenSettings={(section) => setSettingsView({ open: true, section: section as SettingsSection })}
       />
+
+      {/* Overlays */}
+      <Menu
+        position={menu && menuTask ? { x: menu.x, y: menu.y } : null}
+        onClose={() => setMenu(null)}
+        items={menuTask ? buildTaskMenu(menuTask, handlers, expandedId === menuTask.id) : []}
+        minWidth={210}
+      />
+      <AddDownloadDialog
+        open={addState.open}
+        initialText={addState.text}
+        settings={settings}
+        onClose={() => setAddState((s) => ({ ...s, open: false }))}
+        onSubmit={addOne}
+      />
+      <AddMultipleDialog
+        open={multiState.open}
+        initialTab={multiState.tab}
+        initialText={multiState.text}
+        settings={settings}
+        onClose={() => setMultiState((s) => ({ ...s, open: false }))}
+        onSubmit={addMany}
+      />
+      <RemoveDialog
+        tasks={downloads.filter((d) => removeIds.includes(d.id))}
+        onClose={() => setRemoveIds([])}
+        onConfirm={async (deleteFiles) => {
+          await actions.remove(removeIds, deleteFiles);
+          setSelection(new Set());
+        }}
+      />
+      <StatsDialog open={statsOpen} onClose={() => setStatsOpen(false)} downloads={downloads} history={history} peak={peak} speed={totalSpeed} />
     </div>
   );
 }

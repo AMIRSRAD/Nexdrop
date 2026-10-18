@@ -15,14 +15,16 @@
         "label": "main",
         "title": "Nexdrop",
         "url": "index.html",
-        "width": 1120,
-        "height": 740,
-        "minWidth": 840,
-        "minHeight": 560,
+        "width": 1180,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 580,
         "center": true,
         "resizable": true,
         "fullscreen": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-bypass-list=\"<-loopback>;<local>;localhost;127.0.0.1;*.localhost;tauri.localhost\""
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-bypass-list=\"<-loopback>;<local>;localhost;127.0.0.1;*.localhost;tauri.localhost\"",
+        "decorations": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
