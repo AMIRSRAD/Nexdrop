@@ -54,6 +54,9 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 - [x] Download button over playing videos, finding HLS/DASH streams and video files the page loaded, with a picker when there are several
 - [x] Panel listing the videos and files on the current page (toolbar popup, with a badge count)
 - [x] Firefox support (same package; verified in real Firefox and Edge by `scripts/e2e_extension.py`)
+- [x] First-run setup: Nexdrop finds Chrome, Edge, Brave and Firefox, opens each one's extensions page, shows what to click and waits until the browser connects
+- [x] The app shows which browsers are connected (Settings > Browser, status bar nudge until one is set up)
+- [ ] Get the Firefox extension signed by Mozilla (unlisted): create AMO API keys and run `python scripts/sign_firefox.py` (see docs/browser-extension-publishing.md); the installer then offers a one-click add-on
 - [ ] Publish the extension to the Chrome Web Store, Edge Add-ons and Mozilla Add-ons (needed for one-click install and for Firefox to keep it after restarts)
 - [ ] POST-based downloads (forms that return a file)
 - [ ] Start Nexdrop automatically when the browser sends a download and it isn't running

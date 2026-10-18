@@ -4,6 +4,8 @@ import { CheckSquare, ClipboardPaste, Copy, Download, Link2, ListPlus, Magnet, S
 import { api, isTauri } from './services/api';
 import type { BrowserRequest } from './types/download';
 import { QueuesContext, useQueues } from './hooks/useQueues';
+import { useBrowsers } from './hooks/useBrowsers';
+import { BrowserSetupDialog } from './components/dialogs/BrowserSetupDialog';
 import { listen } from '@tauri-apps/api/event';
 import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
 import { useDownloads, errText } from './hooks/useDownloads';
@@ -57,6 +59,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   torrent_dht: true,
   torrent_upnp: false,
   browser_prompt: true,
+  browser_setup_done: false,
 };
 
 const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|xz|bz2|iso|img|exe|msi|dmg|pkg|deb|rpm|apk|mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|pdf|epub|bin)(\?|#|$)/i;
@@ -85,6 +88,7 @@ export default function App() {
     (source) => openTorrent(source),
   );
   const { queues, refresh: refreshQueues } = useQueues();
+  const [browserSetupOpen, setBrowserSetupOpen] = useState(false);
   const [queueFilter, setQueueFilter] = useState('all');
   // A deleted queue can't stay selected.
   useEffect(() => {
@@ -93,6 +97,7 @@ export default function App() {
   }, [queues, queueFilter]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const saveTimer = useRef<number | undefined>(undefined);
@@ -100,7 +105,10 @@ export default function App() {
   useEffect(() => {
     api
       .getSettings()
-      .then((s) => setSettings({ ...DEFAULT_SETTINGS, ...s }))
+      .then((s) => {
+        setSettings({ ...DEFAULT_SETTINGS, ...s });
+        setSettingsLoaded(true);
+      })
       .catch((err) => console.error('Failed to load settings', err));
   }, []);
 
@@ -123,6 +131,19 @@ export default function App() {
     },
     [toast],
   );
+
+  /* ── browsers: first-run setup and the status-bar nudge ─ */
+  const { data: browserData } = useBrowsers(browserSetupOpen || (settingsView.open && settingsView.section === 'integrations'));
+  const browserList = browserData?.browsers ?? [];
+  const firstRunShown = useRef(false);
+  useEffect(() => {
+    if (!settingsLoaded || !browserData || firstRunShown.current || settings.browser_setup_done) return;
+    firstRunShown.current = true;
+    const installed = browserList.filter((b) => b.installed);
+    // Right after installing: offer to connect the browsers found, once.
+    if (installed.length > 0 && !browserList.some((b) => b.ever_connected)) setBrowserSetupOpen(true);
+    changeSettings({ browser_setup_done: true });
+  }, [settingsLoaded, browserData, browserList, settings.browser_setup_done, changeSettings]);
 
   /* ── filtering & sorting ─────────────────────────── */
   const [status, setStatus] = useState<StatusFilter>('all');
@@ -631,6 +652,8 @@ export default function App() {
               saveState={saveState}
               queues={queues}
               onQueuesChanged={refreshQueues}
+              browsers={browserList}
+              onSetupBrowsers={() => setBrowserSetupOpen(true)}
             />
           )}
         </AnimatePresence>
@@ -660,6 +683,8 @@ export default function App() {
         onChangeSettings={changeSettings}
         onOpenSettings={(section) => setSettingsView({ open: true, section: section as SettingsSection })}
         queues={queues}
+        browsers={browserList}
+        onSetupBrowsers={() => setBrowserSetupOpen(true)}
       />
 
       {/* Overlays */}
@@ -704,6 +729,7 @@ export default function App() {
           setSelection(new Set());
         }}
       />
+      <BrowserSetupDialog open={browserSetupOpen} onClose={() => setBrowserSetupOpen(false)} integration={browserData} />
       <StatsDialog open={statsOpen} onClose={() => setStatsOpen(false)} downloads={downloads} history={history} peak={peak} speed={totalSpeed} />
       </div>
     </QueuesContext.Provider>

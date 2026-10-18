@@ -108,6 +108,39 @@ async function sendToNexdrop(url, referer, filename, extra = {}) {
   }
 }
 
+// ── telling the app this browser is connected ──────────────────────────────
+
+async function browserName() {
+  const ua = navigator.userAgent;
+  if (/Firefox\//.test(ua)) return 'firefox';
+  if (/Edg\//.test(ua)) return 'edge';
+  try {
+    if (navigator.brave && (await navigator.brave.isBrave())) return 'brave';
+  } catch (_) { /* not Brave */ }
+  return 'chrome';
+}
+
+async function sayHello() {
+  try {
+    await fetch(`${NEXDROP_SERVER}/hello`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browser: await browserName(), version: chrome.runtime.getManifest().version }),
+    });
+  } catch (_) { /* the app isn't running; try again later */ }
+}
+
+sayHello();
+chrome.runtime.onStartup.addListener(sayHello);
+chrome.runtime.onInstalled.addListener(sayHello);
+// Browsers stop idle background scripts; an alarm wakes this one now and then.
+chrome.alarms.get('nexdrop-hello', (alarm) => {
+  if (!alarm) chrome.alarms.create('nexdrop-hello', { periodInMinutes: 5 });
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'nexdrop-hello') sayHello();
+});
+
 // ── deciding which browser downloads to take over ────────────────────────────
 
 const recentlySent = new Map(); // url → time, to ignore the browser announcing a download twice

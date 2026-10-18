@@ -8,6 +8,7 @@ pub mod process;
 pub mod secrets;
 pub mod tray;
 pub mod util;
+pub mod browsers;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -118,6 +119,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             probe_url_cmd,
             probe_stream_cmd,
+            get_browsers_cmd,
+            setup_browser_cmd,
             get_queues_cmd,
             save_queue_cmd,
             delete_queue_cmd,

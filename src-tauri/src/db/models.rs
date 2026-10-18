@@ -334,6 +334,8 @@ pub struct AppSettings {
     pub torrent_upnp: bool,
     /// Links sent by the browser open the download window first (like IDM) instead of starting at once.
     pub browser_prompt: bool,
+    /// The first-run "connect your browsers" window has been shown.
+    pub browser_setup_done: bool,
 }
 
 impl Default for AppSettings {
@@ -380,6 +382,7 @@ impl Default for AppSettings {
             torrent_dht: true,
             torrent_upnp: false,
             browser_prompt: true,
+            browser_setup_done: false,
         }
     }
 }

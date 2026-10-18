@@ -1,6 +1,6 @@
 import React from 'react';
 import { ArrowDown, CalendarClock, Gauge, Power, Puzzle } from 'lucide-react';
-import type { AppSettings, QueueInfo } from '../../types/download';
+import type { AppSettings, BrowserInfo, QueueInfo } from '../../types/download';
 import { formatSpeed } from '../../utils/format';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
 import { Tooltip } from '../ui/Tooltip';
@@ -16,6 +16,9 @@ interface StatusBarProps {
   onChangeSettings: (patch: Partial<AppSettings>) => void;
   onOpenSettings: (section: string) => void;
   queues: QueueInfo[];
+  /** Browsers found / connected, to nudge the user until the extension is set up. */
+  browsers?: BrowserInfo[];
+  onSetupBrowsers?: () => void;
 }
 
 const LIMITS = [0, 256, 512, 1024, 2048, 5120, 10240]; // KB/s
@@ -31,7 +34,12 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   onChangeSettings,
   onOpenSettings,
   queues,
+  browsers = [],
+  onSetupBrowsers,
 }) => {
+  const found = browsers.filter((b) => b.installed);
+  const connected = browsers.some((b) => b.connected);
+  const nudge = found.length > 0 && !browsers.some((b) => b.ever_connected);
   const scheduled = queues.filter((q) => q.schedule_enabled);
   const first = scheduled[0];
   const limitMenu = useDropdown('end');
@@ -101,9 +109,20 @@ export const StatusBar: React.FC<StatusBarProps> = ({
         </Chip>
         <Menu position={limitMenu.position} onClose={limitMenu.close} items={limitItems} minWidth={180} />
 
-        <Chip icon={Puzzle} onClick={() => onOpenSettings('integrations')} tip={`Browser extension bridge on 127.0.0.1:${GRABBER_PORT}`}>
-          <span className="h-1.5 w-1.5 rounded-full bg-success" />
-          Browser
+        <Chip
+          icon={Puzzle}
+          onClick={() => (nudge && onSetupBrowsers ? onSetupBrowsers() : onOpenSettings('integrations'))}
+          tone={nudge ? 'warning' : undefined}
+          tip={
+            connected
+              ? 'Your browser is connected'
+              : nudge
+                ? 'Connect your browser to catch downloads and videos'
+                : `Browser bridge on 127.0.0.1:${GRABBER_PORT}`
+          }
+        >
+          <span className={cn('h-1.5 w-1.5 rounded-full', connected ? 'bg-success' : nudge ? 'bg-warning' : 'bg-fg-3')} />
+          {nudge ? 'Connect browser' : 'Browser'}
         </Chip>
       </div>
     </footer>
