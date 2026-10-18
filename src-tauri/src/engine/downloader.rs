@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use reqwest::header::{CONTENT_RANGE, RANGE, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{HeaderName, HeaderValue, CONTENT_RANGE, RANGE, RETRY_AFTER, USER_AGENT};
 use reqwest::StatusCode;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -35,8 +35,9 @@ use tokio::task::JoinSet;
 
 use crate::db::models::{DownloadProgressEvent, DownloadSegment, DownloadStatus, DownloadTask};
 use crate::engine::client::ClientPool;
-use crate::engine::fileio::{open_preallocated, write_all_at};
-use crate::engine::probe::resolve_unique_path;
+use crate::engine::auth::build_header_list;
+use crate::engine::fileio::{free_space, open_preallocated, write_all_at};
+use crate::engine::probe::reserve_unique_path;
 use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range};
 use crate::engine::speed::{RateLimiter, SpeedCalculator};
 
@@ -111,6 +112,23 @@ impl DownloadEngine {
     where
         F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
     {
+        self.run_download_with(task, pause_rx, Vec::new(), on_progress).await
+    }
+
+    /// Like [`run_download`](Self::run_download), with extra request headers
+    /// (for example from a saved site login). They are sent to the original
+    /// host only, never to mirrors, and are merged under the task's own headers.
+    pub async fn run_download_with<F>(
+        &self,
+        task: DownloadTask,
+        pause_rx: watch::Receiver<bool>,
+        extra_headers: Vec<(String, String)>,
+        on_progress: F,
+    ) -> Result<DownloadTask, String>
+    where
+        F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
+    {
+        let headers = build_header_list(&task.custom_headers, &extra_headers);
         let dest_dir = Path::new(&task.destination_path);
         if !dest_dir.exists() {
             tokio::fs::create_dir_all(dest_dir)
@@ -124,10 +142,10 @@ impl DownloadEngine {
             .download(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
 
         if task.resumable && task.total_bytes > 0 {
-            self.run_ranged(task, final_dest, client, pause_rx, on_progress).await
+            self.run_ranged(task, final_dest, client, headers, pause_rx, on_progress).await
         } else {
             let part_file = dest_dir.join(format!("{}.nexpart", task.filename));
-            self.run_single_stream(task, final_dest, part_file, client, pause_rx, on_progress)
+            self.run_single_stream(task, final_dest, part_file, client, headers, pause_rx, on_progress)
                 .await
         }
     }
@@ -140,12 +158,17 @@ impl DownloadEngine {
         final_dest: PathBuf,
         part_file: PathBuf,
         client: reqwest::Client,
+        headers: Vec<(HeaderName, HeaderValue)>,
         mut pause_rx: watch::Receiver<bool>,
         on_progress: F,
     ) -> Result<DownloadTask, String>
     where
         F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
     {
+        if task.total_bytes > 0 {
+            check_disk_space(final_dest.parent().unwrap_or(Path::new(".")), task.total_bytes as u64)?;
+        }
+
         // Without range support a partial file can't be continued: start over.
         let mut file = OpenOptions::new()
             .create(true)
@@ -157,7 +180,7 @@ impl DownloadEngine {
         task.downloaded_bytes = 0;
 
         let ua = task.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
-        let req = build_request(&client, &task.url, ua, task.referer.as_deref(), None);
+        let req = build_request(&client, &task.url, ua, task.referer.as_deref(), None, &headers);
 
         let res = match send_or_pause(req, &mut pause_rx).await? {
             Some(res) => res,
@@ -250,10 +273,12 @@ impl DownloadEngine {
             ));
         }
 
-        let final_path = resolve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest));
-        tokio::fs::rename(&part_file, &final_path)
-            .await
-            .map_err(|e| format!("Failed to rename completed file: {e}"))?;
+        let final_path = reserve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest))
+            .map_err(|e| format!("Cannot create the final file: {e}"))?;
+        if let Err(e) = tokio::fs::rename(&part_file, &final_path).await {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(format!("Failed to rename completed file: {e}"));
+        }
 
         finish_task(&mut task, &final_path);
         task.downloaded_bytes = task.downloaded_bytes.max(task.total_bytes);
@@ -278,6 +303,7 @@ impl DownloadEngine {
         mut task: DownloadTask,
         final_dest: PathBuf,
         client: reqwest::Client,
+        headers: Vec<(HeaderName, HeaderValue)>,
         mut pause_rx: watch::Receiver<bool>,
         on_progress: F,
     ) -> Result<DownloadTask, String>
@@ -289,7 +315,7 @@ impl DownloadEngine {
         let mut fresh = false;
         for round in 0..2 {
             match self
-                .ranged_round(&mut task, &final_dest, &client, &mut pause_rx, &on_progress, fresh)
+                .ranged_round(&mut task, &final_dest, &client, &headers, &mut pause_rx, &on_progress, fresh)
                 .await
             {
                 Ok(()) => return Ok(task),
@@ -308,6 +334,7 @@ impl DownloadEngine {
         task: &mut DownloadTask,
         final_dest: &Path,
         client: &reqwest::Client,
+        headers: &[(HeaderName, HeaderValue)],
         pause_rx: &mut watch::Receiver<bool>,
         on_progress: &F,
         force_fresh: bool,
@@ -342,6 +369,9 @@ impl DownloadEngine {
         let already = done.covered();
         let resumed = already > 0;
 
+        // Fail early and clearly instead of hitting "disk full" halfway through.
+        check_disk_space(&dest_dir, total.saturating_sub(already)).map_err(RoundFailure::Failed)?;
+
         let connections = task.connections.clamp(1, 32);
         let min_piece = task.min_chunk_size.max(MIN_STEAL_BYTES);
         let todo: VecDeque<Range> = split_gaps(&done.gaps(total), connections, min_piece).into();
@@ -360,6 +390,7 @@ impl DownloadEngine {
             urls,
             user_agent: task.user_agent.clone().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             referer: task.referer.clone(),
+            headers: headers.to_vec(),
             validator: resume_validator(task.etag.as_deref(), task.last_modified.as_deref()),
             resumed,
             total,
@@ -537,10 +568,12 @@ impl DownloadEngine {
                 drop(shared);
                 drop(file);
 
-                let final_path = resolve_unique_path(&dest_dir, &file_name_of(final_dest));
-                tokio::fs::rename(&part_path, &final_path)
-                    .await
-                    .map_err(|e| RoundFailure::Failed(format!("Failed to move finished file into place: {e}")))?;
+                let final_path = reserve_unique_path(&dest_dir, &file_name_of(final_dest))
+                    .map_err(|e| RoundFailure::Failed(format!("Cannot create the final file: {e}")))?;
+                if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                    return Err(RoundFailure::Failed(format!("Failed to move finished file into place: {e}")));
+                }
                 let _ = tokio::fs::remove_file(&map_path).await;
 
                 finish_task(task, &final_path);
@@ -608,6 +641,8 @@ struct Shared {
     urls: Vec<String>,
     user_agent: String,
     referer: Option<String>,
+    /// Extra headers (cookies, auth). Only ever sent to the original URL.
+    headers: Vec<(HeaderName, HeaderValue)>,
     /// ETag / Last-Modified sent as `If-Range` when resuming.
     validator: Option<String>,
     resumed: bool,
@@ -969,6 +1004,12 @@ async fn attempt(
     if let Some(referer) = &shared.referer {
         req = req.header("Referer", referer);
     }
+    // Credentials and cookies belong to the original host; a mirror must never see them.
+    if url_idx == 0 {
+        for (name, value) in &shared.headers {
+            req = req.header(name.clone(), value.clone());
+        }
+    }
     // When resuming, ask the server to answer with the *same* file or not at all.
     let sent_if_range = shared.resumed && url_idx == 0 && shared.validator.is_some();
     if sent_if_range {
@@ -1153,10 +1194,14 @@ fn build_request(
     user_agent: &str,
     referer: Option<&str>,
     range: Option<String>,
+    headers: &[(HeaderName, HeaderValue)],
 ) -> reqwest::RequestBuilder {
     let mut req = client.get(url).header(USER_AGENT, user_agent);
     if let Some(r) = referer {
         req = req.header("Referer", r);
+    }
+    for (name, value) in headers {
+        req = req.header(name.clone(), value.clone());
     }
     if let Some(range) = range {
         req = req.header(RANGE, range);
@@ -1182,6 +1227,31 @@ async fn send_or_pause(
         _ = wait_paused(pause_rx) => Ok(None),
         res = req.send() => res.map(Some).map_err(|e| format!("HTTP request failed: {e}")),
     }
+}
+
+/// Room to spare beyond the file itself (temp files, other programs writing).
+const DISK_SPACE_MARGIN: u64 = 32 * 1024 * 1024;
+
+fn check_disk_space(dir: &Path, needed: u64) -> Result<(), String> {
+    match free_space(dir) {
+        Some(free) if free < needed.saturating_add(DISK_SPACE_MARGIN) => Err(format!(
+            "Not enough free disk space: {} needed, {} available",
+            human_size(needed),
+            human_size(free)
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
 fn paused(mut task: DownloadTask) -> DownloadTask {
@@ -1233,6 +1303,22 @@ mod tests {
         assert!(d20 <= Duration::from_millis(37_500), "{d20:?}");
         // Retry-After wins when it's longer.
         assert!(backoff_delay(base, 1, Some(Duration::from_secs(20))) >= Duration::from_secs(20));
+    }
+
+    #[test]
+    fn formats_sizes_for_error_messages() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GB");
+    }
+
+    #[test]
+    fn disk_space_check_rejects_impossible_sizes_but_not_small_ones() {
+        let dir = std::env::temp_dir();
+        assert!(check_disk_space(&dir, 1024).is_ok());
+        if crate::engine::fileio::free_space(&dir).is_some() {
+            assert!(check_disk_space(&dir, u64::MAX / 2).unwrap_err().contains("Not enough free disk space"));
+        }
     }
 
     #[test]

@@ -39,6 +39,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   const [destination, setDestination] = useState(settings.default_destination);
   const [probe, setProbe] = useState<ProbeState>({ kind: 'idle' });
   const [curlNote, setCurlNote] = useState<string | null>(null);
+  const [customHeaders, setCustomHeaders] = useState<Record<string, string>>({});
 
   const [when, setWhen] = useState<'now' | 'later'>('now');
   const [scheduledAt, setScheduledAt] = useState(defaultScheduleValue(settings.scheduler_start_time));
@@ -90,7 +91,14 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         setProxyMode('custom');
         setProxyUrl(parsed.custom_proxy_url);
       }
-      const imported = [parsed.user_agent && 'user agent', parsed.referer && 'referer', parsed.custom_proxy_url && 'proxy'].filter(Boolean);
+      const headerCount = Object.keys(parsed.custom_headers ?? {}).length;
+      setCustomHeaders(parsed.custom_headers ?? {});
+      const imported = [
+        parsed.user_agent && 'user agent',
+        parsed.referer && 'referer',
+        parsed.custom_proxy_url && 'proxy',
+        headerCount > 0 && `${headerCount} header${headerCount === 1 ? '' : 's'} (cookies/auth are kept private)`,
+      ].filter(Boolean);
       setCurlNote(imported.length ? `Imported from cURL: ${imported.join(', ')}` : 'Imported from cURL command');
       runProbe(parsed.url);
     } catch (err) {
@@ -163,6 +171,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         min_chunk_size: minChunk,
         proxy_mode: proxyMode,
         custom_proxy_url: proxyMode === 'custom' && proxyUrl.trim() ? proxyUrl.trim() : undefined,
+        custom_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
       });
       onClose();
     } catch (err) {

@@ -45,6 +45,26 @@ pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<
     Ok(())
 }
 
+/// Free space available to the current user on the volume holding `dir`, in
+/// bytes. `None` when it can't be determined (then no check is made).
+pub fn free_space(dir: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut available: u64 = 0;
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, std::ptr::null_mut(), std::ptr::null_mut()) };
+        (ok != 0).then_some(available)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 #[cfg(windows)]
 fn mark_sparse(file: &File) {
     use std::os::windows::io::AsRawHandle;
@@ -99,5 +119,12 @@ mod tests {
         let (_file, fresh) = open_preallocated(&path, 2000).unwrap();
         assert!(fresh);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reports_free_space_for_an_existing_folder() {
+        let free = free_space(&std::env::temp_dir()).expect("free space should be known on Windows");
+        assert!(free > 0);
     }
 }

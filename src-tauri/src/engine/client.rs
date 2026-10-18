@@ -41,12 +41,38 @@ pub fn create_download_client_with_proxy(
     )
 }
 
+/// True when following a redirect would move from encrypted to unencrypted transport.
+pub fn is_downgrade(previous_scheme: &str, next_scheme: &str) -> bool {
+    previous_scheme == "https" && next_scheme == "http"
+}
+
+/// Redirect handling: follow up to 10 hops, but never silently fall from HTTPS
+/// back to plain HTTP. That would let anyone on the network swap the file we
+/// are about to save.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("Too many redirects");
+        }
+        let downgrade = attempt
+            .previous()
+            .last()
+            .map(|prev| is_downgrade(prev.scheme(), attempt.url().scheme()))
+            .unwrap_or(false);
+        if downgrade {
+            attempt.error("Refusing to follow a redirect from HTTPS to unencrypted HTTP")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn build_client(
     builder: reqwest::ClientBuilder,
     proxy_mode: Option<&str>,
     custom_proxy_url: Option<&str>,
 ) -> reqwest::Client {
-    let mut builder = builder.pool_max_idle_per_host(32);
+    let mut builder = builder.pool_max_idle_per_host(32).redirect(redirect_policy());
 
     let mode = proxy_mode.unwrap_or("system");
 
@@ -173,5 +199,18 @@ impl ClientPool {
         };
         clients.insert(key, (Instant::now(), client.clone()));
         client
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_https_to_http_is_a_downgrade() {
+        assert!(is_downgrade("https", "http"));
+        assert!(!is_downgrade("http", "https"));
+        assert!(!is_downgrade("http", "http"));
+        assert!(!is_downgrade("https", "https"));
     }
 }

@@ -7,6 +7,31 @@ use crate::db::models::{AppSettings, DownloadSegment, DownloadStatus, DownloadTa
 
 pub struct Repository;
 
+/// Column order that [`Repository::map_task_row`] expects.
+const TASK_COLUMNS: &str = "id, url, final_url, filename, destination_path, temp_path,
+    total_bytes, downloaded_bytes, status, resumable, etag,
+    last_modified, mime_type, category, connections, speed_limit,
+    priority, speed_bps, eta_seconds, created_at, updated_at,
+    completed_at, error_message, scheduled_time, checksum_sha256,
+    checksum_md5, user_agent, referer, mirrors, min_chunk_size,
+    proxy_mode, custom_proxy_url, antivirus_status,
+    expected_checksum, custom_headers";
+
+/// Header maps hold cookies and tokens, so they are encrypted before they hit the disk.
+fn encode_headers(headers: &std::collections::HashMap<String, String>) -> Option<String> {
+    if headers.is_empty() {
+        return None;
+    }
+    serde_json::to_string(headers).ok().map(|json| crate::secrets::protect(&json))
+}
+
+fn decode_headers(stored: Option<String>) -> std::collections::HashMap<String, String> {
+    stored
+        .and_then(|s| crate::secrets::unprotect(&s))
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
 impl Repository {
     /// Opens the database. Schema setup runs once per process per file; every
     /// other call only sets the cheap per-connection options.
@@ -115,6 +140,8 @@ impl Repository {
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN proxy_mode TEXT", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN custom_proxy_url TEXT", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN antivirus_status TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN expected_checksum TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN custom_headers TEXT", []);
 
         Ok(())
     }
@@ -128,14 +155,16 @@ impl Repository {
                 priority, speed_bps, eta_seconds, created_at, updated_at,
                 completed_at, error_message, scheduled_time, checksum_sha256,
                 checksum_md5, user_agent, referer, mirrors, min_chunk_size,
-                proxy_mode, custom_proxy_url, antivirus_status
+                proxy_mode, custom_proxy_url, antivirus_status,
+                expected_checksum, custom_headers
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32, ?33
+                ?29, ?30, ?31, ?32, ?33,
+                ?34, ?35
             )
             ON CONFLICT(id) DO UPDATE SET
                 final_url = excluded.final_url,
@@ -167,7 +196,9 @@ impl Repository {
                 min_chunk_size = excluded.min_chunk_size,
                 proxy_mode = excluded.proxy_mode,
                 custom_proxy_url = excluded.custom_proxy_url,
-                antivirus_status = excluded.antivirus_status;",
+                antivirus_status = excluded.antivirus_status,
+                expected_checksum = excluded.expected_checksum,
+                custom_headers = excluded.custom_headers;",
             params![
                 task.id,
                 task.url,
@@ -202,6 +233,8 @@ impl Repository {
                 task.proxy_mode,
                 task.custom_proxy_url,
                 task.antivirus_status,
+                task.expected_checksum,
+                encode_headers(&task.custom_headers),
             ],
         )?;
 
@@ -412,20 +445,14 @@ let status_str: String = row.get(8)?;
             proxy_mode,
             custom_proxy_url,
             antivirus_status,
+            expected_checksum: row.get(33).unwrap_or(None),
+            custom_headers: decode_headers(row.get(34).unwrap_or(None)),
         })
     }
 
     pub fn get_all_downloads(conn: &Connection) -> Result<Vec<DownloadTask>> {
         let mut stmt = conn.prepare(
-            "SELECT id, url, final_url, filename, destination_path, temp_path,
-                    total_bytes, downloaded_bytes, status, resumable, etag,
-                    last_modified, mime_type, category, connections, speed_limit,
-                    priority, speed_bps, eta_seconds, created_at, updated_at,
-                    completed_at, error_message, scheduled_time, checksum_sha256,
-                    checksum_md5, user_agent, referer, mirrors, min_chunk_size,
-                    proxy_mode, custom_proxy_url, antivirus_status
-             FROM downloads
-             ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLUMNS} FROM downloads ORDER BY created_at DESC"),
         )?;
 
         let rows = stmt.query_map([], Self::map_task_row)?;
@@ -442,15 +469,7 @@ let status_str: String = row.get(8)?;
 
     pub fn get_download(conn: &Connection, id: &str) -> Result<Option<DownloadTask>> {
         let mut stmt = conn.prepare(
-            "SELECT id, url, final_url, filename, destination_path, temp_path,
-                    total_bytes, downloaded_bytes, status, resumable, etag,
-                    last_modified, mime_type, category, connections, speed_limit,
-                    priority, speed_bps, eta_seconds, created_at, updated_at,
-                    completed_at, error_message, scheduled_time, checksum_sha256,
-                    checksum_md5, user_agent, referer, mirrors, min_chunk_size,
-                    proxy_mode, custom_proxy_url, antivirus_status
-             FROM downloads
-             WHERE id = ?1",
+            &format!("SELECT {TASK_COLUMNS} FROM downloads WHERE id = ?1"),
         )?;
 
         let mut rows = stmt.query_map(params![id], Self::map_task_row)?;
@@ -482,8 +501,8 @@ let status_str: String = row.get(8)?;
                 cred.id,
                 cred.domain.to_lowercase().trim(),
                 cred.username.clone().unwrap_or_default(),
-                cred.password,
-                cred.token_or_cookie,
+                cred.password.as_deref().map(crate::secrets::protect),
+                cred.token_or_cookie.as_deref().map(crate::secrets::protect),
                 cred.notes
             ],
         )?;
@@ -497,8 +516,8 @@ let status_str: String = row.get(8)?;
                 id: row.get(0)?,
                 domain: row.get(1)?,
                 username: row.get::<_, Option<String>>(2)?.filter(|u| !u.is_empty()),
-                password: row.get(3)?,
-                token_or_cookie: row.get(4)?,
+                password: row.get::<_, Option<String>>(3)?.and_then(|s| crate::secrets::unprotect(&s)),
+                token_or_cookie: row.get::<_, Option<String>>(4)?.and_then(|s| crate::secrets::unprotect(&s)),
                 notes: row.get(5)?,
             })
         })?;
@@ -518,8 +537,8 @@ let status_str: String = row.get(8)?;
                 id: row.get(0)?,
                 domain: row.get(1)?,
                 username: row.get::<_, Option<String>>(2)?.filter(|u| !u.is_empty()),
-                password: row.get(3)?,
-                token_or_cookie: row.get(4)?,
+                password: row.get::<_, Option<String>>(3)?.and_then(|s| crate::secrets::unprotect(&s)),
+                token_or_cookie: row.get::<_, Option<String>>(4)?.and_then(|s| crate::secrets::unprotect(&s)),
                 notes: row.get(5)?,
             })
         })?;
@@ -529,6 +548,33 @@ let status_str: String = row.get(8)?;
         } else {
             Ok(None)
         }
+    }
+
+    /// One-time upgrade: encrypts any credentials that were stored as plaintext
+    /// by earlier versions. Safe to run on every start.
+    pub fn protect_existing_secrets(conn: &Connection) -> Result<usize> {
+        let mut stmt = conn.prepare("SELECT id, password, token FROM site_credentials")?;
+        let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_>>()?;
+        drop(stmt);
+
+        let needs = |v: &Option<String>| v.as_deref().map(|s| !s.is_empty() && !crate::secrets::is_protected(s)).unwrap_or(false);
+        let mut updated = 0;
+        for (id, password, token) in rows {
+            if needs(&password) || needs(&token) {
+                conn.execute(
+                    "UPDATE site_credentials SET password = ?1, token = ?2 WHERE id = ?3",
+                    params![
+                        password.as_deref().map(crate::secrets::protect),
+                        token.as_deref().map(crate::secrets::protect),
+                        id
+                    ],
+                )?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub fn delete_site_credential(conn: &Connection, id: &str) -> Result<()> {
@@ -646,6 +692,8 @@ mod tests {
             proxy_mode: Some("direct".to_string()),
             custom_proxy_url: None,
             antivirus_status: None,
+            expected_checksum: Some("abc123".to_string()),
+            custom_headers: [("Cookie".to_string(), "sid=1".to_string())].into_iter().collect(),
         };
 
         // 1. Save
@@ -656,6 +704,15 @@ mod tests {
         assert_eq!(fetched.filename, "test.zip");
         assert_eq!(fetched.status, DownloadStatus::Queued);
         assert_eq!(fetched.segments.len(), 2);
+        assert_eq!(fetched.expected_checksum.as_deref(), Some("abc123"));
+        assert_eq!(fetched.custom_headers.get("Cookie").map(String::as_str), Some("sid=1"));
+        // Cookies and tokens must not be readable straight from the database file.
+        let raw: Option<String> = conn
+            .query_row("SELECT custom_headers FROM downloads WHERE id = ?1", ["test-uuid-1"], |r| r.get(0))
+            .unwrap();
+        if cfg!(windows) {
+            assert!(!raw.unwrap().contains("sid=1"), "headers stored in plaintext");
+        }
 
         // 3. Progress update (only applies while the task is downloading)
         Repository::update_status(&conn, "test-uuid-1", DownloadStatus::Downloading, None, None, 1040).unwrap();
@@ -815,6 +872,8 @@ mod tests {
             proxy_mode: None,
             custom_proxy_url: None,
             antivirus_status: None,
+            expected_checksum: None,
+            custom_headers: Default::default(),
         }
     }
 }

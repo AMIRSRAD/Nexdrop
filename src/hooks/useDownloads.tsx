@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { Power } from 'lucide-react';
 import { api, isTauri } from '../services/api';
 import type { AddDownloadRequest, DownloadProgressEvent, DownloadTask } from '../types/download';
 import { useToast } from '../components/ui/Toast';
@@ -106,6 +107,35 @@ export function useDownloads(onOpenNewDownload: () => void) {
           });
         }),
         listen('download-deleted', () => refresh()),
+        listen<{ action: string; seconds: number }>('completion-action', (e) => {
+          const { action, seconds } = e.payload;
+          toast.show({
+            id: 'power-countdown',
+            tone: 'info',
+            icon: <Power size={17} className="text-warning" />,
+            title: action === 'shutdown' ? `Shutting down in ${seconds} seconds` : `Going to sleep in ${seconds} seconds`,
+            description: 'Your downloads are finished.',
+            duration: seconds * 1000,
+            action: { label: 'Cancel', onClick: () => api.cancelCompletionAction().catch(() => {}) },
+          });
+        }),
+        listen('completion-action-cancelled', () => {
+          toast.dismiss('power-countdown');
+          toast.show({ id: 'power-cancelled', tone: 'success', title: 'Cancelled', duration: 2500 });
+        }),
+        listen<{ event: string; paused?: number }>('scheduler-event', (e) => {
+          refresh();
+          if (e.payload.event === 'started') {
+            toast.show({ id: 'scheduler', title: 'Scheduler window opened', description: 'Queued downloads are starting.' });
+          } else if (e.payload.event === 'stopped') {
+            const n = e.payload.paused ?? 0;
+            toast.show({
+              id: 'scheduler',
+              title: 'Scheduler window closed',
+              description: n > 0 ? `${n} download${n === 1 ? '' : 's'} paused until it reopens.` : undefined,
+            });
+          }
+        }),
         listen('open-new-download', () => openNewRef.current()),
         listen('download-intercepted', () => {
           refresh();

@@ -429,6 +429,14 @@ export const api = {
     ];
   },
 
+  /** Cancels a pending "sleep / shut down when finished" countdown. */
+  async cancelCompletionAction(): Promise<boolean> {
+    if (isTauri()) {
+      return await invoke<boolean>('cancel_completion_action_cmd');
+    }
+    return false;
+  },
+
   onProgress(callback: (event: DownloadProgressEvent) => void): Promise<UnlistenFn> {
     if (isTauri()) {
       return listen<DownloadProgressEvent>('download-progress', (e) => callback(e.payload));

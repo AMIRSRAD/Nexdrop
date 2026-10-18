@@ -71,6 +71,29 @@ On loopback the OS file cache hides the cost of the old double write, so equal-s
 
 Tests: 40 Rust tests pass (24 unit and 16 integration), stable over 5 runs. Coverage includes range-map math, byte-exact download, resume from the map, ignored `Range`, 503 retries, mid-body resets, giving up, fast-fail on 404, work stealing, pause/resume, pause under a speed limit, speed limits, mirror fallback, and the non-resumable path.
 
+### Phase 3 status (branch `feat/safety-phase-3`)
+
+| Item | Status | What changed |
+|------|--------|--------------|
+| §3.2 Mark of the Web | ✅ Done | Every finished file gets a `Zone.Identifier` stream (`ZoneId=3`, plus `HostUrl` and `ReferrerUrl`). SmartScreen, Office Protected View and Explorer's warnings now apply to Nexdrop downloads. URLs are validated, so a crafted link can't inject extra lines. Verified in the real app. |
+| §3.6 Filenames | ✅ Done | The sanitizer strips control, invisible and direction-override characters (the `invoice‮fdp.exe` trick), prefixes Windows reserved names (`CON`, `NUL`, `COM1`, `LPT9`, and their variants), trims trailing dots and spaces, caps length on character boundaries while keeping the extension, and still blocks `..` traversal. |
+| §3.6 Name collisions | ✅ Done | The final path is **claimed atomically** (`create_new`). A finished download can never overwrite an existing file, even if two finish at once. This applies to both the range engine and the single-stream path. |
+| §1.8 Expected checksum | ✅ Fixed | The hash is validated when the download is added (cleans up `sha256:`, case and `hash *file`; rejects non-hex or wrong lengths). It's stored in its own column and compared after hashing. On mismatch the file is **removed**, the task fails with a clear message, and the UI shows it. The Integrity tab shows whether the hash matched. |
+| §3.4 Credentials | ✅ Done | Saved logins are now **applied**: a token with `=` becomes `Cookie`, any other token becomes `Bearer`, and username + password becomes `Basic`. They are sent **only over HTTPS** (or loopback), **only to the original host**, never to mirrors, and reqwest drops them on cross-host redirects. Passwords, tokens and per-task headers are **encrypted at rest with Windows DPAPI**. Plaintext logins from older versions are encrypted at startup. The settings UI only receives masked values. |
+| §5.5 cURL import | ✅ Fixed | `Cookie`, `Authorization`, custom headers, `-b` and `-u` are now kept (engine-controlled headers like `Range` are dropped). They are stored encrypted per task, and resume works. Probes also use the user agent, referer and headers. |
+| §3.7 Redirects | ✅ Fixed | An HTTPS → HTTP redirect is refused with a clear error instead of being followed silently. |
+| §3.6 Disk space | ✅ Done | The engine checks free space before starting (32 MiB margin) and fails early with "Not enough free disk space: X needed, Y available". |
+| Completion actions | ✅ Wired | "When all downloads finish" now works: notify, **sleep**, or **shut down**. Sleep and shutdown start a 30 s / 60 s countdown with a **Cancel** toast in the app. |
+| Notifications and sound | ✅ Wired | Windows toasts on completion, failure and threat detection when the window isn't focused (`notify_on_complete`). The "play a sound" preference actually silences or plays the sound. When the window is focused, only a beep plays. |
+| Scheduler | ✅ Rewritten | It works as a time **window**, not an exact-minute match, so sleeping PCs and late launches are handled. Overnight windows work, and the days apply to the opening day. Running downloads are paused when the window closes and **resume automatically** when it reopens. The scheduler speed cap is applied inside the window (combined with the global limit). The close action (sleep, shut down, or quit) runs through the cancellable countdown, and quitting is a clean `app.exit`, not `process::exit`. Unreadable times never block downloads. |
+| Per-download schedule | ✅ Wired | A download scheduled for a time is queued when the time comes, including after the app was closed or the PC asleep at that moment. |
+| Bridge | ✅ Extended | The extension may pass an optional `expected_checksum`. |
+| Not done | ⏳ | A per-install token for the bridge, a link-reputation check, and an "unsafe extension" warning. |
+
+**Verified end-to-end in the real app** (`python scripts/e2e_bridge.py`: 18 of 18 checks pass). It runs the built app against a local test server and queues downloads over the bridge, with the database backed up and restored. It checks: web and no-origin requests get 403, invalid hashes are rejected up front, a plaintext login is encrypted at startup, a correct hash completes with exact bytes and a recorded SHA-256, the Mark of the Web is present, a wrong hash fails and **removes** the file, a saved login is sent as a Basic header, and **6 downloads with a limit of 3 all complete** (live confirmation of the Phase 1 queue fix).
+
+Tests: 80 Rust tests pass (60 unit and 20 integration).
+
 About a dozen settings and features in the UI do nothing in the backend (see §6). The most important ones are **global speed limit, scheduled downloads, "when all finish → shut down", and site logins**.
 
 ---

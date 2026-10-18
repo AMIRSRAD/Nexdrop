@@ -123,6 +123,8 @@ async fn bench(mib: usize, uneven: bool, label: &str) {
         proxy_mode: None,
         custom_proxy_url: None,
         antivirus_status: None,
+        expected_checksum: None,
+        custom_headers: Default::default(),
     };
 
     let (_tx, rx) = watch::channel(false);

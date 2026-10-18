@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use tauri::State;
 
+use std::collections::HashMap;
+
 use crate::db::models::{AddDownloadRequest, AppSettings, DownloadTask, SiteCredential, UrlProbeResult};
+use crate::engine::auth::{base64, is_forbidden_header};
 use crate::engine::manager::DownloadManager;
 
 pub type AppState = Arc<DownloadManager>;
@@ -249,6 +252,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
     let mut referer: Option<String> = None;
     let mut custom_proxy_url: Option<String> = None;
     let mut proxy_mode: Option<String> = None;
+    let mut headers: HashMap<String, String> = HashMap::new();
 
     let tokens = tokenize_command(trimmed);
     let mut iter = tokens.into_iter().peekable();
@@ -266,8 +270,23 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
                             user_agent = Some(val);
                         } else if key == "referer" {
                             referer = Some(val);
+                        } else if !is_forbidden_header(&key) && !val.is_empty() {
+                            // Cookie, Authorization, custom tokens: exactly what makes
+                            // "Copy as cURL" downloads work for logged-in sites.
+                            headers.insert(k.trim().to_string(), val);
                         }
                     }
+                }
+            }
+            "-b" | "--cookie" => {
+                // A cookie string (name=value; ...). A bare file name is a cookie jar, which we can't read.
+                if let Some(cookie) = iter.next().filter(|c| c.contains('=')) {
+                    headers.insert("Cookie".to_string(), cookie);
+                }
+            }
+            "-u" | "--user" => {
+                if let Some(creds) = iter.next().filter(|c| c.contains(':')) {
+                    headers.insert("Authorization".to_string(), format!("Basic {}", base64(creds.as_bytes())));
                 }
             }
             "-A" | "--user-agent" => {
@@ -306,7 +325,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
         scheduled_time: None,
         user_agent,
         referer,
-        custom_headers: None,
+        custom_headers: if headers.is_empty() { None } else { Some(headers) },
         expected_checksum: None,
         mirrors: None,
         min_chunk_size: None,
@@ -358,4 +377,40 @@ fn tokenize_command(cmd: &str) -> Vec<String> {
 #[tauri::command]
 pub async fn grab_page_links_cmd(url: String) -> Result<Vec<crate::grabber_server::GrabbedLink>, String> {
     crate::grabber_server::extract_links_from_page(&url).await
+}
+
+/// Cancels a pending "sleep/shut down when finished" countdown.
+#[tauri::command]
+pub async fn cancel_completion_action_cmd(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.cancel_pending_power_action())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn curl_import_keeps_cookies_and_auth_but_not_engine_headers() {
+        let cmd = r#"curl 'https://files.example.com/a.zip' -H 'Cookie: sid=abc' -H 'Authorization: Bearer tok' -H 'Range: bytes=0-10' -H 'Accept-Encoding: gzip' -H 'User-Agent: UA/1' -H 'Referer: https://example.com/' -H 'X-Custom: yes' --compressed"#;
+        let req = parse_curl_command_cmd(cmd.to_string()).await.unwrap();
+        let h = req.custom_headers.unwrap();
+        assert_eq!(h.get("Cookie").map(String::as_str), Some("sid=abc"));
+        assert_eq!(h.get("Authorization").map(String::as_str), Some("Bearer tok"));
+        assert_eq!(h.get("X-Custom").map(String::as_str), Some("yes"));
+        assert!(!h.contains_key("Range") && !h.contains_key("Accept-Encoding"), "{h:?}");
+        assert_eq!(req.user_agent.as_deref(), Some("UA/1"));
+        assert_eq!(req.referer.as_deref(), Some("https://example.com/"));
+        assert_eq!(req.url, "https://files.example.com/a.zip");
+    }
+
+    #[tokio::test]
+    async fn curl_cookie_and_basic_auth_flags_are_understood() {
+        let req = parse_curl_command_cmd("curl -b 'a=1; b=2' -u user:pass https://x.test/f".to_string()).await.unwrap();
+        let h = req.custom_headers.unwrap();
+        assert_eq!(h["Cookie"], "a=1; b=2");
+        assert_eq!(h["Authorization"], "Basic dXNlcjpwYXNz");
+        // A cookie *file* can't be read, so it's ignored rather than sent as a cookie.
+        let req = parse_curl_command_cmd("curl -b cookies.txt https://x.test/f".to_string()).await.unwrap();
+        assert!(req.custom_headers.is_none());
+    }
 }
