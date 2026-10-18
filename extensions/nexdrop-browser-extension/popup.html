@@ -31,16 +31,55 @@
       letter-spacing: -0.3px;
     }
     .logo-badge {
-      width: 20px;
-      height: 20px;
+      width: 22px;
+      height: 22px;
       border-radius: 6px;
-      background: linear-gradient(135deg, #6366f1, #4f46e5);
+    }
+    .videos {
+      margin-bottom: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .videos-title {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #94a3b8;
+      margin-bottom: 8px;
+    }
+    .video-row {
       display: flex;
       align-items: center;
-      justify-content: center;
-      color: white;
-      font-size: 11px;
+      gap: 8px;
+      padding: 7px 8px;
+      border-radius: 8px;
+      background: #171b26;
+      margin-bottom: 6px;
     }
+    .video-row .name {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      color: #e2e8f0;
+    }
+    .video-row .kind {
+      font-size: 9.5px;
+      color: #94a3b8;
+      margin-left: 6px;
+    }
+    .btn-small {
+      background: #5b8cff;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-small:hover { background: #7aa2ff; }
     .status-badge {
       display: flex;
       align-items: center;
@@ -81,11 +120,11 @@
       transition: border-color 0.2s;
     }
     .input-box:focus {
-      border-color: #6366f1;
+      border-color: #5b8cff;
     }
     .btn-primary {
       width: 100%;
-      background: #4f46e5;
+      background: #5b8cff;
       color: #ffffff;
       border: none;
       border-radius: 8px;
@@ -96,7 +135,7 @@
       transition: background 0.2s;
     }
     .btn-primary:hover {
-      background: #4338ca;
+      background: #7aa2ff;
     }
     .toggle-row {
       display: flex;
@@ -134,20 +173,25 @@
       border-radius: 50%;
       transition: .3s;
     }
-    input:checked + .slider { background: #4f46e5; }
+    input:checked + .slider { background: #5b8cff; }
     input:checked + .slider:before { transform: translateX(14px); }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="brand">
-      <div class="logo-badge">⚡</div>
+      <img class="logo-badge" src="icons/icon48.png" alt="">
       <span>Nexdrop</span>
     </div>
     <div id="statusBadge" class="status-badge status-offline">
       <span class="dot"></span>
       <span id="statusText">Checking...</span>
     </div>
+  </div>
+
+  <div id="videos" class="videos" hidden>
+    <div class="videos-title">Videos on this page</div>
+    <div id="videoList"></div>
   </div>
 
   <div class="input-group">

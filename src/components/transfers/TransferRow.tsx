@@ -218,6 +218,7 @@ const Subline: React.FC<{ task: DownloadTask }> = ({ task }) => {
   return (
     <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-fg-3">
       <span className="truncate">{host}</span>
+      {task.kind === 'stream' && <span className="shrink-0">· video stream</span>}
       {task.priority >= 1 && task.status !== 'completed' && (
         <span
           className={cn(

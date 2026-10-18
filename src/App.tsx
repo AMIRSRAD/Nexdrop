@@ -63,7 +63,7 @@ export default function App() {
   const toast = useToast();
 
   /* ── dialogs & views ─────────────────────────────── */
-  const [addState, setAddState] = useState<{ open: boolean; text: string }>({ open: false, text: '' });
+  const [addState, setAddState] = useState<{ open: boolean; text: string; referer?: string }>({ open: false, text: '' });
   const [multiState, setMultiState] = useState<{ open: boolean; tab: AddMultipleTab; text: string }>({ open: false, tab: 'paste', text: '' });
   const [removeIds, setRemoveIds] = useState<string[]>([]);
   const [statsOpen, setStatsOpen] = useState(false);
@@ -72,7 +72,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [appMenu, setAppMenu] = useState<{ x: number; y: number; selection: string } | null>(null);
 
-  const openAdd = useCallback((text = '') => setAddState({ open: true, text }), []);
+  const openAdd = useCallback((text = '', referer?: string) => setAddState({ open: true, text, referer }), []);
   const openMultiple = useCallback((tab: AddMultipleTab = 'paste', text = '') => setMultiState({ open: true, tab, text }), []);
   const [torrentState, setTorrentState] = useState<{ open: boolean; source: string; file: File | null }>({ open: false, source: '', file: null });
   const openTorrent = useCallback((source = '', file: File | null = null) => setTorrentState({ open: true, source, file }), []);
@@ -328,6 +328,15 @@ export default function App() {
     },
     [actions, toast],
   );
+
+  // The browser extension found a streaming video: let the user pick its quality.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const un = listen<{ url: string; referer?: string | null }>('stream-requested', (e) => openAdd(e.payload.url, e.payload.referer ?? undefined));
+    return () => {
+      un.then((f) => f()).catch(() => {});
+    };
+  }, [openAdd]);
 
   // The tray's "Settings" entry
   useEffect(() => {
@@ -647,6 +656,7 @@ export default function App() {
         onSubmit={addOne}
         queues={queues}
         defaultQueue={queueFilter === 'all' ? undefined : queueFilter}
+        initialReferer={addState.referer}
       />
       <AddTorrentDialog
         open={torrentState.open}

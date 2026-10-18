@@ -335,6 +335,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
         proxy_mode,
         custom_proxy_url,
         queue_id: None,
+        stream_variant: None,
     })
 }
 
@@ -545,4 +546,17 @@ pub async fn start_queue_cmd(state: State<'_, AppState>, id: String) -> Result<(
 #[tauri::command]
 pub async fn stop_queue_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.stop_queue(&id).await
+}
+
+// ───────────────────────────── streaming video ─────────────────────────────
+
+/// Looks inside an HLS / DASH link: its qualities, length and whether it can be downloaded.
+#[tauri::command]
+pub async fn probe_stream_cmd(
+    state: State<'_, AppState>,
+    url: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+) -> Result<crate::engine::stream::StreamProbe, String> {
+    state.probe_stream(url.trim(), referer, user_agent).await
 }

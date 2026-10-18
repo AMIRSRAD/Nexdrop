@@ -23,12 +23,16 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 ## 2. Streaming video (HLS / DASH)
 
-- [ ] Detect `.m3u8` playlists in the browser extension (network-level, not only `<video>` tags)
-- [ ] Download HLS media playlists (segments fetched in parallel, AES-128 decryption)
-- [ ] Choose a quality from a master playlist
-- [ ] Merge segments into one playable file (MP4/TS) without external tools
-- [ ] DASH (`.mpd`) manifests
-- [ ] Video grab bar shown on the page only when a stream is detected, with a quality picker
+- [x] Detect `.m3u8` and `.mpd` playlists in the browser extension (network-level, not only `<video>` tags)
+- [x] Download HLS media playlists (segments fetched in parallel, AES-128 decryption, byte ranges, resume from the last whole segment)
+- [x] Choose a quality from a master playlist
+- [x] Merge segments into one playable file: transport streams become one `.ts`; separate video and audio fragmented-MP4 tracks are joined into one `.mp4` without re-encoding
+- [x] DASH (`.mpd`) manifests (on-demand streams: segment templates, timelines, segment lists)
+- [~] Video button on the page: appears on videos and sends the detected stream; the quality picker is in Nexdrop's Add dialog, which opens by itself
+- [ ] Live streams (record until the stream ends)
+- [ ] Join separate audio for transport-stream HLS (needs re-muxing; the audio is saved next to the video as its own file for now)
+- [ ] Subtitle tracks (WebVTT)
+- Not planned: DRM-protected streams (Widevine / FairPlay / SAMPLE-AES): they are detected and refused with a clear message
 
 ## 3. Proxy depth
 

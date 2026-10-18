@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  StreamProbe,
   DownloadQueue,
   QueueInfo,
   AddDownloadRequest,
@@ -515,6 +516,27 @@ export const api = {
         extension: 'iso',
       },
     ];
+  },
+
+  /** Looks inside an HLS / DASH link: qualities, length, and whether it can be downloaded. */
+  async probeStream(url: string, referer?: string): Promise<StreamProbe> {
+    if (isTauri()) {
+      return await invoke<StreamProbe>('probe_stream_cmd', { url, referer: referer || null, userAgent: null });
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    return {
+      url,
+      kind: url.includes('.mpd') ? 'dash' : 'hls',
+      title: 'Sample stream',
+      filename: 'Sample stream.mp4',
+      duration_secs: 634,
+      variants: [
+        { id: '8000000:1920x1080', label: '1080p · 8.0 Mbit/s', bandwidth: 8000000, width: 1920, height: 1080, separate_audio: true },
+        { id: '4000000:1280x720', label: '720p · 4.0 Mbit/s', bandwidth: 4000000, width: 1280, height: 720, separate_audio: true },
+        { id: '1000000:640x360', label: '360p · 1.0 Mbit/s', bandwidth: 1000000, width: 640, height: 360, separate_audio: true },
+      ],
+      unsupported: null,
+    };
   },
 
   async getQueues(): Promise<QueueInfo[]> {

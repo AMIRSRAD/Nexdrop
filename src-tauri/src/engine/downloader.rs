@@ -79,11 +79,11 @@ const SINGLE_STREAM_ATTEMPTS: u32 = 5;
 
 #[derive(Clone)]
 pub struct DownloadEngine {
-    pool: Arc<ClientPool>,
-    global_limit: Arc<RateLimiter>,
+    pub(crate) pool: Arc<ClientPool>,
+    pub(crate) global_limit: Arc<RateLimiter>,
     /// Bandwidth shared by one group of downloads (a queue); set per run.
-    group_limit: Option<Arc<RateLimiter>>,
-    retry_base: Duration,
+    pub(crate) group_limit: Option<Arc<RateLimiter>>,
+    pub(crate) retry_base: Duration,
 }
 
 impl Default for DownloadEngine {
@@ -1358,7 +1358,7 @@ async fn attempt(
 // ─────────────────────────────── helpers ───────────────────────────────
 
 /// 1s, 2s, 4s ... capped at 30s, ±25% jitter; never shorter than a server's `Retry-After`.
-fn backoff_delay(base: Duration, failures: u32, retry_after: Option<Duration>) -> Duration {
+pub(crate) fn backoff_delay(base: Duration, failures: u32, retry_after: Option<Duration>) -> Duration {
     let exp = failures.saturating_sub(1).min(5);
     let raw = base.saturating_mul(1u32 << exp).min(base.saturating_mul(30));
     let unit = (std::collections::hash_map::RandomState::new().build_hasher().finish() % 1000) as f64 / 1000.0;
@@ -1378,7 +1378,7 @@ fn forget_resolved(shared: &Shared, stale: Option<&str>) {
 }
 
 /// Same scheme, host and port: safe to send that site's cookies and logins.
-fn same_host(a: &str, b: &str) -> bool {
+pub(crate) fn same_host(a: &str, b: &str) -> bool {
     match (url::Url::parse(a), url::Url::parse(b)) {
         (Ok(a), Ok(b)) => {
             a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
@@ -1435,7 +1435,7 @@ pub(crate) async fn wait_paused(rx: &mut watch::Receiver<bool>) {
 /// Room to spare beyond the file itself (temp files, other programs writing).
 const DISK_SPACE_MARGIN: u64 = 32 * 1024 * 1024;
 
-fn check_disk_space(dir: &Path, needed: u64) -> Result<(), String> {
+pub(crate) fn check_disk_space(dir: &Path, needed: u64) -> Result<(), String> {
     match free_space(dir) {
         Some(free) if free < needed.saturating_add(DISK_SPACE_MARGIN) => Err(format!(
             "Not enough free disk space: {} needed, {} available",
@@ -1457,14 +1457,14 @@ fn human_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
-fn paused(mut task: DownloadTask) -> DownloadTask {
+pub(crate) fn paused(mut task: DownloadTask) -> DownloadTask {
     task.status = DownloadStatus::Paused;
     task.speed_bps = 0;
     task.eta_seconds = None;
     task
 }
 
-fn finish_task(task: &mut DownloadTask, final_path: &Path) {
+pub(crate) fn finish_task(task: &mut DownloadTask, final_path: &Path) {
     task.destination_path = final_path
         .parent()
         .map(|p| p.to_string_lossy().to_string())
@@ -1476,7 +1476,7 @@ fn finish_task(task: &mut DownloadTask, final_path: &Path) {
     task.eta_seconds = None;
 }
 
-fn file_name_of(path: &Path) -> String {
+pub(crate) fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "download.bin".to_string())
