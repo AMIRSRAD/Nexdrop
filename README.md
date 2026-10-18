@@ -1,118 +1,93 @@
-# Nexdrop — A Modern Internet Download Manager
+# Nexdrop
 
-> **"Everything users need, nothing they don't."**
+A fast, safe, modern download manager for Windows, built with Tauri 2 (Rust) and React.
+Multi-connection acceleration, a real scheduler with queues, streaming-video downloads,
+torrents, and a browser extension that catches downloads and videos like IDM does.
 
-**Nexdrop** is a free, high-performance, cross-platform Internet Download Manager crafted with the visual elegance and responsiveness of modern desktop apps (Linear, Arc, Raycast) combined with the power of a multi-threaded Rust download acceleration engine.
+![Downloads](docs/screenshots/downloads.png)
 
----
+## What it does
 
-## Key Highlights & Capabilities
+**Fast and reliable**
+- Splits a file over up to 32 connections, resumes after pauses, crashes and restarts, and
+  keeps going through network drops (it waits out outages for up to ten minutes).
+- Replaces stalled connections, refreshes expired signed links, falls back to one stream
+  when a server can't do ranges, and checks free disk space first.
+- Measured against a local network lab: `ENGINE_REPORT.md`.
 
-- **Multi-Part Accelerated Downloads:**
-  - Automatic detection of HTTP `Accept-Ranges` and `Content-Range`.
-  - Splits files into $N$ contiguous segment streams (1 to 32 connections).
-  - High-speed concurrent disk streaming and atomic segment stitching.
-  - Graceful fallback to single-stream download for non-range servers.
-- **Resilience & Fault Recovery:**
-  - Pause and resume downloads across application restarts.
-  - Persisted segment byte ranges and progress in local SQLite database.
-  - Automatic retry with exponential backoff on network dropouts.
-- **Queue & Bandwidth Management:**
-  - Concurrency management (`max_active_downloads`).
-  - Priority queuing (Urgent, High, Normal).
-  - Configurable global and per-download speed caps.
-  - Scheduled downloads support.
-- **Refined Modern Desktop UI/UX:**
-  - Dark glassmorphism interface with Tailwind CSS v4 and Framer Motion.
-  - Live multi-stream segment visualizer showing individual worker activity.
-  - URL probing before download start (detects size, server range support, file type, and category).
-  - Clipboard detection and batch URL importing.
-  - Quick action controls: Pause, Resume, Retry, Cancel, Open File, and Reveal in File Explorer.
+**Queues and scheduler**
+- Create named queues. Each has its own schedule (days, start, optional stop), limits
+  (simultaneous downloads, shared speed cap), automatic retry, and a "when finished" action
+  (quit, sleep, hibernate, shut down, lock, or run a program).
+- Start now / Stop for any queue; downloads outside their schedule wait and say when they start.
 
----
+![Queues](docs/screenshots/queues.png)
 
-## Architecture Overview
+**Streaming video (HLS and DASH)**
+- Paste a `.m3u8` or `.mpd` link, pick a quality, and Nexdrop downloads the segments in
+  parallel (AES-128 supported), resumes from the last whole segment, and joins separate video
+  and audio into one playable `.mp4` without re-encoding.
 
-```
-Nexdrop
-├── src-tauri/               # Rust Desktop Core (Tauri 2)
-│   ├── src/
-│   │   ├── db/              # SQLite Persistence (rusqlite bundled)
-│   │   │   ├── models.rs    # Core domain models (DownloadTask, Segment, Settings)
-│   │   │   └── repository.rs# SQLite CRUD operations & queries
-│   │   ├── engine/          # Download Acceleration Engine
-│   │   │   ├── probe.rs     # HTTP HEAD / Range=0-0 probing & filename extraction
-│   │   │   ├── segment.rs   # Range partitioning & segment math
-│   │   │   ├── downloader.rs# Multi-stream worker engine & single-stream fallback
-│   │   │   ├── speed.rs     # Rolling window speed calculator & rate limiter
-│   │   │   └── manager.rs   # Queue orchestrator & Tauri event emitter
-│   │   ├── commands/        # Tauri IPC commands exposed to webview
-│   │   ├── lib.rs           # Application setup & handler registration
-│   │   └── main.rs          # Application entrypoint
-│   └── tests/               # Automated Integration & Unit Tests
-└── src/                     # React 19 + TypeScript + Tailwind CSS Frontend
-    ├── components/
-    │   ├── layout/          # Sidebar, Header & navigation
-    │   ├── downloads/       # DownloadCard, DownloadRow, SegmentBar, FileIcon, EmptyState
-    │   └── modals/          # NewDownloadModal, BatchDownloadModal, SettingsModal
-    ├── services/api.ts      # Tauri IPC client & real-time event listeners
-    └── types/download.ts    # TypeScript interface definitions
-```
+![Streaming video](docs/screenshots/add-stream.png)
 
----
+**Browser integration (Chrome, Edge, Brave, Firefox)**
+- Downloads your browser starts are handed to Nexdrop with your login cookies. Hold Alt on a
+  link to keep the browser's own handling.
+- A Download button over videos finds streams and video files the page loaded; the toolbar
+  icon lists them.
+- Setup is guided from inside the app and can be re-run any time (Settings > Browser).
 
-## Getting Started
+![Browser setup](docs/screenshots/connect-browsers.png)
 
-### Prerequisites
+**Also**: BitTorrent and magnet links with file selection, Mark of the Web on downloads,
+checksum verification, saved site logins (encrypted), proxy support, system tray with
+live status, start with Windows, and a single clean interface that stays out of the way.
 
-- **Node.js**: v20+ or v24+
-- **pnpm**: 11+
-- **Rust**: 1.85+ (Edition 2024 / rustc 1.90+)
-- **Windows**: WebView2 runtime (pre-installed on Windows 10/11)
+## Install
 
-### Development Setup
+Run `Nexdrop_<version>_x64-setup.exe`. It installs for the current user, needs no admin
+rights, and Nexdrop offers to connect your browsers the first time it starts.
 
-1. **Install Dependencies:**
-   ```bash
-   pnpm install
-   ```
+- **Firefox** gets a Mozilla-signed add-on (one click, permanent).
+- **Chrome / Edge / Brave** load the extension from Nexdrop's folder; the setup window opens
+  the extensions page and shows the folder. Developer mode has to be switched on by you.
 
-2. **Run Frontend in Dev Server:**
-   ```bash
-   pnpm dev
-   ```
+## Build from source
 
-3. **Run Full Desktop App (Tauri 2):**
-   ```bash
-   pnpm tauri:dev
-   ```
-
----
-
-## Testing & Verification
-
-Nexdrop includes unit and integration tests covering SQLite migrations, segment partitioning math, and an automated end-to-end integration test with an in-process mock HTTP range server:
+Needs Node 20+, pnpm, Rust 1.85+ and the MSVC build tools (WebView2 ships with Windows).
+Use a Git Bash shell on Windows so the native dependencies find the MSVC environment.
 
 ```bash
-# Run all tests in the Rust engine
-pnpm test:backend
+pnpm install
+pnpm tauri dev                 # run it
+bash scripts/release.sh        # build the installer into release/<version>/
 ```
 
-Tests verify:
-- Accurate segment chunk splitting with zero overlaps and zero gaps.
-- SQLite database migrations, updates, and status transitions.
-- Multi-stream range request execution and byte-for-byte file verification.
-- Pause/resume state recovery.
+`release/<version>/` gets `installer/` (the setup exe), `build/` (the app) and `extension/`
+(per-browser extension packages).
 
----
-
-## Production Build & Packaging
-
-Build the desktop installer:
+## Tests
 
 ```bash
-# Build frontend and production desktop binary
-pnpm tauri:build
+cd src-tauri && cargo test --release     # unit + integration tests
+cargo test --release --test network_lab -- --ignored --nocapture --test-threads=1
 ```
 
-Generated installer packages will be placed in `src-tauri/target/release/bundle/`.
+End-to-end scripts in `scripts/` drive the real app and real browsers:
+`e2e_release.py` (install, launch, tray, uninstall), `e2e_queues.py`, `e2e_streams.py`,
+`e2e_bridge.py`, `e2e_extension.py` (Edge and Firefox), `e2e_browser_connect.py`,
+`verify_streams.py` (decodes downloaded videos).
+
+## Project map
+
+```
+src/                  React 19 + TypeScript + Tailwind interface
+src-tauri/src/engine  download engine, queues, scheduler, streams (HLS/DASH), torrents
+src-tauri/src/browsers.rs   browser detection and extension connection status
+extensions/           browser extension (+ signed/ for the Mozilla-signed Firefox build)
+scripts/              release, signing, packaging and end-to-end test scripts
+docs/                 publishing guide and screenshots
+```
+
+More: `ROADMAP.md` (what's done and what's next), `ENGINE_REPORT.md` (speed and reliability
+measurements), `docs/browser-extension-publishing.md` (signing and store publishing).
