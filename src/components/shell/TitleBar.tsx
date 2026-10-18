@@ -1,14 +1,15 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, ChartColumn, Link2, ListPlus, Pause, Play, Settings, Terminal } from 'lucide-react';
+import { ArrowRight, ChartColumn, Link2, ListPlus, Magnet, Pause, Play, Settings, Terminal } from 'lucide-react';
 import { isTauri } from '../../services/api';
 import { Button, IconButton, Kbd } from '../ui/Button';
-import { looksLikeCurl } from '../../lib/meta';
+import { isMagnet, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 
 interface TitleBarProps {
   omniboxRef: React.RefObject<HTMLInputElement | null>;
   onSubmitLink: (text: string) => void;
   onAddMultiple: () => void;
+  onAddTorrent: () => void;
   onStats: () => void;
   onSettings: () => void;
   onPauseAll: () => void;
@@ -22,6 +23,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   omniboxRef,
   onSubmitLink,
   onAddMultiple,
+  onAddTorrent,
   onStats,
   onSettings,
   onPauseAll,
@@ -33,6 +35,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   const [value, setValue] = useState('');
   const [focused, setFocused] = useState(false);
   const isCurl = looksLikeCurl(value);
+  const isTorrent = isMagnet(value);
 
   const submit = () => {
     const text = value.trim();
@@ -87,13 +90,13 @@ export const TitleBar: React.FC<TitleBarProps> = ({
               }
             }}
             spellCheck={false}
-            placeholder="Paste a link or cURL command to download"
+            placeholder="Paste a link, magnet or cURL command to download"
             className="h-full w-full bg-transparent pr-24 pl-8 text-[13px] text-fg outline-none"
           />
           <div className="absolute right-1 flex items-center gap-1">
             {value.trim() ? (
               <Button type="submit" variant="primary" size="sm" className="h-6 gap-1 px-2">
-                {isCurl ? 'Import' : 'Download'}
+                {isCurl ? 'Import' : isTorrent ? 'Add torrent' : 'Download'}
                 <ArrowRight size={13} />
               </Button>
             ) : (
@@ -110,6 +113,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
       {/* Actions */}
       <div className="flex shrink-0 items-center gap-0.5">
+        <IconButton icon={Magnet} label="Add torrent" shortcut="Ctrl+T" onClick={onAddTorrent} />
         <IconButton icon={ListPlus} label="Add multiple" shortcut="Ctrl+B" onClick={onAddMultiple} />
         {canPauseAll || !canResumeAll ? (
           <IconButton icon={Pause} label="Pause all" onClick={onPauseAll} disabled={!canPauseAll} />

@@ -1,10 +1,11 @@
 import React from 'react';
+import { Magnet } from 'lucide-react';
 import { categoryMeta } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 
-export const FileTile: React.FC<{ category: string; size?: number; className?: string }> = React.memo(
-  ({ category, size = 32, className }) => {
-    const meta = categoryMeta(category);
+export const FileTile: React.FC<{ category: string; size?: number; className?: string; torrent?: boolean }> = React.memo(
+  ({ category, size = 32, className, torrent }) => {
+    const meta = torrent ? { icon: Magnet, color: 'var(--accent)' } : categoryMeta(category);
     const Icon = meta.icon;
     return (
       <div

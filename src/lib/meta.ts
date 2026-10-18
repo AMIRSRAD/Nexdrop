@@ -124,6 +124,22 @@ export function isHttpUrl(text: string): boolean {
   return /^https?:\/\/\S+$/i.test(text.trim());
 }
 
+/** A BitTorrent magnet link. */
+export function isMagnet(text: string): boolean {
+  return /^\s*magnet:\?/i.test(text) && /xt=urn:btih:/i.test(text);
+}
+
+/** An http(s) link to a .torrent file. */
+export function isTorrentUrl(text: string): boolean {
+  const t = text.trim();
+  if (!isHttpUrl(t)) return false;
+  try {
+    return new URL(t).pathname.toLowerCase().endsWith('.torrent');
+  } catch {
+    return false;
+  }
+}
+
 export function looksLikeCurl(text: string): boolean {
   return /^\s*curl(\.exe)?\s/i.test(text);
 }

@@ -2,12 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Download } from 'lucide-react';
 import { api } from './services/api';
-import type { AddDownloadRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
+import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
 import { useDownloads, errText } from './hooks/useDownloads';
 import { useSpeedHistory } from './hooks/useSpeedHistory';
 import { useTheme } from './hooks/useTheme';
 import { hasOpenLayer } from './lib/layers';
-import { STATUS_FILTERS, categoryMeta, extractUrls, looksLikeCurl, matchesStatus, progressOf, type StatusFilter } from './lib/meta';
+import { STATUS_FILTERS, categoryMeta, extractUrls, isMagnet, isTorrentUrl, looksLikeCurl, matchesStatus, progressOf, type StatusFilter } from './lib/meta';
 import { plural } from './utils/format';
 import { useToast } from './components/ui/Toast';
 import { Menu } from './components/ui/Menu';
@@ -19,6 +19,7 @@ import { EmptyState } from './components/transfers/EmptyState';
 import { buildTaskMenu, canPause, canResume, canRetry, type TaskHandlers } from './components/transfers/taskMenu';
 import { AddDownloadDialog } from './components/dialogs/AddDownloadDialog';
 import { AddMultipleDialog, type AddMultipleTab } from './components/dialogs/AddMultipleDialog';
+import { AddTorrentDialog } from './components/dialogs/AddTorrentDialog';
 import { RemoveDialog } from './components/dialogs/RemoveDialog';
 import { StatsDialog } from './components/dialogs/StatsDialog';
 import { SettingsView, type SettingsSection } from './components/settings/SettingsView';
@@ -47,6 +48,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   scheduler_action: 'none',
   scan_with_antivirus: true,
   antivirus_path: undefined,
+  torrent_seed_after_download: true,
+  torrent_ratio_limit: 1,
+  torrent_upload_limit: 0,
+  torrent_dht: true,
+  torrent_upnp: false,
 };
 
 const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|xz|bz2|iso|img|exe|msi|dmg|pkg|deb|rpm|apk|mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|pdf|epub|bin)(\?|#|$)/i;
@@ -65,9 +71,14 @@ export default function App() {
 
   const openAdd = useCallback((text = '') => setAddState({ open: true, text }), []);
   const openMultiple = useCallback((tab: AddMultipleTab = 'paste', text = '') => setMultiState({ open: true, tab, text }), []);
+  const [torrentState, setTorrentState] = useState<{ open: boolean; source: string; file: File | null }>({ open: false, source: '', file: null });
+  const openTorrent = useCallback((source = '', file: File | null = null) => setTorrentState({ open: true, source, file }), []);
 
   /* ── data ────────────────────────────────────────── */
-  const { downloads, loaded, actions } = useDownloads(() => openAdd());
+  const { downloads, loaded, actions } = useDownloads(
+    () => openAdd(),
+    (source) => openTorrent(source),
+  );
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const settingsRef = useRef(settings);
@@ -205,6 +216,8 @@ export default function App() {
         await navigator.clipboard.writeText(cmd);
         toast.show({ id: 'copied', tone: 'success', title: 'cURL command copied', duration: 1800 });
       },
+      stopSeeding: (id) => actions.stopSeeding(id).catch((err) => toast.show({ tone: 'error', title: "Couldn't stop sharing", description: errText(err) })),
+      startSeeding: (id) => actions.startSeeding(id).catch((err) => toast.show({ tone: 'error', title: "Couldn't start sharing", description: errText(err) })),
       requestRemove: (ids) => setRemoveIds(ids),
       toggleExpand: (id) => setExpandedId((cur) => (cur === id ? null : id)),
       toggleSelect: (id, range) => {
@@ -253,13 +266,14 @@ export default function App() {
       const text = raw.trim();
       if (!text) return;
       if (looksLikeCurl(text)) return openAdd(text);
+      if (isMagnet(text) || isTorrentUrl(text)) return openTorrent(text);
       const urls = extractUrls(text);
       if (urls.length > 1) return openMultiple('paste', urls.join('\n'));
       if (urls.length === 1) return openAdd(urls[0]);
       if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(text)) return openAdd(`https://${text}`);
       toast.show({ id: 'not-a-link', tone: 'error', title: 'That doesn’t look like a link', description: 'Links start with http:// or https://' });
     },
-    [openAdd, openMultiple, toast],
+    [openAdd, openMultiple, openTorrent, toast],
   );
 
   const addOne = useCallback(
@@ -272,6 +286,15 @@ export default function App() {
         description: task.filename,
       });
       setStatus((s) => (s === 'all' || matchesStatus(task.status, s) ? s : 'all'));
+    },
+    [actions, toast],
+  );
+
+  const addTorrent = useCallback(
+    async (req: AddTorrentRequest) => {
+      const task = await actions.addTorrent(req);
+      toast.show({ id: `added-${task.id}`, tone: 'success', title: 'Torrent added', description: task.filename });
+      setStatus('all');
     },
     [actions, toast],
   );
@@ -298,6 +321,9 @@ export default function App() {
       if (mod && k === 'n') {
         e.preventDefault();
         openAdd();
+      } else if (mod && k === 't') {
+        e.preventDefault();
+        openTorrent();
       } else if (mod && k === 'b') {
         e.preventDefault();
         openMultiple();
@@ -333,7 +359,7 @@ export default function App() {
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('paste', onPaste);
     };
-  }, [openAdd, openMultiple, routeText, settingsView.open, selection.size, expandedId]);
+  }, [openAdd, openMultiple, openTorrent, routeText, settingsView.open, selection.size, expandedId]);
 
   // Offer copied file links when the window regains focus
   const lastClip = useRef('');
@@ -367,7 +393,7 @@ export default function App() {
   const dragDepth = useRef(0);
   const isLinkDrag = (e: React.DragEvent) => {
     const types = Array.from(e.dataTransfer.types);
-    return types.includes('text/uri-list') || (types.includes('text/plain') && !types.includes('Files'));
+    return types.includes('Files') || types.includes('text/uri-list') || types.includes('text/plain');
   };
 
   /* ── render ──────────────────────────────────────── */
@@ -398,6 +424,15 @@ export default function App() {
       onDrop={(e) => {
         dragDepth.current = 0;
         setDragging(false);
+        const files = Array.from(e.dataTransfer.files ?? []);
+        if (files.length > 0) {
+          // Dropping a file onto the window would otherwise navigate the webview to it.
+          e.preventDefault();
+          const torrent = files.find((f) => f.name.toLowerCase().endsWith('.torrent'));
+          if (torrent) openTorrent('', torrent);
+          else toast.show({ id: 'drop-file', tone: 'error', title: 'Only .torrent files can be dropped here', duration: 3000 });
+          return;
+        }
         const text = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
         if (text) {
           e.preventDefault();
@@ -409,6 +444,7 @@ export default function App() {
         omniboxRef={omniboxRef}
         onSubmitLink={routeText}
         onAddMultiple={() => openMultiple()}
+        onAddTorrent={() => openTorrent()}
         onStats={() => setStatsOpen(true)}
         onSettings={() => setSettingsView((v) => ({ ...v, open: !v.open }))}
         onPauseAll={() => actions.pause(activeIds)}
@@ -523,6 +559,14 @@ export default function App() {
         settings={settings}
         onClose={() => setAddState((s) => ({ ...s, open: false }))}
         onSubmit={addOne}
+      />
+      <AddTorrentDialog
+        open={torrentState.open}
+        initialSource={torrentState.source}
+        initialFile={torrentState.file}
+        settings={settings}
+        onClose={() => setTorrentState((s) => ({ ...s, open: false }))}
+        onSubmit={addTorrent}
       />
       <AddMultipleDialog
         open={multiState.open}

@@ -94,6 +94,32 @@ Tests: 40 Rust tests pass (24 unit and 16 integration), stable over 5 runs. Cove
 
 Tests: 80 Rust tests pass (60 unit and 20 integration).
 
+### Phase 4 status: torrents (branch `feat/torrents-phase-4`)
+
+Built on `librqbit` 9 (pure Rust, same Tokio runtime). A torrent is a normal download with `kind = "torrent"`, so it shares the queue, pause/resume, notifications and the list.
+
+| Area | Status | Details |
+|------|--------|---------|
+| Magnet links and `.torrent` files | ✅ | Paste a magnet link or `.torrent` URL in the bar, press **Ctrl+T**, use the title-bar magnet button, drop a `.torrent` file on the window, or choose a file. The extension routes magnet links and `.torrent` URLs to the app, which asks before anything starts. |
+| Look inside first | ✅ | The Add torrent dialog resolves the name and file list before anything downloads (a magnet takes a moment while peers are found). The metadata is cached for 15 minutes so adding doesn't fetch it twice. |
+| File selection | ✅ | Pick which files to download (select all/none, sizes, running total). Unselected files are never downloaded. The byte map shows one segment per selected file, and a **Files** tab shows per-file progress. |
+| Seeding | ✅ | Finished torrents keep sharing by default. Settings → **Torrents** has: keep sharing, stop at a ratio (0.5× to 5× or never), an upload speed limit, DHT, and UPnP (off by default). Rows show *Seeding · ratio · ↑ speed*, and each torrent has stop/start sharing. Sharing resumes after a restart. |
+| Speed limits | ✅ | The torrent download rate follows the global limit (including the scheduler window cap), and the upload rate follows its own limit. Both update live. |
+| Safety | ✅ | **Torrent metadata is untrusted.** Names are rejected up front if they contain `:` (a hidden NTFS stream, or another drive), `..`, absolute paths, reserved device names, trailing dots/spaces, `\ * ? " < > \|` or control/bidi characters. A fresh add never overwrites existing files (files are only reused for a torrent Nexdrop started itself). Free disk space is checked first. Finished files get the Mark of the Web. |
+| Persistence | ✅ | Nexdrop's database is the source of truth. The `.torrent` bytes are stored with the task, so resume doesn't refetch metadata, and librqbit's own persistence is off. |
+| Removing | ✅ | Removing a torrent stops it, and "delete files" removes exactly the files it downloaded (plus emptied sub-folders). It never deletes a folder that still has other files. |
+
+**Tested for real:** 3 integration tests build a torrent and seed it from a real librqbit session over loopback, and our engine downloads it: file selection, pause/resume byte-exact, seeding/stop/remove, and refusing to overwrite. `python scripts/e2e_torrent.py` drives the **real app** (19 of 19 checks): a local tracker + seeder, then probe, add, duplicate and empty-selection refusal, download byte-exact, unselected file absent, Mark of the Web, DB state, stop/start sharing, and removal with files. `scripts/torrent_swarm.py` starts that swarm for manual testing.
+
+**Not done / limitations (be aware):**
+- Only a **local swarm** has been tested. Real internet swarms (DHT discovery, NAT traversal, real tracker behaviour) are untested.
+- There is no OS-level `magnet:` / `.torrent` association yet (that needs the deep-link plugin plus installer config). Magnet links work when pasted, dropped, or sent from the extension.
+- librqbit can't bind to a network interface on Windows, so "only use my VPN" isn't offered. Run behind a VPN at the system level.
+- No seeding time limit, only a ratio limit. Selected files can't be changed after adding.
+- Windows Firewall will prompt the first time a torrent starts listening.
+- The build uses librqbit's native-TLS feature, because its rustls option needs NASM (the PowerShell tool lacks the MSVC environment, so build in a Developer shell or via Git Bash).
+- The UI was checked in the browser preview with mock data and through the real app's IPC, but not by clicking the real window.
+
 About a dozen settings and features in the UI do nothing in the backend (see §6). The most important ones are **global speed limit, scheduled downloads, "when all finish → shut down", and site logins**.
 
 ---

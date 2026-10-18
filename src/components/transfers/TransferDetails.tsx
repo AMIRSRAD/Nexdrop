@@ -12,18 +12,24 @@ import { ProgressTrack } from './ProgressTrack';
 import type { TaskHandlers } from './taskMenu';
 import { errText } from '../../hooks/useDownloads';
 
-type Tab = 'overview' | 'connections' | 'integrity';
+type Tab = 'overview' | 'connections' | 'files' | 'integrity';
 
 export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandlers }> = ({ task, handlers }) => {
   const [tab, setTab] = useState<Tab>('overview');
   // Segments are the file's byte map: finished ranges plus the ranges being
   // downloaded right now (one per open connection).
   const liveCount = task.status === 'downloading' ? task.segments.filter((s) => s.status === 'downloading').length : 0;
-  const tabs: { id: Tab; label: string }[] = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'connections', label: `Connections${liveCount > 0 ? ` · ${liveCount}` : ''}` },
-    { id: 'integrity', label: 'Integrity' },
-  ];
+  const isTorrent = task.kind === 'torrent';
+  const tabs: { id: Tab; label: string }[] = isTorrent
+    ? [
+        { id: 'overview', label: 'Overview' },
+        { id: 'files', label: `Files · ${task.torrent_files?.length ?? 0}` },
+      ]
+    : [
+        { id: 'overview', label: 'Overview' },
+        { id: 'connections', label: `Connections${liveCount > 0 ? ` · ${liveCount}` : ''}` },
+        { id: 'integrity', label: 'Integrity' },
+      ];
 
   return (
     <div className="pt-1 pr-6 pb-5 pl-[80px]" onClick={(e) => e.stopPropagation()}>
@@ -44,16 +50,19 @@ export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandl
         ))}
         <div className="ml-auto flex items-center gap-1 pb-1">
           <Button size="sm" variant="ghost" icon={Copy} onClick={() => handlers.copyLink(task)}>
-            Copy link
+            {isTorrent ? 'Copy magnet link' : 'Copy link'}
           </Button>
-          <Button size="sm" variant="ghost" icon={Terminal} onClick={() => handlers.copyCurl(task)}>
-            cURL
-          </Button>
+          {!isTorrent && (
+            <Button size="sm" variant="ghost" icon={Terminal} onClick={() => handlers.copyCurl(task)}>
+              cURL
+            </Button>
+          )}
         </div>
       </div>
 
       {tab === 'overview' && <Overview task={task} handlers={handlers} />}
       {tab === 'connections' && <Connections task={task} />}
+      {tab === 'files' && <TorrentFiles task={task} />}
       {tab === 'integrity' && <Integrity task={task} />}
     </div>
   );
@@ -83,7 +92,33 @@ const Overview: React.FC<{ task: DownloadTask; handlers: TaskHandlers }> = ({ ta
         </Button>
       </div>
 
-      <dl className="grid grid-cols-4 gap-x-6 gap-y-3 rounded-lg bg-surface-2 p-3.5 shadow-[inset_0_0_0_1px_var(--line)]">
+      {task.kind === 'torrent' ? (
+        <dl className="grid grid-cols-4 gap-x-6 gap-y-3 rounded-lg bg-surface-2 p-3.5 shadow-[inset_0_0_0_1px_var(--line)]">
+          <Row label="Status">
+            <span className="font-medium" style={{ color: STATUS_COLOR[task.status] }}>
+              {task.status === 'completed' && task.seeding ? 'Seeding' : STATUS_LABEL[task.status]}
+            </span>
+          </Row>
+          <Row label="Downloaded">
+            {formatBytes(task.downloaded_bytes)} {task.total_bytes > 0 && <span className="text-fg-3">of {formatBytes(task.total_bytes)}</span>}
+          </Row>
+          <Row label="Uploaded">{formatBytes(task.uploaded_bytes ?? 0)}</Row>
+          <Row label="Share ratio">{task.total_bytes > 0 ? ((task.uploaded_bytes ?? 0) / task.total_bytes).toFixed(2) : '—'}</Row>
+          <Row label="Connected peers">{task.peers ?? 0}</Row>
+          <Row label="Sharing">{task.seeding ? 'Yes' : 'No'}</Row>
+          <Row label="Added">{formatDate(task.created_at)}</Row>
+          <Row label="Finished">{task.completed_at ? formatDate(task.completed_at) : '—'}</Row>
+          <Row label="Info hash" mono className="col-span-4">
+            {task.info_hash || '—'}
+          </Row>
+        </dl>
+      ) : null}
+      <dl
+        className={cn(
+          'grid grid-cols-4 gap-x-6 gap-y-3 rounded-lg bg-surface-2 p-3.5 shadow-[inset_0_0_0_1px_var(--line)]',
+          task.kind === 'torrent' && 'hidden',
+        )}
+      >
         <Row label="Status">
           <span className="font-medium" style={{ color: STATUS_COLOR[task.status] }}>
             {STATUS_LABEL[task.status]}
@@ -138,6 +173,49 @@ const Overview: React.FC<{ task: DownloadTask; handlers: TaskHandlers }> = ({ ta
           </ul>
         </div>
       )}
+    </div>
+  );
+};
+
+const TorrentFiles: React.FC<{ task: DownloadTask }> = ({ task }) => {
+  const files = task.torrent_files ?? [];
+  // Segments describe the selected files, in order.
+  const selected = files.filter((f) => f.selected);
+  const progressOf = (index: number) => {
+    const pos = selected.findIndex((f) => f.index === index);
+    if (task.status === 'completed') return 1;
+    const seg = pos >= 0 ? task.segments[pos] : undefined;
+    return seg && seg.total_bytes > 0 ? Math.min(1, seg.downloaded_bytes / seg.total_bytes) : 0;
+  };
+  if (files.length === 0) {
+    return <div className="rounded-lg bg-surface-2 p-4 text-[12.5px] text-fg-2">The file list appears once the torrent has started.</div>;
+  }
+  return (
+    <div className="max-h-[260px] overflow-y-auto rounded-lg bg-surface-2 p-1 shadow-[inset_0_0_0_1px_var(--line)]">
+      {files.map((f) => {
+        const p = progressOf(f.index);
+        const parts = f.path.split('/');
+        const name = parts.pop() ?? f.path;
+        const dir = parts.join('/');
+        return (
+          <div key={f.index} className={cn('flex items-center gap-3 rounded-md px-2.5 py-1.5', !f.selected && 'opacity-50')}>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[12.5px]" title={f.path}>
+                {dir && <span className="text-fg-3">{dir}/</span>}
+                <span className="font-medium text-fg">{name}</span>
+              </div>
+              {f.selected ? (
+                <ProgressTrack progress={p} status={p >= 1 ? 'completed' : task.status} totalBytes={f.length} height={3} className="mt-1.5" />
+              ) : (
+                <div className="mt-0.5 text-[11.5px] text-fg-3">Not downloading</div>
+              )}
+            </div>
+            <div className="w-[120px] shrink-0 text-right text-[12px] whitespace-nowrap text-fg-3 tabular">
+              {f.selected ? `${Math.round(p * 100)}%` : ''} <span className="ml-1">{formatBytes(f.length)}</span>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 };

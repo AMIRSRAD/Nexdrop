@@ -15,7 +15,8 @@ const TASK_COLUMNS: &str = "id, url, final_url, filename, destination_path, temp
     completed_at, error_message, scheduled_time, checksum_sha256,
     checksum_md5, user_agent, referer, mirrors, min_chunk_size,
     proxy_mode, custom_proxy_url, antivirus_status,
-    expected_checksum, custom_headers";
+    expected_checksum, custom_headers,
+    kind, info_hash, uploaded_bytes, seeding, torrent_files";
 
 /// Header maps hold cookies and tokens, so they are encrypted before they hit the disk.
 fn encode_headers(headers: &std::collections::HashMap<String, String>) -> Option<String> {
@@ -142,6 +143,14 @@ impl Repository {
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN antivirus_status TEXT", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN expected_checksum TEXT", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN custom_headers TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN kind TEXT NOT NULL DEFAULT 'http'", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN info_hash TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN uploaded_bytes INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN seeding INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_files TEXT", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_bytes BLOB", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_started INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_info_hash ON downloads(info_hash)", []);
 
         Ok(())
     }
@@ -156,7 +165,8 @@ impl Repository {
                 completed_at, error_message, scheduled_time, checksum_sha256,
                 checksum_md5, user_agent, referer, mirrors, min_chunk_size,
                 proxy_mode, custom_proxy_url, antivirus_status,
-                expected_checksum, custom_headers
+                expected_checksum, custom_headers,
+                kind, info_hash, uploaded_bytes, seeding, torrent_files
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
@@ -164,7 +174,8 @@ impl Repository {
                 ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32, ?33,
-                ?34, ?35
+                ?34, ?35,
+                ?36, ?37, ?38, ?39, ?40
             )
             ON CONFLICT(id) DO UPDATE SET
                 final_url = excluded.final_url,
@@ -198,7 +209,12 @@ impl Repository {
                 custom_proxy_url = excluded.custom_proxy_url,
                 antivirus_status = excluded.antivirus_status,
                 expected_checksum = excluded.expected_checksum,
-                custom_headers = excluded.custom_headers;",
+                custom_headers = excluded.custom_headers,
+                kind = excluded.kind,
+                info_hash = excluded.info_hash,
+                uploaded_bytes = excluded.uploaded_bytes,
+                seeding = excluded.seeding,
+                torrent_files = excluded.torrent_files;",
             params![
                 task.id,
                 task.url,
@@ -235,6 +251,11 @@ impl Repository {
                 task.antivirus_status,
                 task.expected_checksum,
                 encode_headers(&task.custom_headers),
+                task.kind,
+                task.info_hash,
+                task.uploaded_bytes,
+                if task.seeding { 1 } else { 0 },
+                if task.torrent_files.is_empty() { None } else { serde_json::to_string(&task.torrent_files).ok() },
             ],
         )?;
 
@@ -447,6 +468,16 @@ let status_str: String = row.get(8)?;
             antivirus_status,
             expected_checksum: row.get(33).unwrap_or(None),
             custom_headers: decode_headers(row.get(34).unwrap_or(None)),
+            kind: row.get::<_, Option<String>>(35).unwrap_or(None).unwrap_or_else(|| "http".to_string()),
+            info_hash: row.get(36).unwrap_or(None),
+            uploaded_bytes: row.get(37).unwrap_or(0),
+            peers: 0,
+            seeding: row.get::<_, i32>(38).unwrap_or(0) == 1,
+            torrent_files: row
+                .get::<_, Option<String>>(39)
+                .unwrap_or(None)
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -481,6 +512,43 @@ let status_str: String = row.get(8)?;
         } else {
             Ok(None)
         }
+    }
+
+    /// The `.torrent` file contents kept so a torrent can resume without re-fetching its metadata.
+    pub fn save_torrent_bytes(conn: &Connection, id: &str, bytes: &[u8]) -> Result<()> {
+        conn.execute("UPDATE downloads SET torrent_bytes = ?1 WHERE id = ?2", params![bytes, id])?;
+        Ok(())
+    }
+
+    pub fn get_torrent_bytes(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> {
+        conn.query_row("SELECT torrent_bytes FROM downloads WHERE id = ?1", params![id], |r| r.get(0))
+    }
+
+    /// Whether a torrent has ever been started, i.e. whether files in its folder are ours.
+    pub fn torrent_started(conn: &Connection, id: &str) -> Result<bool> {
+        conn.query_row("SELECT torrent_started FROM downloads WHERE id = ?1", params![id], |r| Ok(r.get::<_, i32>(0)? == 1))
+    }
+
+    pub fn mark_torrent_started(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute("UPDATE downloads SET torrent_started = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn update_torrent_state(conn: &Connection, id: &str, uploaded_bytes: i64, seeding: bool) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads SET uploaded_bytes = ?1, seeding = ?2 WHERE id = ?3",
+            params![uploaded_bytes, if seeding { 1 } else { 0 }, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_by_info_hash(conn: &Connection, info_hash: &str) -> Result<Option<String>> {
+        let mut stmt = conn.prepare("SELECT id FROM downloads WHERE info_hash = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![info_hash])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
     }
 
     pub fn update_antivirus_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
@@ -694,6 +762,12 @@ mod tests {
             antivirus_status: None,
             expected_checksum: Some("abc123".to_string()),
             custom_headers: [("Cookie".to_string(), "sid=1".to_string())].into_iter().collect(),
+            kind: "http".to_string(),
+            info_hash: None,
+            uploaded_bytes: 0,
+            peers: 0,
+            seeding: false,
+            torrent_files: vec![],
         };
 
         // 1. Save
@@ -874,6 +948,12 @@ mod tests {
             antivirus_status: None,
             expected_checksum: None,
             custom_headers: Default::default(),
+            kind: "http".to_string(),
+            info_hash: None,
+            uploaded_bytes: 0,
+            peers: 0,
+            seeding: false,
+            torrent_files: vec![],
         }
     }
 }

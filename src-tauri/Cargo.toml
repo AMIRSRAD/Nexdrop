@@ -32,6 +32,7 @@ thiserror = "2.0"
 sha2 = "0.10"
 md-5 = "0.10"
 log = "0.4"
+librqbit = { version = "9.0.1", default-features = false, features = ["default-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

@@ -55,7 +55,7 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
 
   // Check if extension is downloadable
   const filename = downloadItem.filename || '';
-  const isTargetExtension = /\.(zip|rar|7z|tar|gz|iso|dmg|exe|msi|apk|mp4|mkv|webm|avi|mp3|flac|pdf|docx|xlsx)$/i.test(
+  const isTargetExtension = /\.(zip|rar|7z|tar|gz|iso|dmg|exe|msi|apk|mp4|mkv|webm|avi|mp3|flac|pdf|docx|xlsx|torrent)$/i.test(
     url.split('?')[0]
   );
 

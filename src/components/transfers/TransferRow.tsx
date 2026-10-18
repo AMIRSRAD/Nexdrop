@@ -1,6 +1,6 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { CalendarClock, CircleCheck, Ellipsis, ExternalLink, FolderOpen, Pause, Play, RotateCw } from 'lucide-react';
+import { ArrowUp, CalendarClock, CircleCheck, Ellipsis, ExternalLink, FolderOpen, Pause, Play, Radio, RotateCw, Square } from 'lucide-react';
 import type { DownloadTask } from '../../types/download';
 import { formatBytes, formatDate, formatDuration, formatRelative, formatSpeed, hostOf } from '../../utils/format';
 import { progressOf } from '../../lib/meta';
@@ -26,6 +26,7 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
     const progress = progressOf(task);
     const isActive = task.status === 'downloading';
     const done = task.status === 'completed';
+    const seeding = done && task.kind === 'torrent' && !!task.seeding;
 
     const onRowClick = (e: React.MouseEvent) => {
       h.focus(task.id);
@@ -77,7 +78,7 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
 
           {/* Name */}
           <div className="flex min-w-0 items-center gap-3 pr-4">
-            <FileTile category={task.category} />
+            <FileTile category={task.category} torrent={task.kind === 'torrent'} />
             <div className="min-w-0">
               <div className={cn('truncate text-[13px] font-medium', done || isActive ? 'text-fg' : 'text-fg-2')} title={task.filename}>
                 {task.filename}
@@ -97,8 +98,22 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
           </div>
 
           {/* Speed */}
-          <div className={cn('pr-4 text-right text-[12.5px] tabular', isActive && task.speed_bps > 0 ? 'font-medium text-fg' : 'text-fg-3')}>
-            {isActive && task.speed_bps > 0 ? formatSpeed(task.speed_bps) : '—'}
+          <div
+            className={cn(
+              'pr-4 text-right text-[12.5px] tabular',
+              (isActive && task.speed_bps > 0) || seeding ? 'font-medium text-fg' : 'text-fg-3',
+            )}
+          >
+            {isActive && task.speed_bps > 0 ? (
+              formatSpeed(task.speed_bps)
+            ) : seeding && (task.upload_bps ?? 0) > 0 ? (
+              <span className="inline-flex items-center gap-0.5 text-accent">
+                <ArrowUp size={12} strokeWidth={2.4} />
+                {formatSpeed(task.upload_bps ?? 0)}
+              </span>
+            ) : (
+              '—'
+            )}
           </div>
 
           {/* ETA */}
@@ -121,6 +136,14 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
             onDoubleClick={(e) => e.stopPropagation()}
           >
             <PrimaryAction task={task} h={h} />
+            {done && task.kind === 'torrent' && (
+              <IconButton
+                size="sm"
+                icon={seeding ? Square : Radio}
+                label={seeding ? 'Stop sharing' : 'Start sharing'}
+                onClick={() => (seeding ? h.stopSeeding(task.id) : h.startSeeding(task.id))}
+              />
+            )}
             <IconButton size="sm" icon={FolderOpen} label="Show in folder" onClick={() => h.reveal(task.id)} />
             <IconButton
               size="sm"
@@ -165,6 +188,14 @@ const PrimaryAction: React.FC<{ task: DownloadTask; h: TaskHandlers }> = ({ task
 };
 
 const Subline: React.FC<{ task: DownloadTask }> = ({ task }) => {
+  if (task.kind === 'torrent' && task.status !== 'failed') {
+    const files = task.torrent_files?.length ?? 0;
+    const ratio = task.total_bytes > 0 ? (task.uploaded_bytes ?? 0) / task.total_bytes : 0;
+    const bits: string[] = [files > 1 ? `Torrent · ${files} files` : 'Torrent'];
+    if (task.status === 'downloading') bits.push(`${task.peers ?? 0} peers`);
+    if (task.status === 'completed') bits.push(task.seeding ? `ratio ${ratio.toFixed(2)}` : 'not sharing');
+    return <div className="truncate text-[12px] text-fg-3">{bits.join(' · ')}</div>;
+  }
   const host = hostOf(task.url);
   if ((task.status === 'failed' || task.status === 'canceled') && task.error_message) {
     return (
@@ -194,6 +225,16 @@ const Subline: React.FC<{ task: DownloadTask }> = ({ task }) => {
 };
 
 const ProgressCell: React.FC<{ task: DownloadTask; progress: number }> = ({ task, progress }) => {
+  if (task.status === 'completed' && task.kind === 'torrent' && task.seeding) {
+    const ratio = task.total_bytes > 0 ? (task.uploaded_bytes ?? 0) / task.total_bytes : 0;
+    return (
+      <div className="flex items-center gap-1.5 text-[12.5px] text-accent">
+        <Radio size={14} className="nx-pulse" />
+        <span className="font-medium">Seeding</span>
+        <span className="truncate text-fg-3 tabular">· {ratio.toFixed(2)}</span>
+      </div>
+    );
+  }
   if (task.status === 'completed') {
     return (
       <div className="flex items-center gap-1.5 text-[12.5px] text-success">

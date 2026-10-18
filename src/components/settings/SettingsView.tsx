@@ -8,6 +8,7 @@ import {
   Copy,
   Folder,
   Key,
+  Magnet,
   Monitor,
   Moon,
   Network,
@@ -36,6 +37,7 @@ export type SettingsSection =
   | 'scheduler'
   | 'notifications'
   | 'security'
+  | 'torrents'
   | 'logins'
   | 'integrations';
 
@@ -46,6 +48,7 @@ const SECTIONS: { id: SettingsSection; label: string; icon: LucideIcon }[] = [
   { id: 'scheduler', label: 'Scheduler', icon: CalendarClock },
   { id: 'notifications', label: 'When finished', icon: Bell },
   { id: 'security', label: 'Security', icon: ShieldCheck },
+  { id: 'torrents', label: 'Torrents', icon: Magnet },
   { id: 'logins', label: 'Site logins', icon: Key },
   { id: 'integrations', label: 'Browser', icon: Puzzle },
 ];
@@ -122,6 +125,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'scheduler' && <Scheduler s={settings} set={onChange} />}
           {section === 'notifications' && <Notifications s={settings} set={onChange} />}
           {section === 'security' && <Security s={settings} set={onChange} />}
+          {section === 'torrents' && <Torrents s={settings} set={onChange} />}
           {section === 'logins' && <Logins />}
           {section === 'integrations' && <Integrations />}
         </div>
@@ -405,6 +409,48 @@ const Security: React.FC<SectionProps> = ({ s, set }) => (
       </SettingRow>
     )}
   </Group>
+);
+
+const Torrents: React.FC<SectionProps> = ({ s, set }) => (
+  <>
+    <Group title="Sharing">
+      <SettingRow title="Keep sharing after a torrent finishes" description="Seeding is how the torrent network stays healthy: others download from you while you share.">
+        <Switch checked={s.torrent_seed_after_download} onChange={(v) => set({ torrent_seed_after_download: v })} label="Keep sharing after finishing" />
+      </SettingRow>
+      <SettingRow title="Stop sharing at ratio" description="Uploaded ÷ downloaded. A ratio of 1 means you gave back as much as you took. 0 never stops on its own.">
+        <Select
+          value={s.torrent_ratio_limit || 0}
+          onValueChange={(v) => set({ torrent_ratio_limit: parseFloat(v) })}
+          options={[0, 0.5, 1, 1.5, 2, 3, 5]
+            .concat(s.torrent_ratio_limit && ![0.5, 1, 1.5, 2, 3, 5].includes(s.torrent_ratio_limit) ? [s.torrent_ratio_limit] : [])
+            .sort((a, b) => a - b)
+            .map((v) => ({ value: v, label: v === 0 ? 'Never stop' : `${v}×` }))}
+          className="w-36"
+        />
+      </SettingRow>
+      <SettingRow title="Upload speed limit" description="Caps how fast you share. Download speed follows the global limit in the status bar.">
+        <NumberInput
+          value={kb(s.torrent_upload_limit)}
+          unit="KB/s"
+          placeholder="Unlimited"
+          onChange={(v) => set({ torrent_upload_limit: v * 1024 })}
+          className="w-36"
+        />
+      </SettingRow>
+    </Group>
+    <Group title="Finding peers">
+      <SettingRow title="Use DHT" description="Finds peers without a tracker. Needed for magnet links to work reliably.">
+        <Switch checked={s.torrent_dht} onChange={(v) => set({ torrent_dht: v })} label="Use DHT" />
+      </SettingRow>
+      <SettingRow title="Open the port on my router (UPnP)" description="Lets more peers connect to you, which speeds up sharing. Takes effect after restarting Nexdrop.">
+        <Switch checked={s.torrent_upnp} onChange={(v) => set({ torrent_upnp: v })} label="Use UPnP" />
+      </SettingRow>
+    </Group>
+    <p className="text-[12.5px] leading-relaxed text-fg-3">
+      Torrents connect you directly to other people, so your IP address is visible to them. If that matters, run Nexdrop behind a VPN. Windows may ask to allow
+      Nexdrop through the firewall the first time a torrent starts: allow private networks so peers can connect.
+    </p>
+  </>
 );
 
 const Logins: React.FC = () => {

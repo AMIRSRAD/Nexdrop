@@ -9,6 +9,7 @@ pub mod ranges;
 pub mod scheduler;
 pub mod security;
 pub mod segment;
+pub mod torrent;
 pub mod speed;
 
 pub use checksum::{compute_checksums, verify_file_checksum};

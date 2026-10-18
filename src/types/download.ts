@@ -62,6 +62,47 @@ export interface DownloadTask {
   antivirus_status?: 'clean' | 'threat_detected' | 'scanning' | 'skipped';
   /** Hash the user expects; checked automatically when the download finishes. */
   expected_checksum?: string;
+  /** 'http' for a normal download, 'torrent' for BitTorrent. */
+  kind?: 'http' | 'torrent';
+  info_hash?: string;
+  uploaded_bytes?: number;
+  peers?: number;
+  /** A finished torrent that is still being shared. */
+  seeding?: boolean;
+  torrent_files?: TorrentFile[];
+  /** Live upload speed (bytes/s); torrents only, never stored. */
+  upload_bps?: number;
+}
+
+export interface TorrentFile {
+  index: number;
+  path: string;
+  length: number;
+  selected: boolean;
+}
+
+export interface TorrentProbeInfo {
+  info_hash: string;
+  name: string;
+  total_bytes: number;
+  files: TorrentFile[];
+}
+
+export interface AddTorrentRequest {
+  source?: string;
+  info_hash?: string;
+  destination_path?: string;
+  /** Indices of the files to download; omit for all. */
+  selected_files?: number[];
+}
+
+export interface TorrentLive {
+  id: string;
+  uploaded_bytes: number;
+  upload_bps: number;
+  peers: number;
+  seeding: boolean;
+  ratio: number;
 }
 
 export interface SiteCredential {
@@ -97,6 +138,13 @@ export interface AppSettings {
   scheduler_action: 'none' | 'sleep' | 'shutdown' | 'exit';
   scan_with_antivirus: boolean;
   antivirus_path?: string;
+  torrent_seed_after_download: boolean;
+  /** Stop sharing at this upload/download ratio (0 = never stop on ratio). */
+  torrent_ratio_limit: number;
+  /** Bytes per second, 0 = unlimited. */
+  torrent_upload_limit: number;
+  torrent_dht: boolean;
+  torrent_upnp: boolean;
 }
 
 export interface UrlProbeResult {

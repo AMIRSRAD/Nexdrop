@@ -216,6 +216,12 @@ fn make_task(url: &str, dir: &Path, len: usize, name: &str, connections: usize) 
         antivirus_status: None,
         expected_checksum: None,
         custom_headers: Default::default(),
+        kind: "http".to_string(),
+        info_hash: None,
+        uploaded_bytes: 0,
+        peers: 0,
+        seeding: false,
+        torrent_files: vec![],
     }
 }
 

@@ -2,12 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Power } from 'lucide-react';
 import { api, isTauri } from '../services/api';
-import type { AddDownloadRequest, DownloadProgressEvent, DownloadTask } from '../types/download';
+import type { AddDownloadRequest, AddTorrentRequest, DownloadProgressEvent, DownloadTask, TorrentLive } from '../types/download';
 import { useToast } from '../components/ui/Toast';
 
 export interface DownloadActions {
   add: (req: AddDownloadRequest) => Promise<DownloadTask>;
   addMany: (reqs: AddDownloadRequest[]) => Promise<DownloadTask[]>;
+  addTorrent: (req: AddTorrentRequest) => Promise<DownloadTask>;
+  stopSeeding: (id: string) => Promise<void>;
+  startSeeding: (id: string) => Promise<void>;
   pause: (ids: string[]) => Promise<void>;
   resume: (ids: string[]) => Promise<void>;
   retry: (ids: string[]) => Promise<void>;
@@ -25,7 +28,7 @@ const errText = (err: unknown) => (err instanceof Error ? err.message : String(e
  * applied once per animation frame so a dozen active transfers cost a
  * single React render instead of a dozen.
  */
-export function useDownloads(onOpenNewDownload: () => void) {
+export function useDownloads(onOpenNewDownload: () => void, onOpenTorrent: (source: string) => void) {
   const [downloads, setDownloads] = useState<DownloadTask[]>([]);
   const [loaded, setLoaded] = useState(false);
   const toast = useToast();
@@ -33,6 +36,8 @@ export function useDownloads(onOpenNewDownload: () => void) {
   downloadsRef.current = downloads;
   const openNewRef = useRef(onOpenNewDownload);
   openNewRef.current = onOpenNewDownload;
+  const openTorrentRef = useRef(onOpenTorrent);
+  openTorrentRef.current = onOpenTorrent;
 
   const refresh = useCallback(async () => {
     try {
@@ -51,15 +56,20 @@ export function useDownloads(onOpenNewDownload: () => void) {
   // Engine events
   useEffect(() => {
     const pending = new Map<string, DownloadProgressEvent>();
+    const pendingLive = new Map<string, TorrentLive>();
     let frame = 0;
 
     const flush = () => {
       frame = 0;
-      if (pending.size === 0) return;
+      if (pending.size === 0 && pendingLive.size === 0) return;
       const batch = new Map(pending);
+      const liveBatch = new Map(pendingLive);
       pending.clear();
+      pendingLive.clear();
       setDownloads((prev) =>
-        prev.map((item) => {
+        prev.map((base) => {
+          const live = liveBatch.get(base.id);
+          const item = live ? { ...base, uploaded_bytes: live.uploaded_bytes, peers: live.peers, upload_bps: live.upload_bps } : base;
           const ev = batch.get(item.id);
           if (!ev) return item;
           return {
@@ -78,6 +88,10 @@ export function useDownloads(onOpenNewDownload: () => void) {
     const unlisteners: Promise<() => void>[] = [
       api.onProgress((ev) => {
         pending.set(ev.id, ev);
+        if (!frame) frame = requestAnimationFrame(flush);
+      }),
+      api.onTorrentLive((live) => {
+        pendingLive.set(live.id, live);
         if (!frame) frame = requestAnimationFrame(flush);
       }),
       api.onCompleted((task) => {
@@ -107,6 +121,7 @@ export function useDownloads(onOpenNewDownload: () => void) {
           });
         }),
         listen('download-deleted', () => refresh()),
+        listen<{ source: string }>('torrent-requested', (e) => openTorrentRef.current(e.payload.source)),
         listen<{ action: string; seconds: number }>('completion-action', (e) => {
           const { action, seconds } = e.payload;
           toast.show({
@@ -183,6 +198,19 @@ export function useDownloads(onOpenNewDownload: () => void) {
         const ids = new Set(created.map((c) => c.id));
         setDownloads((prev) => [...created, ...prev.filter((d) => !ids.has(d.id))]);
         return created;
+      },
+      addTorrent: async (req) => {
+        const created = await api.addTorrent(req);
+        setDownloads((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
+        return created;
+      },
+      stopSeeding: async (id) => {
+        await api.stopSeeding(id);
+        patch([id], (d) => ({ ...d, seeding: false, upload_bps: 0 }));
+      },
+      startSeeding: async (id) => {
+        await api.startSeeding(id);
+        patch([id], (d) => ({ ...d, seeding: true }));
       },
       pause: async (ids) => {
         await runAll(ids, (id) => api.pauseDownload(id), 'pause');
