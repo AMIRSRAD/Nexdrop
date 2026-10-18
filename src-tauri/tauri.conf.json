@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Nexdrop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.nexdrop.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -67,7 +67,9 @@
         "displayLanguageSelector": false,
         "startMenuFolder": "Nexdrop",
         "compression": "lzma",
-        "installerHooks": "installer-hooks.nsh"
+        "installerHooks": "installer-hooks.nsh",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp"
       }
     }
   }

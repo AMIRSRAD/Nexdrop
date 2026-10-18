@@ -1,6 +1,6 @@
 [package]
 name = "nexdrop"
-version = "0.1.0"
+version = "1.0.0"
 description = "Nexdrop - Modern Internet Download Manager"
 authors = ["Nexdrop Contributors"]
 edition = "2024"

@@ -533,7 +533,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '0.1.0' };
+    return { name: 'Nexdrop', version: '1.0.0' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */
