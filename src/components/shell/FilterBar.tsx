@@ -1,7 +1,7 @@
 import React from 'react';
-import { ChevronDown, Layers, Pause, Play, RotateCw, Search, Trash, X } from 'lucide-react';
+import { CalendarClock, ChevronDown, Layers, ListOrdered, Pause, Play, RotateCw, Search, Trash, X } from 'lucide-react';
 import { CATEGORIES, STATUS_FILTERS, categoryMeta, type StatusFilter } from '../../lib/meta';
-import type { FileCategory } from '../../types/download';
+import type { FileCategory, QueueInfo } from '../../types/download';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
 import { Button } from '../ui/Button';
 import { cn } from '../../lib/cn';
@@ -23,10 +23,18 @@ interface FilterBarProps {
   onBulkRetry: () => void;
   onBulkRemove: () => void;
   bulkCan: { pause: boolean; resume: boolean; retry: boolean };
+  queues: QueueInfo[];
+  /** 'all' or a queue id. */
+  queue: string;
+  onQueue: (id: string) => void;
+  onBulkMove: (queueId: string) => void;
 }
 
 export const FilterBar: React.FC<FilterBarProps> = (p) => {
   const typeMenu = useDropdown('end');
+  const queueMenu = useDropdown('end');
+  const moveMenu = useDropdown('end');
+  const multiQueue = p.queues.length > 1;
 
   if (p.selectionCount > 0) {
     return (
@@ -56,6 +64,19 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
               Retry
             </Button>
           )}
+          {multiQueue && (
+            <>
+              <Button size="sm" variant="ghost" icon={ListOrdered} onClick={moveMenu.open}>
+                Move to queue
+              </Button>
+              <Menu
+                position={moveMenu.position}
+                onClose={moveMenu.close}
+                items={p.queues.map<MenuItem>((q) => ({ label: q.name, onSelect: () => p.onBulkMove(q.id) }))}
+                minWidth={180}
+              />
+            </>
+          )}
           <Button size="sm" variant="ghost" icon={Trash} onClick={p.onBulkRemove} className="hover:text-danger">
             Remove
           </Button>
@@ -74,6 +95,19 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
       onSelect: () => p.onCategory(c.id),
       checked: p.category === c.id,
       hint: String(p.categoryCounts[c.id] ?? 0),
+    })),
+  ];
+
+  const activeQueue = p.queue === 'all' ? null : p.queues.find((q) => q.id === p.queue);
+  const queueItems: MenuItem[] = [
+    { label: 'All queues', icon: Layers, onSelect: () => p.onQueue('all'), checked: p.queue === 'all' },
+    { separator: true },
+    ...p.queues.map<MenuItem>((q) => ({
+      label: q.name,
+      icon: q.schedule_enabled ? CalendarClock : ListOrdered,
+      onSelect: () => p.onQueue(q.id),
+      checked: p.queue === q.id,
+      hint: q.active + q.queued > 0 ? String(q.active + q.queued) : undefined,
     })),
   ];
 
@@ -114,6 +148,23 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
       </nav>
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
+        {multiQueue && (
+          <>
+            <button
+              type="button"
+              onClick={queueMenu.open}
+              className={cn(
+                'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12.5px] font-medium transition-colors',
+                activeQueue ? 'bg-accent-soft text-accent' : 'text-fg-2 hover:bg-hover hover:text-fg',
+              )}
+            >
+              <ListOrdered size={14} />
+              {activeQueue ? activeQueue.name : 'All queues'}
+              <ChevronDown size={13} className="opacity-70" />
+            </button>
+            <Menu position={queueMenu.position} onClose={queueMenu.close} items={queueItems} minWidth={190} />
+          </>
+        )}
         <button
           type="button"
           onClick={typeMenu.open}

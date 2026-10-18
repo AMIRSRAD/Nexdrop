@@ -8,6 +8,7 @@ import { cn } from '../../lib/cn';
 import { Checkbox } from '../ui/Field';
 import { IconButton } from '../ui/Button';
 import { FileTile } from './FileTile';
+import { useQueueInfos, whenText } from '../../hooks/useQueues';
 import { ProgressTrack } from './ProgressTrack';
 import { TransferDetails } from './TransferDetails';
 import { canPause, canResume, canRetry, type TaskHandlers } from './taskMenu';
@@ -197,6 +198,16 @@ const Subline: React.FC<{ task: DownloadTask }> = ({ task }) => {
     return <div className="truncate text-[12px] text-fg-3">{bits.join(' · ')}</div>;
   }
   const host = hostOf(task.url);
+  const queues = useQueueInfos();
+  const queue = task.status === 'queued' && queues.length > 0 ? queues.find((q) => q.id === (task.queue_id ?? 'main')) : undefined;
+  if (queue && !queue.open) {
+    return (
+      <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-warning">
+        <CalendarClock size={12} className="shrink-0" />
+        <span className="truncate">{queue.next_start ? `Waiting for ${queue.name} · opens ${whenText(queue.next_start)}` : `Waiting for ${queue.name}`}</span>
+      </div>
+    );
+  }
   if ((task.status === 'failed' || task.status === 'canceled') && task.error_message) {
     return (
       <div className="truncate text-[12px] text-danger" title={task.error_message}>

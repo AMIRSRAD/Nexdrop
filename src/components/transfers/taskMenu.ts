@@ -1,5 +1,5 @@
 import { Copy, ExternalLink, FolderOpen, Info, Pause, Play, Radio, RotateCw, Square, Terminal, Trash } from 'lucide-react';
-import type { DownloadTask } from '../../types/download';
+import type { DownloadTask, QueueInfo } from '../../types/download';
 import type { MenuItem } from '../ui/Menu';
 
 export interface TaskHandlers {
@@ -13,6 +13,7 @@ export interface TaskHandlers {
   stopSeeding: (id: string) => void;
   startSeeding: (id: string) => void;
   requestRemove: (ids: string[]) => void;
+  moveToQueue: (ids: string[], queueId: string) => void;
   toggleExpand: (id: string) => void;
   toggleSelect: (id: string, range?: boolean) => void;
   focus: (id: string) => void;
@@ -29,7 +30,7 @@ export function canRetry(t: DownloadTask) {
   return t.status === 'failed' || t.status === 'canceled';
 }
 
-export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boolean): MenuItem[] {
+export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boolean, queues: QueueInfo[] = []): MenuItem[] {
   const items: MenuItem[] = [];
   if (task.status === 'completed') {
     items.push(
@@ -53,6 +54,17 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
   items.push(
     { label: expanded ? 'Hide details' : 'Details', icon: Info, onSelect: () => h.toggleExpand(task.id) },
     { separator: true },
+    ...(queues.length > 1 && task.status !== 'completed'
+      ? [
+          { heading: 'Move to queue' } as MenuItem,
+          ...queues.map<MenuItem>((q) => ({
+            label: q.name,
+            checked: (task.queue_id ?? 'main') === q.id,
+            onSelect: () => h.moveToQueue([task.id], q.id),
+          })),
+          { separator: true } as MenuItem,
+        ]
+      : []),
     { label: task.kind === 'torrent' ? 'Copy magnet link' : 'Copy link', icon: Copy, onSelect: () => h.copyLink(task) },
     ...(task.kind === 'torrent' ? [] : [{ label: 'Copy as cURL', icon: Terminal, onSelect: () => h.copyCurl(task) }]),
     { separator: true },

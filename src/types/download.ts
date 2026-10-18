@@ -64,6 +64,8 @@ export interface DownloadTask {
   expected_checksum?: string;
   /** 'http' for a normal download, 'torrent' for BitTorrent. */
   kind?: 'http' | 'torrent';
+  /** The queue this download belongs to. */
+  queue_id?: string;
   info_hash?: string;
   uploaded_bytes?: number;
   peers?: number;
@@ -94,6 +96,7 @@ export interface AddTorrentRequest {
   destination_path?: string;
   /** Indices of the files to download; omit for all. */
   selected_files?: number[];
+  queue_id?: string;
 }
 
 export interface TorrentLive {
@@ -174,6 +177,7 @@ export interface AddDownloadRequest {
   custom_proxy_url?: string;
   /** Extra request headers (e.g. Cookie / Authorization imported from cURL). */
   custom_headers?: Record<string, string>;
+  queue_id?: string;
 }
 
 export interface DownloadProgressEvent {
@@ -198,4 +202,35 @@ export interface GrabbedLink {
   filename: string;
   category: string;
   extension: string;
+}
+
+export type QueueAction = 'none' | 'notify' | 'exit' | 'sleep' | 'hibernate' | 'shutdown' | 'lock' | 'program';
+
+/** A named list of downloads with its own schedule, limits and "when finished" action. */
+export interface DownloadQueue {
+  id: string;
+  name: string;
+  schedule_enabled: boolean;
+  days: string[];
+  start_time: string;
+  /** Without a stop time the queue starts at the start time and runs until it is empty. */
+  stop_time?: string | null;
+  /** Simultaneous downloads (0 = the global limit). */
+  max_active: number;
+  /** Bytes per second shared by the whole queue (0 = unlimited). */
+  speed_limit: number;
+  after_done: QueueAction;
+  after_done_program?: string | null;
+  retry_count: number;
+  retry_delay_secs: number;
+  position: number;
+}
+
+export interface QueueInfo extends DownloadQueue {
+  /** Allowed to start downloads right now. */
+  open: boolean;
+  active: number;
+  queued: number;
+  /** Unix seconds when the schedule next opens (while closed). */
+  next_start?: number | null;
 }

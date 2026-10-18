@@ -117,6 +117,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_url_cmd,
+            get_queues_cmd,
+            save_queue_cmd,
+            delete_queue_cmd,
+            move_to_queue_cmd,
+            start_queue_cmd,
+            stop_queue_cmd,
             add_download_cmd,
             batch_add_downloads_cmd,
             pause_download_cmd,

@@ -128,7 +128,12 @@ export function useDownloads(onOpenNewDownload: () => void, onOpenTorrent: (sour
             id: 'power-countdown',
             tone: 'info',
             icon: <Power size={17} className="text-warning" />,
-            title: action === 'shutdown' ? `Shutting down in ${seconds} seconds` : `Going to sleep in ${seconds} seconds`,
+            title:
+              action === 'shutdown'
+                ? `Shutting down in ${seconds} seconds`
+                : action === 'hibernate'
+                  ? `Hibernating in ${seconds} seconds`
+                  : `Going to sleep in ${seconds} seconds`,
             description: 'Your downloads are finished.',
             duration: seconds * 1000,
             action: { label: 'Cancel', onClick: () => api.cancelCompletionAction().catch(() => {}) },
@@ -138,15 +143,15 @@ export function useDownloads(onOpenNewDownload: () => void, onOpenTorrent: (sour
           toast.dismiss('power-countdown');
           toast.show({ id: 'power-cancelled', tone: 'success', title: 'Cancelled', duration: 2500 });
         }),
-        listen<{ event: string; paused?: number }>('scheduler-event', (e) => {
+        listen<{ event: string; paused?: number; queue?: string }>('scheduler-event', (e) => {
           refresh();
           if (e.payload.event === 'started') {
-            toast.show({ id: 'scheduler', title: 'Scheduler window opened', description: 'Queued downloads are starting.' });
+            toast.show({ id: 'scheduler', title: `${e.payload.queue ?? 'Queue'} started`, description: 'Its downloads are starting.' });
           } else if (e.payload.event === 'stopped') {
             const n = e.payload.paused ?? 0;
             toast.show({
               id: 'scheduler',
-              title: 'Scheduler window closed',
+              title: `${e.payload.queue ?? 'Queue'} stopped`,
               description: n > 0 ? `${n} download${n === 1 ? '' : 's'} paused until it reopens.` : undefined,
             });
           }

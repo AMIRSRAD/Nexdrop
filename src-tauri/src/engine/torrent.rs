@@ -746,6 +746,7 @@ mod tests {
             peers: 0,
             seeding: false,
             torrent_files: vec![],
+            queue_id: "main".to_string(),
         }
     }
 }

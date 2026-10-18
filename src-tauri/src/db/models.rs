@@ -190,10 +190,80 @@ pub struct DownloadTask {
     /// The files inside a torrent and which of them are being downloaded.
     #[serde(default)]
     pub torrent_files: Vec<TorrentFile>,
+    /// The queue this download belongs to (`"main"` unless the user made more).
+    #[serde(default = "default_queue_id")]
+    pub queue_id: String,
 }
 
 pub fn default_kind() -> String {
     "http".to_string()
+}
+
+pub const MAIN_QUEUE_ID: &str = "main";
+
+pub fn default_queue_id() -> String {
+    MAIN_QUEUE_ID.to_string()
+}
+
+/// A named list of downloads with its own schedule, limits and "when finished" action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadQueue {
+    pub id: String,
+    pub name: String,
+    /// Off: the queue runs whenever it has work. On: only inside its schedule (or after "Start now").
+    pub schedule_enabled: bool,
+    /// Days the schedule applies to: "mon" .. "sun".
+    pub days: Vec<String>,
+    /// "HH:MM"
+    pub start_time: String,
+    /// "HH:MM". `None`: after starting, run until the queue is empty.
+    pub stop_time: Option<String>,
+    /// Simultaneous downloads in this queue (0 = the global limit).
+    pub max_active: usize,
+    /// Bandwidth shared by the whole queue, bytes/s (0 = unlimited).
+    pub speed_limit: u64,
+    /// When the queue empties: "none", "notify", "exit", "sleep", "hibernate", "shutdown", "lock" or "program".
+    pub after_done: String,
+    pub after_done_program: Option<String>,
+    /// How many times a failed download is put back in the queue automatically.
+    pub retry_count: u32,
+    /// Seconds to wait before each automatic retry.
+    pub retry_delay_secs: u64,
+    pub position: i64,
+}
+
+impl Default for DownloadQueue {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: "Queue".to_string(),
+            schedule_enabled: false,
+            days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].iter().map(|d| d.to_string()).collect(),
+            start_time: "02:00".to_string(),
+            stop_time: None,
+            max_active: 0,
+            speed_limit: 0,
+            after_done: "none".to_string(),
+            after_done_program: None,
+            retry_count: 0,
+            retry_delay_secs: 60,
+            position: 0,
+        }
+    }
+}
+
+/// A queue plus what it's doing right now (for the interface).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueInfo {
+    #[serde(flatten)]
+    pub queue: DownloadQueue,
+    /// Allowed to start downloads right now.
+    pub open: bool,
+    pub active: usize,
+    pub queued: usize,
+    /// Unix seconds when the schedule next opens (only while closed).
+    pub next_start: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +409,7 @@ pub struct AddDownloadRequest {
     pub min_chunk_size: Option<u64>,
     pub proxy_mode: Option<String>,
     pub custom_proxy_url: Option<String>,
+    pub queue_id: Option<String>,
 }
 
 /// Adding a torrent: either a magnet/`.torrent` link or an `info_hash` from an earlier probe.
@@ -351,6 +422,7 @@ pub struct AddTorrentRequest {
     pub destination_path: Option<String>,
     /// Indices of the files to download; `None` means all of them.
     pub selected_files: Option<Vec<usize>>,
+    pub queue_id: Option<String>,
 }
 
 /// What the "Add torrent" dialog shows before anything is downloaded.

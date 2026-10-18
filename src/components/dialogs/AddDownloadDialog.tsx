@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ChevronRight, ClipboardPaste, Download, Folder, Link2, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
-import type { AddDownloadRequest, AppSettings, UrlProbeResult } from '../../types/download';
+import type { AddDownloadRequest, AppSettings, QueueInfo, UrlProbeResult } from '../../types/download';
 import { formatBytes } from '../../utils/format';
 import { CHUNK_SIZES, PRIORITIES, USER_AGENTS, categoryMeta, isHttpUrl, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
@@ -18,6 +18,9 @@ interface AddDownloadDialogProps {
   settings: AppSettings;
   onClose: () => void;
   onSubmit: (req: AddDownloadRequest) => Promise<void>;
+  queues?: QueueInfo[];
+  /** Queue preselected in the picker. */
+  defaultQueue?: string;
 }
 
 type ProbeState =
@@ -26,13 +29,16 @@ type ProbeState =
   | { kind: 'ok'; result: UrlProbeResult }
   | { kind: 'error'; message: string };
 
-export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit }) => (
+export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue }) => (
   <Dialog open={open} onClose={onClose} title="New download" width={560} bare>
-    {open && <AddDownloadForm initialText={initialText} settings={settings} onClose={onClose} onSubmit={onSubmit} />}
+    {open && (
+      <AddDownloadForm initialText={initialText} settings={settings} onClose={onClose} onSubmit={onSubmit} queues={queues} defaultQueue={defaultQueue} />
+    )}
   </Dialog>
 );
 
-const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit }) => {
+const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue }) => {
+  const [queueId, setQueueId] = useState(defaultQueue && queues.some((q) => q.id === defaultQueue) ? defaultQueue : 'main');
   const [url, setUrl] = useState('');
   const [filename, setFilename] = useState('');
   const filenameTouched = useRef(false);
@@ -172,6 +178,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         proxy_mode: proxyMode,
         custom_proxy_url: proxyMode === 'custom' && proxyUrl.trim() ? proxyUrl.trim() : undefined,
         custom_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
+        queue_id: queues.length > 1 ? queueId : undefined,
       });
       onClose();
     } catch (err) {
@@ -264,6 +271,18 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
           <Label>Save to</Label>
           <Input icon={Folder} mono value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Downloads" />
         </div>
+
+        {/* Queue (only when there is more than one) */}
+        {queues.length > 1 && (
+          <div className="flex items-center gap-3">
+            <Label className="mb-0 w-24 shrink-0">Queue</Label>
+            <Select value={queueId} onValueChange={setQueueId} options={queues.map((q) => ({ value: q.id, label: q.name }))} className="w-56" />
+            {(() => {
+              const q = queues.find((x) => x.id === queueId);
+              return q && !q.open ? <span className="text-[12px] text-fg-3">Waits for its schedule</span> : null;
+            })()}
+          </div>
+        )}
 
         {/* When */}
         <div className="flex items-center gap-3">

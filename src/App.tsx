@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { CheckSquare, ClipboardPaste, Copy, Download, Link2, ListPlus, Magnet, Settings as SettingsIcon } from 'lucide-react';
 import { api, isTauri } from './services/api';
+import { QueuesContext, useQueues } from './hooks/useQueues';
 import { listen } from '@tauri-apps/api/event';
 import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
 import { useDownloads, errText } from './hooks/useDownloads';
@@ -81,6 +82,13 @@ export default function App() {
     () => openAdd(),
     (source) => openTorrent(source),
   );
+  const { queues, refresh: refreshQueues } = useQueues();
+  const [queueFilter, setQueueFilter] = useState('all');
+  // A deleted queue can't stay selected.
+  useEffect(() => {
+    if (queueFilter !== 'all' && queues.length > 0 && !queues.some((q) => q.id === queueFilter)) setQueueFilter('all');
+    if (queues.length < 2 && queueFilter !== 'all') setQueueFilter('all');
+  }, [queues, queueFilter]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const settingsRef = useRef(settings);
@@ -142,6 +150,7 @@ export default function App() {
     const list = downloads.filter(
       (d) =>
         matchesStatus(d.status, status) &&
+        (queueFilter === 'all' || (d.queue_id ?? 'main') === queueFilter) &&
         (category === 'all' || categoryMeta(d.category).id === category) &&
         (!q || d.filename.toLowerCase().includes(q) || d.url.toLowerCase().includes(q)),
     );
@@ -168,7 +177,7 @@ export default function App() {
       if (typeof va === 'string' && typeof vb === 'string') return va.localeCompare(vb) * dir;
       return ((va as number) - (vb as number)) * dir || b.created_at - a.created_at;
     });
-  }, [downloads, status, category, search, sort]);
+  }, [downloads, status, category, queueFilter, search, sort]);
 
   const onSort = useCallback(
     (key: SortKey) =>
@@ -240,10 +249,20 @@ export default function App() {
           return next;
         });
       },
+      moveToQueue: (ids, queueId) => {
+        api
+          .moveToQueue(ids, queueId)
+          .then(() => {
+            refreshQueues();
+            actions.refresh();
+            toast.show({ tone: 'success', title: ids.length > 1 ? `Moved ${ids.length} downloads` : 'Moved to queue', duration: 1800 });
+          })
+          .catch((err) => toast.show({ tone: 'error', title: "Couldn't move the download", description: errText(err) }));
+      },
       focus: (id) => setFocusedId(id),
       contextMenu: (task, x, y) => setMenu({ id: task.id, x, y }),
     }),
-    [actions, toast],
+    [actions, toast, refreshQueues],
   );
 
   const menuTask = menu ? downloads.find((d) => d.id === menu.id) : undefined;
@@ -459,7 +478,8 @@ export default function App() {
   const filtersActive = status !== 'all' || category !== 'all' || search.trim() !== '';
 
   return (
-    <div
+    <QueuesContext.Provider value={queues}>
+          <div
       className="flex h-full flex-col bg-canvas text-fg"
       onDragEnter={(e) => {
         if (!isLinkDrag(e)) return;
@@ -534,6 +554,13 @@ export default function App() {
               onBulkRetry={() => actions.retry(selectedTasks.filter(canRetry).map((t) => t.id))}
               onBulkRemove={() => setRemoveIds([...selection])}
               bulkCan={bulkCan}
+              queues={queues}
+              queue={queueFilter}
+              onQueue={setQueueFilter}
+              onBulkMove={(queueId) => {
+                handlers.moveToQueue([...selection], queueId);
+                setSelection(new Set());
+              }}
             />
             {visible.length === 0 && loaded ? (
               <EmptyState
@@ -571,6 +598,8 @@ export default function App() {
               section={settingsView.section}
               onSection={(section) => setSettingsView({ open: true, section })}
               saveState={saveState}
+              queues={queues}
+              onQueuesChanged={refreshQueues}
             />
           )}
         </AnimatePresence>
@@ -599,13 +628,14 @@ export default function App() {
         settings={settings}
         onChangeSettings={changeSettings}
         onOpenSettings={(section) => setSettingsView({ open: true, section: section as SettingsSection })}
+        queues={queues}
       />
 
       {/* Overlays */}
       <Menu
         position={menu && menuTask ? { x: menu.x, y: menu.y } : null}
         onClose={() => setMenu(null)}
-        items={menuTask ? buildTaskMenu(menuTask, handlers, expandedId === menuTask.id) : []}
+        items={menuTask ? buildTaskMenu(menuTask, handlers, expandedId === menuTask.id, queues) : []}
         minWidth={210}
       />
       <Menu position={appMenu ? { x: appMenu.x, y: appMenu.y } : null} onClose={() => setAppMenu(null)} items={appMenuItems} minWidth={190} />
@@ -615,6 +645,8 @@ export default function App() {
         settings={settings}
         onClose={() => setAddState((s) => ({ ...s, open: false }))}
         onSubmit={addOne}
+        queues={queues}
+        defaultQueue={queueFilter === 'all' ? undefined : queueFilter}
       />
       <AddTorrentDialog
         open={torrentState.open}
@@ -641,6 +673,7 @@ export default function App() {
         }}
       />
       <StatsDialog open={statsOpen} onClose={() => setStatsOpen(false)} downloads={downloads} history={history} peak={peak} speed={totalSpeed} />
-    </div>
+      </div>
+    </QueuesContext.Provider>
   );
 }
