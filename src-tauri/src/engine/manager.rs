@@ -22,6 +22,15 @@ use crate::engine::security;
 use crate::engine::torrent::{TorrentEngine, TorrentLive, TorrentSettings, TorrentSource};
 use crate::engine::segment::{calculate_segments, calculate_segments_with_chunk_size};
 
+/// What the tray shows.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct StatusSummary {
+    pub downloading: u32,
+    pub queued: u32,
+    pub paused: u32,
+    pub speed_bps: u64,
+}
+
 pub struct DownloadManager {
     db_path: PathBuf,
     engine: DownloadEngine,
@@ -563,6 +572,53 @@ impl DownloadManager {
         Repository::update_torrent_state(&conn, id, task.uploaded_bytes, true).map_err(|e| e.to_string())?;
         let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
         Ok(())
+    }
+
+    // ───────────────────────────── tray / exit ─────────────────────────────
+
+    pub fn status_summary(&self) -> StatusSummary {
+        match self.get_db_conn().and_then(|c| Repository::status_summary(&c)) {
+            Ok((downloading, queued, paused, speed_bps)) => StatusSummary { downloading, queued, paused, speed_bps },
+            Err(_) => StatusSummary::default(),
+        }
+    }
+
+    /// Pauses everything that is running or waiting.
+    pub fn pause_all(&self) {
+        if let Ok(tasks) = self.get_all_downloads() {
+            for task in tasks {
+                if matches!(task.status, DownloadStatus::Downloading | DownloadStatus::Queued) {
+                    let _ = self.pause_download(&task.id);
+                }
+            }
+        }
+    }
+
+    /// Resumes everything that was paused.
+    pub async fn resume_all(self: &Arc<Self>) {
+        if let Ok(tasks) = self.get_all_downloads() {
+            for task in tasks.into_iter().filter(|t| t.status == DownloadStatus::Paused) {
+                let _ = self.resume_download(&task.id).await;
+            }
+        }
+    }
+
+    /// Called when the app is quitting: stop every running download cleanly (progress
+    /// is saved) but leave it marked as in progress, so it carries on at the next launch.
+    pub async fn shutdown(&self) {
+        {
+            let active = self.active_controllers.lock();
+            for tx in active.values() {
+                let _ = tx.send(true);
+            }
+        }
+        for _ in 0..100 {
+            if self.active_controllers.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.torrents.shutdown().await;
     }
 
     /// Housekeeping for torrents that are being shared: report their live numbers

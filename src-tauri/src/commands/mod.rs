@@ -447,3 +447,69 @@ mod tests {
         assert!(req.custom_headers.is_none());
     }
 }
+
+/// Quits Nexdrop for real (the window's close button only hides it to the tray).
+#[tauri::command]
+pub async fn quit_app_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    crate::quit_app(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_autostart_cmd(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_autostart_cmd(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let launcher = app.autolaunch();
+    if enabled {
+        launcher.enable().map_err(|e| e.to_string())?;
+    } else {
+        launcher.disable().map_err(|e| e.to_string())?;
+    }
+    launcher.is_enabled().map_err(|e| e.to_string())
+}
+
+/// Where the bundled browser extension lives on this machine.
+fn extension_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let mut candidates = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        candidates.push(res.join("extension"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("extension"));
+        }
+    }
+    // Development checkout
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("extensions").join("nexdrop-browser-extension"));
+    candidates.into_iter().find(|p| p.join("manifest.json").exists()).map(|p| p.canonicalize().unwrap_or(p))
+}
+
+#[tauri::command]
+pub async fn get_extension_dir_cmd(app: tauri::AppHandle) -> Result<String, String> {
+    extension_dir(&app)
+        .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+        .ok_or_else(|| "The browser extension folder was not found".to_string())
+}
+
+#[tauri::command]
+pub async fn open_extension_dir_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = extension_dir(&app).ok_or_else(|| "The browser extension folder was not found".to_string())?;
+    open::that(dir).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct AppInfo {
+    pub name: String,
+    pub version: String,
+}
+
+#[tauri::command]
+pub async fn get_app_info_cmd(app: tauri::AppHandle) -> Result<AppInfo, String> {
+    Ok(AppInfo { name: app.package_info().name.clone(), version: app.package_info().version.to_string() })
+}

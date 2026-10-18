@@ -109,7 +109,6 @@ export const USER_AGENTS = [
   { value: 'curl/8.10.1', label: 'curl' },
 ];
 
-export const EXTENSION_DIR = 'd:\\Projects\\Nexdrop\\extensions\\nexdrop-browser-extension';
 export const GRABBER_PORT = 18888;
 
 const URL_RE = /https?:\/\/[^\s"'<>]+/gi;

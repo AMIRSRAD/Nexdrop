@@ -294,6 +294,20 @@ impl Repository {
         Ok(())
     }
 
+    /// Counts for the tray: (downloading, queued, paused, bytes/s of the running ones).
+    pub fn status_summary(conn: &Connection) -> Result<(u32, u32, u32, u64)> {
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(status = 'downloading'), 0),
+                COALESCE(SUM(status = 'queued'), 0),
+                COALESCE(SUM(status = 'paused'), 0),
+                COALESCE(SUM(CASE WHEN status = 'downloading' THEN speed_bps END), 0)
+             FROM downloads",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)?.max(0) as u64)),
+        )
+    }
+
     /// Startup recovery: tasks left as `downloading` by a crash or quit have no
     /// running engine; move them to `status` so they can be resumed.
     pub fn reset_interrupted(conn: &Connection, status: DownloadStatus, now: i64) -> Result<usize> {

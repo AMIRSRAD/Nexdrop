@@ -7,15 +7,64 @@ pub mod power;
 pub mod process;
 pub mod secrets;
 pub mod tray;
+pub mod util;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
 use commands::*;
 use engine::DownloadManager;
-use tauri::Manager;
+use tauri::{AppHandle, Manager, RunEvent};
+use tauri_plugin_autostart::MacosLauncher;
+
+/// Passed by the "start with Windows" entry so the app starts hidden in the tray.
+const MINIMIZED_FLAG: &str = "--minimized";
+
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Quits for real (the window's close button only hides to the tray).
+///
+/// Running downloads are stopped cleanly first: their progress is saved and
+/// they stay marked as in progress, so they continue on the next launch.
+pub fn quit_app(app: &AppHandle) {
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(manager) = app.try_state::<Arc<DownloadManager>>() {
+            manager.shutdown().await;
+        }
+        app.exit(0);
+    });
+}
+
+/// First time the window is hidden, say where the app went (once, ever).
+fn tell_about_the_tray_once(app: &AppHandle) {
+    let flag = util::data_dir().join("tray_hint_shown");
+    if flag.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(util::data_dir());
+    let _ = std::fs::write(&flag, "1");
+    notify::toast(
+        app,
+        "Nexdrop is still running",
+        "Downloads continue in the background. Use the tray icon to open it again, or choose Exit to quit.",
+        false,
+    );
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if let Err(e) = tauri::Builder::default()
+    let result = tauri::Builder::default()
+        // Must be first: a second launch hands over to the running instance
+        // (which brings its window forward) instead of fighting it for the
+        // database and the browser-bridge port.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main(app);
+        }))
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![MINIMIZED_FLAG])))
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -25,41 +74,45 @@ pub fn run() {
                 )?;
             }
 
-            let app_data_dir = dirs::data_local_dir()
-                .map(|p| p.join("Nexdrop"))
-                .unwrap_or_else(|| std::path::PathBuf::from("./nexdrop_data"));
-
+            let app_data_dir = util::data_dir();
             let _ = std::fs::create_dir_all(&app_data_dir);
             let db_path = app_data_dir.join("nexdrop.db");
 
             let manager = Arc::new(DownloadManager::new(app.handle().clone(), db_path));
             app.manage(manager.clone());
 
-            // Setup Windows System Tray
+            // System tray
             if let Err(err) = tray::setup_tray(app, manager.clone()) {
                 log::warn!("Failed to initialize tray icon: {}", err);
             }
 
-            // Start Browser Link Grabber local server on 127.0.0.1:18888
+            // Browser bridge on 127.0.0.1:18888
             grabber_server::GrabberServer::start(app.handle().clone(), manager.clone());
 
-            // Startup check: auto resume queued/unfinished downloads if enabled
+            // Resume what was running (or wait for the scheduler window)
             manager.protect_stored_secrets();
             let mgr_clone = manager.clone();
             tauri::async_runtime::spawn(async move {
                 mgr_clone.startup_resume().await;
             });
 
-            // Start IDM-grade background scheduler loop
+            // Background scheduler loop
             crate::engine::DownloadScheduler::start_loop(app.handle().clone(), manager.clone());
+
+            // The window starts hidden (no white flash while the page loads).
+            // Show it, unless we were started with Windows and belong in the tray.
+            if !std::env::args().any(|a| a == MINIMIZED_FLAG) {
+                tray::show_main(app.handle());
+            }
 
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Keep running in system tray on close
+                // Closing the window keeps Nexdrop running in the tray.
                 let _ = window.hide();
                 api.prevent_close();
+                tell_about_the_tray_once(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -93,10 +146,34 @@ pub fn run() {
             add_torrent_cmd,
             stop_seeding_cmd,
             start_seeding_cmd,
+            quit_app_cmd,
+            get_autostart_cmd,
+            set_autostart_cmd,
+            get_extension_dir_cmd,
+            open_extension_dir_cmd,
+            get_app_info_cmd,
         ])
-        .run(tauri::generate_context!()) {
-        let msg = format!("error while running tauri application: {e}");
-        let _ = std::fs::write("d:\\Projects\\Nexdrop\\tauri_error.log", &msg);
-        panic!("{}", msg);
-    }
+        .build(tauri::generate_context!());
+
+    let app = match result {
+        Ok(app) => app,
+        Err(e) => {
+            // No console in release builds: leave a log the user can send us.
+            let msg = format!("Nexdrop could not start: {e}\n");
+            eprintln!("{msg}");
+            let _ = std::fs::create_dir_all(util::data_dir());
+            let _ = std::fs::write(util::data_dir().join("startup_error.log"), &msg);
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|_app, event| {
+        if let RunEvent::ExitRequested { api, code, .. } = event {
+            // `code` is None when the last window closed; we live in the tray, so stay.
+            // An explicit exit (Exit in the tray, Ctrl+Q) carries a code and goes through.
+            if code.is_none() {
+                api.prevent_exit();
+            }
+        }
+    });
 }

@@ -495,6 +495,47 @@ export const api = {
     ];
   },
 
+  /** Quits Nexdrop for real (closing the window only hides it to the tray). */
+  async quitApp(): Promise<void> {
+    if (isTauri()) {
+      await invoke('quit_app_cmd');
+    }
+  },
+
+  async getAutostart(): Promise<boolean> {
+    if (isTauri()) {
+      return await invoke<boolean>('get_autostart_cmd');
+    }
+    return false;
+  },
+
+  async setAutostart(enabled: boolean): Promise<boolean> {
+    if (isTauri()) {
+      return await invoke<boolean>('set_autostart_cmd', { enabled });
+    }
+    return enabled;
+  },
+
+  async getExtensionDir(): Promise<string> {
+    if (isTauri()) {
+      return await invoke<string>('get_extension_dir_cmd');
+    }
+    return 'C:\\Program Files\\Nexdrop\\extension';
+  },
+
+  async openExtensionDir(): Promise<void> {
+    if (isTauri()) {
+      await invoke('open_extension_dir_cmd');
+    }
+  },
+
+  async getAppInfo(): Promise<{ name: string; version: string }> {
+    if (isTauri()) {
+      return await invoke<{ name: string; version: string }>('get_app_info_cmd');
+    }
+    return { name: 'Nexdrop', version: '0.1.0' };
+  },
+
   /** Cancels a pending "sleep / shut down when finished" countdown. */
   async cancelCompletionAction(): Promise<boolean> {
     if (isTauri()) {

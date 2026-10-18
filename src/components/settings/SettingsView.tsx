@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import type { AppSettings, SiteCredential } from '../../types/download';
 import { api } from '../../services/api';
-import { CHUNK_SIZES, EXTENSION_DIR, GRABBER_PORT } from '../../lib/meta';
+import { CHUNK_SIZES, GRABBER_PORT } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 import { Button, IconButton } from '../ui/Button';
 import { Input, Label, NumberInput, Segmented, Select, Switch } from '../ui/Field';
@@ -164,8 +164,40 @@ const kb = (bytes: number) => (bytes ? Math.round(bytes / 1024) : 0);
 
 /* ───────────── sections ───────────── */
 
-const General: React.FC<SectionProps> = ({ s, set }) => (
+const General: React.FC<SectionProps> = ({ s, set }) => {
+  const [autostart, setAutostartState] = useState(false);
+  const [version, setVersion] = useState('');
+  useEffect(() => {
+    api.getAutostart().then(setAutostartState).catch(() => {});
+    api.getAppInfo().then((i) => setVersion(i.version)).catch(() => {});
+  }, []);
+  const toast = useToast();
+
+  return (
   <>
+    <Group title="Startup">
+      <SettingRow title="Start Nexdrop when I sign in" description="Starts quietly in the system tray so downloads and the schedule keep working.">
+        <Switch
+          checked={autostart}
+          onChange={(v) => {
+            setAutostartState(v);
+            api
+              .setAutostart(v)
+              .then(setAutostartState)
+              .catch((err) => {
+                setAutostartState(!v);
+                toast.show({ tone: 'error', title: "Couldn't change startup", description: errText(err) });
+              });
+          }}
+          label="Start with Windows"
+        />
+      </SettingRow>
+      <SettingRow title="Exit Nexdrop" description="Closing the window keeps Nexdrop running in the tray. Exit stops it; running downloads resume next time.">
+        <Button variant="secondary" size="sm" onClick={() => api.quitApp()}>
+          Exit
+        </Button>
+      </SettingRow>
+    </Group>
     <Group title="Appearance">
       <SettingRow title="Theme" description="Follow your system or pick one.">
         <Segmented
@@ -195,8 +227,10 @@ const General: React.FC<SectionProps> = ({ s, set }) => (
         <Switch checked={s.clipboard_watch} onChange={(v) => set({ clipboard_watch: v })} label="Watch the clipboard" />
       </SettingRow>
     </Group>
+    <p className="text-[12px] text-fg-3">Nexdrop {version && `v${version}`}</p>
   </>
-);
+  );
+};
 
 const Connections: React.FC<SectionProps> = ({ s, set }) => (
   <>
@@ -564,6 +598,10 @@ const Logins: React.FC = () => {
 
 const Integrations: React.FC = () => {
   const [copied, setCopied] = useState(false);
+  const [dir, setDir] = useState<string | null>(null);
+  useEffect(() => {
+    api.getExtensionDir().then(setDir).catch(() => setDir(''));
+  }, []);
   return (
     <>
       <Group>
@@ -585,19 +623,23 @@ const Integrations: React.FC = () => {
           <Step n={3}>
             Choose <span className="font-medium text-fg">Load unpacked</span> and select this folder:
             <div className="mt-2 flex items-center gap-2 rounded-lg bg-surface-2 py-1 pr-1 pl-3 shadow-[inset_0_0_0_1px_var(--line)]">
-              <span className="selectable min-w-0 flex-1 truncate font-mono text-[12px] text-fg">{EXTENSION_DIR}</span>
+              <span className="selectable min-w-0 flex-1 truncate font-mono text-[12px] text-fg">{dir === null ? 'Looking…' : dir || 'Not found'}</span>
               <Button
                 size="sm"
                 variant="ghost"
                 icon={copied ? Check : Copy}
+                disabled={!dir}
                 onClick={() =>
-                  navigator.clipboard.writeText(EXTENSION_DIR).then(() => {
+                  navigator.clipboard.writeText(dir ?? '').then(() => {
                     setCopied(true);
                     setTimeout(() => setCopied(false), 1500);
                   })
                 }
               >
                 {copied ? 'Copied' : 'Copy'}
+              </Button>
+              <Button size="sm" variant="ghost" icon={Folder} disabled={!dir} onClick={() => api.openExtensionDir()}>
+                Open
               </Button>
             </div>
           </Step>
