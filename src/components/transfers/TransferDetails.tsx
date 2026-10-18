@@ -16,9 +16,12 @@ type Tab = 'overview' | 'connections' | 'integrity';
 
 export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandlers }> = ({ task, handlers }) => {
   const [tab, setTab] = useState<Tab>('overview');
+  // Segments are the file's byte map: finished ranges plus the ranges being
+  // downloaded right now (one per open connection).
+  const liveCount = task.status === 'downloading' ? task.segments.filter((s) => s.status === 'downloading').length : 0;
   const tabs: { id: Tab; label: string }[] = [
     { id: 'overview', label: 'Overview' },
-    { id: 'connections', label: `Connections${task.segments.length > 1 ? ` · ${task.segments.length}` : ''}` },
+    { id: 'connections', label: `Connections${liveCount > 0 ? ` · ${liveCount}` : ''}` },
     { id: 'integrity', label: 'Integrity' },
   ];
 
@@ -149,6 +152,8 @@ const Connections: React.FC<{ task: DownloadTask }> = ({ task }) => {
       </div>
     );
   }
+
+  const live = task.status === 'downloading' ? task.segments.filter((s) => s.status === 'downloading') : [];
   return (
     <div className="space-y-4">
       <div>
@@ -158,23 +163,28 @@ const Connections: React.FC<{ task: DownloadTask }> = ({ task }) => {
         </div>
         <ProgressTrack progress={progressOf(task)} status={task.status} segments={task.segments} totalBytes={task.total_bytes} height={10} className="rounded-md" />
       </div>
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 xl:grid-cols-4">
-        {task.segments.map((seg) => {
-          const p = seg.total_bytes > 0 ? Math.min(1, seg.downloaded_bytes / seg.total_bytes) : 0;
-          const segStatus = p >= 1 ? 'completed' : seg.status === 'downloading' && task.status === 'downloading' ? 'downloading' : task.status === 'failed' ? 'failed' : 'paused';
-          return (
-            <div key={seg.segment_index} className="min-w-0">
-              <div className="mb-1 flex items-baseline justify-between text-[11.5px] tabular">
-                <span className="font-medium text-fg-2">#{seg.segment_index + 1}</span>
-                <span className="text-fg-3">
-                  {formatBytes(seg.downloaded_bytes)} / {formatBytes(seg.total_bytes)}
-                </span>
+      {live.length > 0 ? (
+        <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 xl:grid-cols-4">
+          {live.map((seg, i) => {
+            const p = seg.total_bytes > 0 ? Math.min(1, seg.downloaded_bytes / seg.total_bytes) : 0;
+            return (
+              <div key={seg.segment_index} className="min-w-0">
+                <div className="mb-1 flex items-baseline justify-between text-[11.5px] tabular">
+                  <span className="font-medium text-fg-2">#{i + 1}</span>
+                  <span className="text-fg-3">
+                    {formatBytes(seg.downloaded_bytes)} / {formatBytes(seg.total_bytes)}
+                  </span>
+                </div>
+                <ProgressTrack progress={p} status="downloading" totalBytes={seg.total_bytes} height={3} />
               </div>
-              <ProgressTrack progress={p} status={segStatus as DownloadTask['status']} totalBytes={seg.total_bytes} height={3} />
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="text-[12px] text-fg-3">
+          Connections share the work: when one finishes it takes over half of the slowest remaining part.
+        </p>
+      )}
     </div>
   );
 };

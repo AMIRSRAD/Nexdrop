@@ -41,6 +41,7 @@ pub fn run() {
             grabber_server::GrabberServer::start(app.handle().clone(), manager.clone());
 
             // Startup check: auto resume queued/unfinished downloads if enabled
+            manager.apply_runtime_settings();
             manager.recover_interrupted();
             let mgr_clone = manager.clone();
             tauri::async_runtime::spawn(async move {

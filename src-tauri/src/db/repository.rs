@@ -1,21 +1,37 @@
 use rusqlite::{params, Connection, Result};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use crate::db::models::{AppSettings, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, SiteCredential};
 
 pub struct Repository;
 
 impl Repository {
+    /// Opens the database. Schema setup runs once per process per file; every
+    /// other call only sets the cheap per-connection options.
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Connection> {
-        if let Some(parent) = path.as_ref().parent() {
+        static INITIALIZED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;"
-        )?;
-        Self::create_tables(&conn)?;
+        // Several threads write (progress, status changes). Without a busy
+        // timeout a write that collides with another fails instantly and is lost.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+
+        let initialized = INITIALIZED.get_or_init(|| Mutex::new(HashSet::new()));
+        let already = initialized.lock().map(|set| set.contains(path)).unwrap_or(false);
+        if !already {
+            conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+            Self::create_tables(&conn)?;
+            if let Ok(mut set) = initialized.lock() {
+                set.insert(path.to_path_buf());
+            }
+        }
         Ok(conn)
     }
 
@@ -190,7 +206,7 @@ impl Repository {
         )?;
 
         if !task.segments.is_empty() {
-            Self::save_segments(conn, &task.id, &task.segments)?;
+            Self::replace_segments(conn, &task.id, &task.segments)?;
         }
 
         Ok(())
@@ -278,38 +294,125 @@ impl Repository {
         Ok(())
     }
 
+    /// Replaces a download's segments atomically. The set of segments changes
+    /// shape while a download runs (ranges are split and merged), so rows must be
+    /// swapped as a whole rather than updated one by one.
+    pub fn replace_segments(conn: &Connection, download_id: &str, segments: &[DownloadSegment]) -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM segments WHERE download_id = ?1", params![download_id])?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO segments (download_id, segment_index, start_byte, end_byte, downloaded_bytes, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (i, seg) in segments.iter().enumerate() {
+                stmt.execute(params![
+                    download_id,
+                    i as i64,
+                    seg.start_byte as i64,
+                    seg.end_byte as i64,
+                    seg.downloaded_bytes as i64,
+                    seg.status
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    fn map_segment(row: &rusqlite::Row, first_col: usize) -> Result<DownloadSegment> {
+        let start_byte: i64 = row.get(first_col + 1)?;
+        let end_byte: i64 = row.get(first_col + 2)?;
+        let total_bytes = if end_byte >= start_byte { (end_byte - start_byte + 1) as u64 } else { 0 };
+        Ok(DownloadSegment {
+            segment_index: row.get::<_, i64>(first_col)? as usize,
+            start_byte: start_byte as u64,
+            end_byte: end_byte as u64,
+            downloaded_bytes: row.get::<_, i64>(first_col + 3)? as u64,
+            total_bytes,
+            status: row.get(first_col + 4)?,
+        })
+    }
+
+    /// Every download's segments in one query (instead of one query per download).
+    fn get_all_segments(conn: &Connection) -> Result<HashMap<String, Vec<DownloadSegment>>> {
+        let mut stmt = conn.prepare(
+            "SELECT download_id, segment_index, start_byte, end_byte, downloaded_bytes, status
+             FROM segments ORDER BY download_id, segment_index",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, Self::map_segment(row, 1)?)))?;
+        let mut map: HashMap<String, Vec<DownloadSegment>> = HashMap::new();
+        for r in rows {
+            let (id, seg) = r?;
+            map.entry(id).or_default().push(seg);
+        }
+        Ok(map)
+    }
+
     pub fn get_segments(conn: &Connection, download_id: &str) -> Result<Vec<DownloadSegment>> {
         let mut stmt = conn.prepare(
-            "SELECT segment_index, start_byte, end_byte, downloaded_bytes, status 
-             FROM segments 
-             WHERE download_id = ?1 
+            "SELECT segment_index, start_byte, end_byte, downloaded_bytes, status
+             FROM segments
+             WHERE download_id = ?1
              ORDER BY segment_index ASC",
         )?;
+        let rows = stmt.query_map(params![download_id], |row| Self::map_segment(row, 0))?;
+        rows.collect()
+    }
 
-        let rows = stmt.query_map(params![download_id], |row| {
-            let start_byte: i64 = row.get(1)?;
-            let end_byte: i64 = row.get(2)?;
-            let total_bytes = if end_byte >= start_byte {
-                (end_byte - start_byte + 1) as u64
-            } else {
-                0
-            };
+    fn map_task_row(row: &rusqlite::Row) -> Result<DownloadTask> {
+let status_str: String = row.get(8)?;
+        let resumable_int: i32 = row.get(9)?;
+        let category_str: String = row.get(13)?;
+        let connections_int: i64 = row.get(14)?;
+        let speed_limit_int: i64 = row.get(15)?;
+        let speed_bps_int: i64 = row.get(17)?;
+        let eta_sec_int: Option<i64> = row.get(18)?;
 
-            Ok(DownloadSegment {
-                segment_index: row.get::<_, i64>(0)? as usize,
-                start_byte: start_byte as u64,
-                end_byte: end_byte as u64,
-                downloaded_bytes: row.get::<_, i64>(3)? as u64,
-                total_bytes,
-                status: row.get(4)?,
-            })
-        })?;
+        let mirrors_str: Option<String> = row.get(28).unwrap_or(None);
+        let mirrors: Vec<String> = mirrors_str
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let min_chunk_size: i64 = row.get(29).unwrap_or(1024 * 1024);
+        let proxy_mode: Option<String> = row.get(30).unwrap_or(None);
+        let custom_proxy_url: Option<String> = row.get(31).unwrap_or(None);
+        let antivirus_status: Option<String> = row.get(32).unwrap_or(None);
 
-        let mut segments = Vec::new();
-        for r in rows {
-            segments.push(r?);
-        }
-        Ok(segments)
+        Ok(DownloadTask {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            final_url: row.get(2)?,
+            filename: row.get(3)?,
+            destination_path: row.get(4)?,
+            temp_path: row.get(5)?,
+            total_bytes: row.get(6)?,
+            downloaded_bytes: row.get(7)?,
+            status: DownloadStatus::from_str(&status_str),
+            resumable: resumable_int == 1,
+            etag: row.get(10)?,
+            last_modified: row.get(11)?,
+            mime_type: row.get(12)?,
+            category: FileCategory::from_str(&category_str),
+            connections: connections_int as usize,
+            speed_limit: speed_limit_int as u64,
+            priority: row.get(16)?,
+            speed_bps: speed_bps_int as u64,
+            eta_seconds: eta_sec_int.map(|e| e as u64),
+            segments: Vec::new(),
+            created_at: row.get(19)?,
+            updated_at: row.get(20)?,
+            completed_at: row.get(21)?,
+            error_message: row.get(22)?,
+            scheduled_time: row.get(23)?,
+            checksum_sha256: row.get(24).unwrap_or(None),
+            checksum_md5: row.get(25).unwrap_or(None),
+            user_agent: row.get(26).unwrap_or(None),
+            referer: row.get(27).unwrap_or(None),
+            mirrors,
+            min_chunk_size: if min_chunk_size <= 0 { 1024 * 1024 } else { min_chunk_size as u64 },
+            proxy_mode,
+            custom_proxy_url,
+            antivirus_status,
+        })
     }
 
     pub fn get_all_downloads(conn: &Connection) -> Result<Vec<DownloadTask>> {
@@ -325,66 +428,13 @@ impl Repository {
              ORDER BY created_at DESC",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            let status_str: String = row.get(8)?;
-            let resumable_int: i32 = row.get(9)?;
-            let category_str: String = row.get(13)?;
-            let connections_int: i64 = row.get(14)?;
-            let speed_limit_int: i64 = row.get(15)?;
-            let speed_bps_int: i64 = row.get(17)?;
-            let eta_sec_int: Option<i64> = row.get(18)?;
+        let rows = stmt.query_map([], Self::map_task_row)?;
 
-            let mirrors_str: Option<String> = row.get(28).unwrap_or(None);
-            let mirrors: Vec<String> = mirrors_str
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let min_chunk_size: i64 = row.get(29).unwrap_or(1024 * 1024);
-            let proxy_mode: Option<String> = row.get(30).unwrap_or(None);
-            let custom_proxy_url: Option<String> = row.get(31).unwrap_or(None);
-            let antivirus_status: Option<String> = row.get(32).unwrap_or(None);
-
-            Ok(DownloadTask {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                final_url: row.get(2)?,
-                filename: row.get(3)?,
-                destination_path: row.get(4)?,
-                temp_path: row.get(5)?,
-                total_bytes: row.get(6)?,
-                downloaded_bytes: row.get(7)?,
-                status: DownloadStatus::from_str(&status_str),
-                resumable: resumable_int == 1,
-                etag: row.get(10)?,
-                last_modified: row.get(11)?,
-                mime_type: row.get(12)?,
-                category: FileCategory::from_str(&category_str),
-                connections: connections_int as usize,
-                speed_limit: speed_limit_int as u64,
-                priority: row.get(16)?,
-                speed_bps: speed_bps_int as u64,
-                eta_seconds: eta_sec_int.map(|e| e as u64),
-                segments: Vec::new(),
-                created_at: row.get(19)?,
-                updated_at: row.get(20)?,
-                completed_at: row.get(21)?,
-                error_message: row.get(22)?,
-                scheduled_time: row.get(23)?,
-                checksum_sha256: row.get(24).unwrap_or(None),
-                checksum_md5: row.get(25).unwrap_or(None),
-                user_agent: row.get(26).unwrap_or(None),
-                referer: row.get(27).unwrap_or(None),
-                mirrors,
-                min_chunk_size: if min_chunk_size <= 0 { 1024 * 1024 } else { min_chunk_size as u64 },
-                proxy_mode,
-                custom_proxy_url,
-                antivirus_status,
-            })
-        })?;
-
+        let mut segments = Self::get_all_segments(conn).unwrap_or_default();
         let mut tasks = Vec::new();
         for r in rows {
             let mut task = r?;
-            task.segments = Self::get_segments(conn, &task.id).unwrap_or_default();
+            task.segments = segments.remove(&task.id).unwrap_or_default();
             tasks.push(task);
         }
         Ok(tasks)
@@ -403,61 +453,7 @@ impl Repository {
              WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query_map(params![id], |row| {
-            let status_str: String = row.get(8)?;
-            let resumable_int: i32 = row.get(9)?;
-            let category_str: String = row.get(13)?;
-            let connections_int: i64 = row.get(14)?;
-            let speed_limit_int: i64 = row.get(15)?;
-            let speed_bps_int: i64 = row.get(17)?;
-            let eta_sec_int: Option<i64> = row.get(18)?;
-
-            let mirrors_str: Option<String> = row.get(28).unwrap_or(None);
-            let mirrors: Vec<String> = mirrors_str
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let min_chunk_size: i64 = row.get(29).unwrap_or(1024 * 1024);
-            let proxy_mode: Option<String> = row.get(30).unwrap_or(None);
-            let custom_proxy_url: Option<String> = row.get(31).unwrap_or(None);
-            let antivirus_status: Option<String> = row.get(32).unwrap_or(None);
-
-            Ok(DownloadTask {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                final_url: row.get(2)?,
-                filename: row.get(3)?,
-                destination_path: row.get(4)?,
-                temp_path: row.get(5)?,
-                total_bytes: row.get(6)?,
-                downloaded_bytes: row.get(7)?,
-                status: DownloadStatus::from_str(&status_str),
-                resumable: resumable_int == 1,
-                etag: row.get(10)?,
-                last_modified: row.get(11)?,
-                mime_type: row.get(12)?,
-                category: FileCategory::from_str(&category_str),
-                connections: connections_int as usize,
-                speed_limit: speed_limit_int as u64,
-                priority: row.get(16)?,
-                speed_bps: speed_bps_int as u64,
-                eta_seconds: eta_sec_int.map(|e| e as u64),
-                segments: Vec::new(),
-                created_at: row.get(19)?,
-                updated_at: row.get(20)?,
-                completed_at: row.get(21)?,
-                error_message: row.get(22)?,
-                scheduled_time: row.get(23)?,
-                checksum_sha256: row.get(24).unwrap_or(None),
-                checksum_md5: row.get(25).unwrap_or(None),
-                user_agent: row.get(26).unwrap_or(None),
-                referer: row.get(27).unwrap_or(None),
-                mirrors,
-                min_chunk_size: if min_chunk_size <= 0 { 1024 * 1024 } else { min_chunk_size as u64 },
-                proxy_mode,
-                custom_proxy_url,
-                antivirus_status,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], Self::map_task_row)?;
 
         if let Some(r) = rows.next() {
             let mut task = r?;

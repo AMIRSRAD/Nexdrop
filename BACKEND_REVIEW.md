@@ -39,6 +39,38 @@
 
 Tests: 18 Rust tests pass, including regression tests for stale resume data, servers that ignore `Range`, truncated bodies, pause mid-transfer then resume (byte-exact), refused single-stream resume, bridge origin rules, and the credential/pause-race DB fixes.
 
+### Phase 2 status (branch `feat/engine-phase-2`)
+
+| Item | Status | What changed |
+|------|--------|--------------|
+| #6 Write everything twice | ✅ Fixed | One preallocated `name.nexpart` (marked **sparse on NTFS**, so the first far-offset write doesn't zero-fill gigabytes), written at the right offsets. There is no segment files and no merge pass, and finishing is an atomic rename. |
+| Disk writes | ✅ Done | A dedicated writer thread gets coalesced writes (about 512 KiB or 250 ms) over a bounded channel, so network tasks never block on the disk. |
+| Progress | ✅ Done | Workers update atomic counters. One ticker computes speed (smoothed) and emits events, and persists progress at most every 2 s. |
+| Resume | ✅ Done | A done-range map (`name.nexpart.map`) is saved atomically and `fsync`ed before it's written. A map for a different-sized file is ignored. `If-Range` (strong ETag, else `Last-Modified`) is sent on resume; a full `200` answer means the file changed, so the engine restarts once from scratch. |
+| #8 Retries | ✅ Fixed | Each range retries transient failures (connection errors, resets, early closes, 408/5xx, 429/503) with exponential backoff and jitter (1 s → 30 s cap), honouring `Retry-After`. It gives up after 6 consecutive failures with no progress. Permanent errors (404, 403, 416…) fail immediately. |
+| Dynamic segmentation | ✅ Done | A connection that runs out of work steals the upper half of the biggest range still downloading. The split happens atomically under a per-range lock. |
+| Connection ramp-up | ✅ Done | Up to 8 connections open immediately, and the rest ramp up gradually. A 429/503 lowers the connection cap, makes that connection hand its range back, and pauses ramp-up for 15 s. |
+| Mirrors | 🟡 Improved | A mirror that errors, or reports a different file size, falls back to the original URL. The range engine now uses mirrors per range. |
+| Shared HTTP client | ✅ Done | `ClientPool`, keyed by proxy config. System-proxy clients are rebuilt every 30 s so VPN/proxy toggles are picked up. Previously each download built its own client and read the registry. |
+| Double probe | ✅ Fixed | Probe results are cached for 60 s, so adding a link the dialog just probed costs no second round trip. Probes honour the configured proxy. |
+| Proxy setting | ✅ Fixed | Tasks are saved with the app's proxy setting when the request doesn't specify one. Before, the engine ignored the global proxy setting. |
+| Speed limits | ✅ Done | Per-download limits now apply to segmented downloads (they used to apply to single-stream only), and the **global limit** from Settings and the status bar works, on a shared token bucket. Pause stays instant while connections wait for tokens. |
+| §5.1 Database | ✅ Done | Busy timeout (writes used to fail instantly with "database is locked" and be silently dropped), schema setup once per process, transactional segment replacement, one query for all segments instead of one per download, and no duplicated row-mapping code. |
+| Delete / cancel | ✅ Fixed | These wait for a stopping run to release its files, then remove the `.nexpart` file, its map, and any old `_seg_N` files. |
+| Slow-connection detection | ⏳ | Stealing already routes work around slow connections, but a connection that is slow yet steady is never dropped. |
+| Old in-progress downloads | ⚠️ | Downloads half-finished with the **old** engine (`.nexpart_seg_N` files) won't resume. They restart from zero. |
+
+**Measured** (release build, loopback, 8 connections, `cargo test --release --test bench_engine -- --ignored --nocapture`):
+
+| Scenario | Phase 1 engine | New engine |
+|---|---|---|
+| 384 MiB, all connections equal | ~850 MiB/s | ~890–1090 MiB/s |
+| 64 MiB, one connection 8× slower than the rest (typical of real servers) | 8.05 s | **2.8–3.1 s** |
+
+On loopback the OS file cache hides the cost of the old double write, so equal-speed throughput is similar. The gains show up on real disks (no extra full copy at the end) and above all on real networks, where per-connection speed varies and the old engine always waited for its slowest connection.
+
+Tests: 40 Rust tests pass (24 unit and 16 integration), stable over 5 runs. Coverage includes range-map math, byte-exact download, resume from the map, ignored `Range`, 503 retries, mid-body resets, giving up, fast-fail on 404, work stealing, pause/resume, pause under a speed limit, speed limits, mirror fallback, and the non-resumable path.
+
 About a dozen settings and features in the UI do nothing in the backend (see §6). The most important ones are **global speed limit, scheduled downloads, "when all finish → shut down", and site logins**.
 
 ---

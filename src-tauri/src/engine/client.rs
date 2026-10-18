@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 /// Client for short control requests (probing, page scans). `timeout` bounds
 /// the *whole* request, which is exactly what we want for small responses.
@@ -110,4 +113,65 @@ fn build_client(
     }
 
     builder.build().unwrap_or_default()
+}
+
+/// How long a cached client that follows the *system* proxy is reused. The
+/// Windows proxy setting is only read when a client is built, so this keeps
+/// VPN/proxy toggles taking effect within a short time.
+const SYSTEM_PROXY_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct PoolKey {
+    bulk: bool,
+    mode: String,
+    custom: String,
+}
+
+/// Shares HTTP clients between downloads and probes.
+///
+/// A `reqwest::Client` owns the connection pool, TLS sessions and DNS cache, so
+/// building one per download (as before) threw all of that away and re-read the
+/// Windows registry every time. Clients are keyed by their proxy configuration.
+#[derive(Default)]
+pub struct ClientPool {
+    clients: Mutex<HashMap<PoolKey, (Instant, reqwest::Client)>>,
+}
+
+impl ClientPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Client for bulk transfers (no total timeout, idle-read timeout only).
+    pub fn download(&self, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
+        self.get(true, proxy_mode, custom_proxy_url)
+    }
+
+    /// Client for short control requests (probing).
+    pub fn probe(&self, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
+        self.get(false, proxy_mode, custom_proxy_url)
+    }
+
+    fn get(&self, bulk: bool, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
+        let mode = proxy_mode.unwrap_or("system");
+        let key = PoolKey {
+            bulk,
+            mode: mode.to_string(),
+            custom: if mode == "custom" { custom_proxy_url.unwrap_or("").trim().to_string() } else { String::new() },
+        };
+
+        let mut clients = self.clients.lock();
+        if let Some((built, client)) = clients.get(&key) {
+            if mode != "system" || built.elapsed() < SYSTEM_PROXY_TTL {
+                return client.clone();
+            }
+        }
+        let client = if bulk {
+            create_download_client_with_proxy(Duration::from_secs(30), Some(mode), custom_proxy_url)
+        } else {
+            create_http_client_with_proxy(Duration::from_secs(15), Some(mode), custom_proxy_url)
+        };
+        clients.insert(key, (Instant::now(), client.clone()));
+        client
+    }
 }

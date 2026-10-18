@@ -3,6 +3,7 @@ use reqwest::header::{HeaderMap, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LEN
 use url::Url;
 use crate::db::models::FileCategory;
 
+#[derive(Clone)]
 pub struct ProbeResult {
     pub url: String,
     pub final_url: String,

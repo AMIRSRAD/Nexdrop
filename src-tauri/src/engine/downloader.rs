@@ -1,35 +1,68 @@
-use std::io::SeekFrom;
+//! The download engine.
+//!
+//! Resumable downloads run on a *range engine*:
+//!
+//! * One target file (`name.nexpart`), preallocated once and written at the
+//!   correct offsets, so there is nothing to merge afterwards.
+//! * A dedicated writer thread receives large batched writes; network tasks
+//!   never block on the disk.
+//! * A *done map* of byte ranges known to be on disk is saved next to the file
+//!   (`name.nexpart.map`), which is exactly what resume needs.
+//! * **Dynamic segmentation**: when a connection runs out of work it takes the
+//!   upper half of the largest range still being downloaded, so no connection
+//!   idles while another is still slogging through its share.
+//! * Each range retries transient failures with exponential backoff; a
+//!   throttling server (429/503) makes the engine use fewer connections.
+//! * Connections ramp up gradually instead of all opening at once.
+//!
+//! Servers that cannot do ranges fall back to a plain single-stream download.
+
+use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_RANGE, RANGE, USER_AGENT};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader};
+use parking_lot::Mutex;
+use reqwest::header::{CONTENT_RANGE, RANGE, RETRY_AFTER, USER_AGENT};
+use reqwest::StatusCode;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::db::models::{DownloadProgressEvent, DownloadSegment, DownloadStatus, DownloadTask};
+use crate::engine::client::ClientPool;
+use crate::engine::fileio::{open_preallocated, write_all_at};
 use crate::engine::probe::resolve_unique_path;
-use crate::engine::speed::{SpeedCalculator, SpeedLimiter};
+use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range};
+use crate::engine::speed::{RateLimiter, SpeedCalculator};
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Nexdrop/1.0";
-/// How long a connection may sit idle (no bytes received) before it is dropped.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-
-pub enum WorkerMessage {
-    /// The worker inspected its segment file; `already` bytes are safely on disk.
-    Started { segment_index: usize, already: u64 },
-    /// Absolute number of bytes now stored for the segment. Lossy by design:
-    /// a newer value always supersedes an older one.
-    Progress { segment_index: usize, bytes_downloaded: u64 },
-    Finished { segment_index: usize },
-    Failed { segment_index: usize, error: String },
-}
+/// Received data is handed to the disk writer in pieces at least this big.
+const WRITE_BATCH_BYTES: usize = 512 * 1024;
+/// ...or after this long, so progress is never held back by a slow connection.
+const WRITE_BATCH_MAX_AGE: Duration = Duration::from_millis(250);
+const MAP_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// A range gives up after this many failures in a row that made no progress.
+const MAX_CONSECUTIVE_FAILURES: u32 = 6;
+/// Connections opened immediately; the rest ramp up while the server cooperates.
+const INITIAL_CONNECTIONS: usize = 8;
+const RAMP_INTERVAL: Duration = Duration::from_millis(500);
+const RAMP_STEP: usize = 2;
+/// After a 429/503, don't open more connections for this long.
+const THROTTLE_COOLDOWN: Duration = Duration::from_secs(15);
+/// Never split off a range smaller than this.
+const MIN_STEAL_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone)]
 pub struct DownloadEngine {
-    client: reqwest::Client,
+    pool: Arc<ClientPool>,
+    global_limit: Arc<RateLimiter>,
+    retry_base: Duration,
 }
 
 impl Default for DownloadEngine {
@@ -40,14 +73,33 @@ impl Default for DownloadEngine {
 
 impl DownloadEngine {
     pub fn new() -> Self {
-        let client = crate::engine::create_download_client_with_proxy(IDLE_TIMEOUT, None, None);
-        Self { client }
+        Self {
+            pool: Arc::new(ClientPool::new()),
+            global_limit: Arc::new(RateLimiter::new(0)),
+            retry_base: Duration::from_secs(1),
+        }
+    }
+
+    /// The shared client pool (the manager uses it for probing too).
+    pub fn clients(&self) -> Arc<ClientPool> {
+        self.pool.clone()
+    }
+
+    /// Bandwidth cap shared by every running download, in bytes/s (0 = none).
+    pub fn set_global_speed_limit(&self, bytes_per_sec: u64) {
+        self.global_limit.set_rate(bytes_per_sec);
+    }
+
+    /// Base delay for retry backoff (tests use a tiny one).
+    pub fn with_retry_base(mut self, base: Duration) -> Self {
+        self.retry_base = base;
+        self
     }
 
     /// Runs a download to completion, pause, or failure.
     ///
     /// * `Ok(task)` with `status == Completed` — the final file is in place.
-    /// * `Ok(task)` with `status == Paused` — stopped on request; every byte
+    /// * `Ok(task)` with `status == Paused` — stopped on request; everything
     ///   received so far is on disk and a later call resumes from it.
     /// * `Err(_)` — the transfer failed; partial data is kept for a retry.
     pub async fn run_download<F>(
@@ -67,28 +119,20 @@ impl DownloadEngine {
         }
 
         let final_dest = dest_dir.join(&task.filename);
-        let part_file = dest_dir.join(format!("{}.nexpart", task.filename));
+        let client = self
+            .pool
+            .download(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
 
-        let client = if task.proxy_mode.is_some() || task.custom_proxy_url.is_some() {
-            crate::engine::client::create_download_client_with_proxy(
-                IDLE_TIMEOUT,
-                task.proxy_mode.as_deref().or(Some("system")),
-                task.custom_proxy_url.as_deref(),
-            )
+        if task.resumable && task.total_bytes > 0 {
+            self.run_ranged(task, final_dest, client, pause_rx, on_progress).await
         } else {
-            self.client.clone()
-        };
-
-        // Fallback or 1-connection download
-        if !task.resumable || task.total_bytes <= 0 || task.connections <= 1 || task.segments.len() <= 1 {
-            return self
-                .run_single_stream(task, final_dest, part_file, client, pause_rx, on_progress)
-                .await;
+            let part_file = dest_dir.join(format!("{}.nexpart", task.filename));
+            self.run_single_stream(task, final_dest, part_file, client, pause_rx, on_progress)
+                .await
         }
-
-        self.run_segmented_download(task, final_dest, client, pause_rx, on_progress)
-            .await
     }
+
+    // ───────────────────────── single stream (no ranges) ─────────────────────────
 
     async fn run_single_stream<F>(
         &self,
@@ -102,54 +146,41 @@ impl DownloadEngine {
     where
         F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
     {
+        // Without range support a partial file can't be continued: start over.
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .open(&part_file)
             .await
             .map_err(|e| format!("Failed to create download file: {e}"))?;
-
-        let existing = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        // Only continue a partial file if the server can actually resume.
-        let mut offset = if task.resumable { existing } else { 0 };
+        task.downloaded_bytes = 0;
 
         let ua = task.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
-        let range = (offset > 0).then(|| format!("bytes={offset}-"));
-        let req = build_request(&client, &task.url, ua, task.referer.as_deref(), range);
+        let req = build_request(&client, &task.url, ua, task.referer.as_deref(), None);
 
         let res = match send_or_pause(req, &mut pause_rx).await? {
             Some(res) => res,
             None => return Ok(paused(task)),
         };
-        let status = res.status();
-
-        if !status.is_success() {
-            return Err(format!("Server returned HTTP status: {status}"));
+        if !res.status().is_success() {
+            return Err(format!("Server returned HTTP status: {}", res.status()));
         }
-        // Asked for a range but got the whole body: start over rather than
-        // appending a full copy of the file after the partial data.
-        if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            offset = 0;
-        }
-
-        file.set_len(offset)
-            .await
-            .map_err(|e| format!("Failed to prepare download file: {e}"))?;
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| format!("Failed to seek download file: {e}"))?;
-        task.downloaded_bytes = offset as i64;
 
         let mut stream = res.bytes_stream();
         let mut speed_calc = SpeedCalculator::new(2);
-        let mut speed_limiter = SpeedLimiter::new(task.speed_limit);
+        let task_limit = RateLimiter::new(task.speed_limit);
         let mut last_progress_emit = Instant::now();
 
         loop {
             let next = tokio::select! {
                 biased;
                 _ = wait_paused(&mut pause_rx) => {
-                    file.flush().await.map_err(|e| format!("Failed to flush file: {e}"))?;
+                    // Nothing can be resumed without range support, so a pause
+                    // simply discards the partial file.
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&part_file).await;
+                    task.downloaded_bytes = 0;
                     return Ok(paused(task));
                 }
                 next = stream.next() => next,
@@ -165,7 +196,21 @@ impl DownloadEngine {
 
             task.downloaded_bytes += chunk_len as i64;
             speed_calc.record_bytes(chunk_len as u64);
-            speed_limiter.throttle(chunk_len).await;
+
+            let limited = async {
+                task_limit.acquire(chunk_len as u64).await;
+                self.global_limit.acquire(chunk_len as u64).await;
+            };
+            tokio::select! {
+                biased;
+                _ = wait_paused(&mut pause_rx) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&part_file).await;
+                    task.downloaded_bytes = 0;
+                    return Ok(paused(task));
+                }
+                _ = limited => {}
+            }
 
             if last_progress_emit.elapsed() >= PROGRESS_INTERVAL {
                 let speed_bps = speed_calc.current_speed_bps();
@@ -185,7 +230,7 @@ impl DownloadEngine {
                         segment_index: 0,
                         start_byte: 0,
                         end_byte: if task.total_bytes > 0 { (task.total_bytes - 1) as u64 } else { 0 },
-                        downloaded_bytes: task.downloaded_bytes as u64,
+                        downloaded_bytes: task.downloaded_bytes.max(0) as u64,
                         total_bytes: task.total_bytes.max(0) as u64,
                         status: "downloading".to_string(),
                     }],
@@ -205,10 +250,7 @@ impl DownloadEngine {
             ));
         }
 
-        let final_path = resolve_unique_path(
-            final_dest.parent().unwrap_or(Path::new(".")),
-            &file_name_of(&final_dest),
-        );
+        let final_path = resolve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest));
         tokio::fs::rename(&part_file, &final_path)
             .await
             .map_err(|e| format!("Failed to rename completed file: {e}"))?;
@@ -229,7 +271,9 @@ impl DownloadEngine {
         Ok(task)
     }
 
-    async fn run_segmented_download<F>(
+    // ───────────────────────────── range engine ─────────────────────────────
+
+    async fn run_ranged<F>(
         &self,
         mut task: DownloadTask,
         final_dest: PathBuf,
@@ -240,122 +284,141 @@ impl DownloadEngine {
     where
         F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
     {
-        let dest_dir = final_dest.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let total_bytes = task.total_bytes as u64;
-        let num_segments = task.segments.len();
-        let (tx, mut rx) = mpsc::channel::<WorkerMessage>(256);
-        let (cancel_tx, _) = watch::channel(false);
-
-        // Mirror pool for multi-network distribution
-        let mut mirror_pool: Vec<String> = vec![task.url.clone()];
-        mirror_pool.extend(task.mirrors.iter().cloned());
-
-        let user_agent = task.user_agent.clone().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
-        let referer = task.referer.clone();
-
-        // One worker per segment. Segments that are already complete on disk
-        // finish immediately after checking their file, so we never have to
-        // trust progress numbers that may be stale in the database.
-        for seg in &task.segments {
-            let ctx = SegmentContext {
-                client: client.clone(),
-                url: mirror_pool[seg.segment_index % mirror_pool.len()].clone(),
-                user_agent: user_agent.clone(),
-                referer: referer.clone(),
-                segment: seg.clone(),
-                file_total: total_bytes,
-                path: dest_dir.join(format!("{}.nexpart_seg_{}", task.filename, seg.segment_index)),
-                tx: tx.clone(),
-                cancel: cancel_tx.subscribe(),
-            };
-            tauri::async_runtime::spawn(run_segment_worker(ctx));
+        // If the server reveals that the file changed since we started, the
+        // partial data is worthless: restart once from scratch.
+        let mut fresh = false;
+        for round in 0..2 {
+            match self
+                .ranged_round(&mut task, &final_dest, &client, &mut pause_rx, &on_progress, fresh)
+                .await
+            {
+                Ok(()) => return Ok(task),
+                Err(RoundFailure::FileChanged) if round == 0 => fresh = true,
+                Err(RoundFailure::FileChanged) => {
+                    return Err("The file on the server changed while it was being downloaded".to_string())
+                }
+                Err(RoundFailure::Failed(msg)) => return Err(msg),
+            }
         }
-        // Drop our sender so `rx` closes once every worker has ended.
-        drop(tx);
+        Err("Download failed".to_string())
+    }
 
-        let mut finished = vec![false; num_segments];
-        let mut finished_count = 0usize;
+    async fn ranged_round<F>(
+        &self,
+        task: &mut DownloadTask,
+        final_dest: &Path,
+        client: &reqwest::Client,
+        pause_rx: &mut watch::Receiver<bool>,
+        on_progress: &F,
+        force_fresh: bool,
+    ) -> Result<(), RoundFailure>
+    where
+        F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
+    {
+        let dest_dir = final_dest.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let total = task.total_bytes as u64;
+        let part_path = dest_dir.join(format!("{}.nexpart", task.filename));
+        let map_path = dest_dir.join(format!("{}.nexpart.map", task.filename));
 
+        if force_fresh {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            let _ = tokio::fs::remove_file(&map_path).await;
+        }
+
+        // Open / preallocate the target (blocking calls, so off the async threads).
+        let open_path = part_path.clone();
+        let (file, fresh) = tokio::task::spawn_blocking(move || open_preallocated(&open_path, total))
+            .await
+            .map_err(|e| RoundFailure::Failed(format!("Internal error: {e}")))?
+            .map_err(|e| RoundFailure::Failed(format!("Cannot prepare download file: {e}")))?;
+        let file = Arc::new(file);
+
+        let done = if fresh {
+            let _ = tokio::fs::remove_file(&map_path).await;
+            DoneMap::default()
+        } else {
+            load_map(&map_path, total).unwrap_or_default()
+        };
+        let already = done.covered();
+        let resumed = already > 0;
+
+        let connections = task.connections.clamp(1, 32);
+        let min_piece = task.min_chunk_size.max(MIN_STEAL_BYTES);
+        let todo: VecDeque<Range> = split_gaps(&done.gaps(total), connections, min_piece).into();
+        let initial_workers = connections.min(INITIAL_CONNECTIONS).min(todo.len().max(1));
+
+        let mut urls = vec![task.url.clone()];
+        urls.extend(task.mirrors.iter().filter(|m| !m.trim().is_empty()).cloned());
+
+        let done = Arc::new(Mutex::new(done));
+        let (writer_tx, writer_rx) = mpsc::channel::<WriterMsg>(32);
+        let (cancel_tx, _) = watch::channel(false);
+        let writer = spawn_writer(file.clone(), done.clone(), writer_rx);
+
+        let shared = Arc::new(Shared {
+            client: client.clone(),
+            urls,
+            user_agent: task.user_agent.clone().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
+            referer: task.referer.clone(),
+            validator: resume_validator(task.etag.as_deref(), task.last_modified.as_deref()),
+            resumed,
+            total,
+            min_steal: min_piece,
+            done: done.clone(),
+            plan: Mutex::new(Plan { todo, slots: Vec::new() }),
+            received: AtomicU64::new(already),
+            writer_tx,
+            task_limit: RateLimiter::new(task.speed_limit),
+            global_limit: self.global_limit.clone(),
+            cancel: cancel_tx,
+            fatal: Mutex::new(None),
+            range_ok: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            cap: AtomicUsize::new(connections),
+            next_slot_id: AtomicUsize::new(0),
+            clock: Instant::now(),
+            last_throttle_ms: AtomicU64::new(u64::MAX),
+            retry_base: self.retry_base,
+        });
+
+        let mut workers: JoinSet<()> = JoinSet::new();
+        for _ in 0..initial_workers {
+            workers.spawn(worker(shared.clone()));
+        }
+
+        // ── coordinator ────────────────────────────────────────────────────
         let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick = Instant::now();
-        let mut last_total = 0u64;
+        let mut last_received = already;
         let mut smoothed_bps = 0.0f64;
-        let mut baseline_set = false;
+        let mut last_ramp = Instant::now();
+        let mut last_save = Instant::now();
+        let mut save_inflight: Option<tokio::task::JoinHandle<()>> = None;
 
-        let sum_downloaded = |segments: &[DownloadSegment]| -> u64 {
-            segments.iter().map(|s| s.downloaded_bytes.min(s.total_bytes)).sum()
-        };
+        enum End {
+            Done,
+            Paused,
+            Failed(RoundFailure),
+        }
 
-        while finished_count < num_segments {
+        let end = loop {
             tokio::select! {
                 biased;
-                _ = wait_paused(&mut pause_rx) => {
-                    let _ = cancel_tx.send(true);
-                    drain_workers(&mut rx).await;
-                    task.status = DownloadStatus::Paused;
-                    task.downloaded_bytes = sum_downloaded(&task.segments) as i64;
-                    task.speed_bps = 0;
-                    task.eta_seconds = None;
-                    return Ok(task);
-                }
-                msg = rx.recv() => {
-                    match msg {
-                        Some(WorkerMessage::Started { segment_index, already }) => {
-                            if let Some(seg) = task.segments.get_mut(segment_index) {
-                                seg.downloaded_bytes = already;
-                                seg.status = "downloading".to_string();
-                            }
-                            if !baseline_set {
-                                // Baseline so resumed data isn't counted as instant speed.
-                                last_total = sum_downloaded(&task.segments);
-                                baseline_set = true;
-                            }
-                        }
-                        Some(WorkerMessage::Progress { segment_index, bytes_downloaded }) => {
-                            if let Some(seg) = task.segments.get_mut(segment_index) {
-                                seg.downloaded_bytes = bytes_downloaded;
-                                seg.status = "downloading".to_string();
-                            }
-                        }
-                        Some(WorkerMessage::Finished { segment_index }) => {
-                            if let Some(seg) = task.segments.get_mut(segment_index) {
-                                seg.status = "completed".to_string();
-                                seg.downloaded_bytes = seg.total_bytes;
-                            }
-                            if !finished[segment_index] {
-                                finished[segment_index] = true;
-                                finished_count += 1;
-                            }
-                        }
-                        Some(WorkerMessage::Failed { segment_index, error }) => {
-                            let _ = cancel_tx.send(true);
-                            drain_workers(&mut rx).await;
-                            if let Some(seg) = task.segments.get_mut(segment_index) {
-                                seg.status = "failed".to_string();
-                            }
-                            return Err(error);
-                        }
-                        None => {
-                            // Every worker ended without reporting completion for all segments.
-                            if finished_count < num_segments {
-                                return Err("Download workers stopped unexpectedly".to_string());
-                            }
-                        }
-                    }
-                }
+                _ = wait_paused(pause_rx) => break End::Paused,
+                _ = workers.join_next(), if !workers.is_empty() => {}
                 _ = ticker.tick() => {
-                    let total = sum_downloaded(&task.segments);
                     let now = Instant::now();
+                    let received = shared.received.load(Ordering::Relaxed);
                     let dt = now.duration_since(last_tick).as_secs_f64().max(0.001);
-                    let instant_bps = total.saturating_sub(last_total) as f64 / dt;
+                    let instant_bps = received.saturating_sub(last_received) as f64 / dt;
                     smoothed_bps = if smoothed_bps == 0.0 { instant_bps } else { 0.35 * instant_bps + 0.65 * smoothed_bps };
                     last_tick = now;
-                    last_total = total;
+                    last_received = received;
 
                     let speed_bps = smoothed_bps as u64;
-                    let eta = SpeedCalculator::calculate_eta(total_bytes.saturating_sub(total), speed_bps);
-                    task.downloaded_bytes = total as i64;
+                    let eta = SpeedCalculator::calculate_eta(total.saturating_sub(received), speed_bps);
+                    task.downloaded_bytes = received.min(total) as i64;
                     task.speed_bps = speed_bps;
                     task.eta_seconds = eta;
 
@@ -366,226 +429,723 @@ impl DownloadEngine {
                         speed_bps,
                         eta_seconds: eta,
                         status: DownloadStatus::Downloading,
-                        segments: task.segments.clone(),
+                        segments: shared.snapshot_segments(),
                     });
+
+                    // Persist what's safely on disk (the sidecar is what resume reads).
+                    if now.duration_since(last_save) >= MAP_SAVE_INTERVAL
+                        && save_inflight.as_ref().map(|h| h.is_finished()).unwrap_or(true)
+                    {
+                        last_save = now;
+                        let snapshot = done.lock().clone();
+                        let (f, p) = (file.clone(), map_path.clone());
+                        save_inflight = Some(tokio::task::spawn_blocking(move || {
+                            let _ = f.sync_data();
+                            let _ = save_map(&p, total, &snapshot);
+                        }));
+                    }
+
+                    // Ramp up: add connections while there is work to share and
+                    // the server hasn't pushed back recently.
+                    if now.duration_since(last_ramp) >= RAMP_INTERVAL
+                        && shared.range_ok.load(Ordering::Relaxed)
+                        && !shared.recently_throttled()
+                    {
+                        last_ramp = now;
+                        let room = shared.cap.load(Ordering::Relaxed).saturating_sub(workers.len());
+                        for _ in 0..room.min(RAMP_STEP) {
+                            if !shared.can_feed_another_worker() {
+                                break;
+                            }
+                            workers.spawn(worker(shared.clone()));
+                        }
+                    }
                 }
             }
+
+            if let Some(failure) = shared.fatal.lock().clone() {
+                break End::Failed(failure);
+            }
+            if workers.is_empty() {
+                if shared.has_unfinished_work() {
+                    // Every worker left (e.g. gave ranges back after throttling): keep one going.
+                    workers.spawn(worker(shared.clone()));
+                } else {
+                    break End::Done;
+                }
+            }
+        };
+
+        // ── wind down ──────────────────────────────────────────────────────
+        if !matches!(end, End::Done) {
+            let _ = shared.cancel.send_replace(true);
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while workers.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            workers.abort_all();
+        }
+        if let Some(handle) = save_inflight.take() {
+            let _ = handle.await;
         }
 
-        // ── Merge segment files ────────────────────────────────────────────
-        // Verify every piece first so a short file can never be stitched in.
-        let seg_paths: Vec<PathBuf> = (0..num_segments)
-            .map(|i| dest_dir.join(format!("{}.nexpart_seg_{}", task.filename, i)))
-            .collect();
-        for (seg, path) in task.segments.iter().zip(&seg_paths) {
-            let len = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
-            if len != seg.total_bytes {
-                return Err(format!(
-                    "Segment {} is incomplete on disk ({} of {} bytes); retry to resume it",
-                    seg.segment_index + 1,
-                    len,
-                    seg.total_bytes
-                ));
+        let _ = shared.writer_tx.send(WriterMsg::Stop).await;
+        let writer_result = tokio::task::spawn_blocking(move || writer.join())
+            .await
+            .map_err(|e| RoundFailure::Failed(format!("Internal error: {e}")))?;
+        let writer_error = match writer_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("Disk write error: {e}")),
+            Err(_) => Some("Disk writer stopped unexpectedly".to_string()),
+        };
+
+        // Final durable snapshot of progress.
+        let snapshot = done.lock().clone();
+        {
+            let (f, p, snap) = (file.clone(), map_path.clone(), snapshot.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = f.sync_data();
+                let _ = save_map(&p, total, &snap);
+            })
+            .await;
+        }
+        let covered = snapshot.covered();
+        task.segments = segments_from_done(&snapshot);
+        task.downloaded_bytes = covered.min(total) as i64;
+        task.speed_bps = 0;
+        task.eta_seconds = None;
+
+        if let Some(msg) = writer_error {
+            return Err(RoundFailure::Failed(msg));
+        }
+
+        match end {
+            End::Failed(failure) => Err(failure),
+            End::Paused => {
+                task.status = DownloadStatus::Paused;
+                Ok(())
+            }
+            End::Done => {
+                if !snapshot.is_complete(total) {
+                    return Err(RoundFailure::Failed(format!(
+                        "Download incomplete: {} bytes are missing",
+                        total.saturating_sub(covered)
+                    )));
+                }
+                drop(shared);
+                drop(file);
+
+                let final_path = resolve_unique_path(&dest_dir, &file_name_of(final_dest));
+                tokio::fs::rename(&part_path, &final_path)
+                    .await
+                    .map_err(|e| RoundFailure::Failed(format!("Failed to move finished file into place: {e}")))?;
+                let _ = tokio::fs::remove_file(&map_path).await;
+
+                finish_task(task, &final_path);
+                task.downloaded_bytes = task.total_bytes;
+                task.segments = vec![DownloadSegment {
+                    segment_index: 0,
+                    start_byte: 0,
+                    end_byte: total.saturating_sub(1),
+                    downloaded_bytes: total,
+                    total_bytes: total,
+                    status: "completed".to_string(),
+                }];
+
+                on_progress(DownloadProgressEvent {
+                    id: task.id.clone(),
+                    downloaded_bytes: task.total_bytes,
+                    total_bytes: task.total_bytes,
+                    speed_bps: 0,
+                    eta_seconds: None,
+                    status: DownloadStatus::Completed,
+                    segments: task.segments.clone(),
+                });
+                Ok(())
             }
         }
-
-        let merge_path = dest_dir.join(format!("{}.nexmerge", task.filename));
-        if let Err(e) = merge_segments(&seg_paths, &merge_path, total_bytes).await {
-            let _ = tokio::fs::remove_file(&merge_path).await;
-            return Err(e);
-        }
-
-        let final_path = resolve_unique_path(&dest_dir, &file_name_of(&final_dest));
-        if let Err(e) = tokio::fs::rename(&merge_path, &final_path).await {
-            let _ = tokio::fs::remove_file(&merge_path).await;
-            return Err(format!("Failed to move merged file into place: {e}"));
-        }
-        for path in &seg_paths {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-
-        finish_task(&mut task, &final_path);
-        task.downloaded_bytes = task.total_bytes;
-        for seg in &mut task.segments {
-            seg.status = "completed".to_string();
-            seg.downloaded_bytes = seg.total_bytes;
-        }
-
-        on_progress(DownloadProgressEvent {
-            id: task.id.clone(),
-            downloaded_bytes: task.total_bytes,
-            total_bytes: task.total_bytes,
-            speed_bps: 0,
-            eta_seconds: None,
-            status: DownloadStatus::Completed,
-            segments: task.segments.clone(),
-        });
-
-        Ok(task)
     }
 }
 
-// ───────────────────────────── segment worker ─────────────────────────────
+// ───────────────────────────── shared state ─────────────────────────────
 
-struct SegmentContext {
-    client: reqwest::Client,
-    url: String,
-    user_agent: String,
-    referer: Option<String>,
-    segment: DownloadSegment,
-    /// Size of the whole file, used to recognise a request that covers all of it.
-    file_total: u64,
-    path: PathBuf,
-    tx: mpsc::Sender<WorkerMessage>,
-    cancel: watch::Receiver<bool>,
-}
-
-enum SegmentEnd {
-    Cancelled,
+#[derive(Clone)]
+enum RoundFailure {
+    /// The server's file no longer matches what we started downloading.
+    FileChanged,
     Failed(String),
 }
 
-async fn run_segment_worker(mut ctx: SegmentContext) {
-    let index = ctx.segment.segment_index;
-    let tx = ctx.tx.clone();
-    match transfer_segment(&mut ctx).await {
-        Ok(()) => {
-            let _ = tx.send(WorkerMessage::Finished { segment_index: index }).await;
+enum WriterMsg {
+    Write { offset: u64, data: Vec<u8> },
+    Stop,
+}
+
+#[derive(Clone, Copy)]
+struct SlotState {
+    pos: u64,
+    end: u64,
+}
+
+/// One in-flight range. `end` can shrink when another connection steals the
+/// tail, so `pos`/`end` are only ever touched together under the lock.
+struct Slot {
+    id: usize,
+    start: u64,
+    url_idx: AtomicUsize,
+    state: Mutex<SlotState>,
+}
+
+struct Plan {
+    todo: VecDeque<Range>,
+    slots: Vec<Arc<Slot>>,
+}
+
+struct Shared {
+    client: reqwest::Client,
+    urls: Vec<String>,
+    user_agent: String,
+    referer: Option<String>,
+    /// ETag / Last-Modified sent as `If-Range` when resuming.
+    validator: Option<String>,
+    resumed: bool,
+    total: u64,
+    min_steal: u64,
+    plan: Mutex<Plan>,
+    /// Ranges confirmed on disk (shared with the writer thread).
+    done: Arc<Mutex<DoneMap>>,
+    /// Bytes accepted from the network (including data not yet flushed).
+    received: AtomicU64,
+    writer_tx: mpsc::Sender<WriterMsg>,
+    task_limit: RateLimiter,
+    global_limit: Arc<RateLimiter>,
+    cancel: watch::Sender<bool>,
+    fatal: Mutex<Option<RoundFailure>>,
+    /// Set once the server has answered a range request with 206.
+    range_ok: AtomicBool,
+    active: AtomicUsize,
+    /// Maximum simultaneous connections (lowered when the server pushes back).
+    cap: AtomicUsize,
+    next_slot_id: AtomicUsize,
+    clock: Instant,
+    last_throttle_ms: AtomicU64,
+    retry_base: Duration,
+}
+
+impl Shared {
+    fn fail(&self, failure: RoundFailure) {
+        let mut fatal = self.fatal.lock();
+        if fatal.is_none() {
+            *fatal = Some(failure);
         }
-        Err(SegmentEnd::Cancelled) => {}
-        Err(SegmentEnd::Failed(error)) => {
-            let _ = tx.send(WorkerMessage::Failed { segment_index: index, error }).await;
+        let _ = self.cancel.send_replace(true);
+    }
+
+    fn note_throttle(&self) {
+        self.last_throttle_ms
+            .store(self.clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let _ = self
+            .cap
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1).max(1)));
+    }
+
+    fn recently_throttled(&self) -> bool {
+        let at = self.last_throttle_ms.load(Ordering::Relaxed);
+        at != u64::MAX && (self.clock.elapsed().as_millis() as u64).saturating_sub(at) < THROTTLE_COOLDOWN.as_millis() as u64
+    }
+
+    /// Hands the next piece of work to a worker: queued ranges first, otherwise
+    /// the upper half of the biggest range that's still being downloaded.
+    fn take_range(&self) -> Option<Arc<Slot>> {
+        let mut plan = self.plan.lock();
+        let id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
+
+        let range = if let Some(range) = plan.todo.pop_front() {
+            Some(range)
+        } else if self.range_ok.load(Ordering::Relaxed) {
+            // Try the victims with the most data left first.
+            let mut order: Vec<(u64, usize)> = plan
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let st = s.state.lock();
+                    (st.end.saturating_sub(st.pos), i)
+                })
+                .collect();
+            order.sort_unstable_by(|a, b| b.cmp(a));
+
+            let mut stolen = None;
+            for (_, i) in order {
+                let mut st = plan.slots[i].state.lock();
+                if let Some(mid) = steal_point(st.pos, st.end, self.min_steal) {
+                    let old_end = st.end;
+                    st.end = mid;
+                    stolen = Some((mid, old_end));
+                    break;
+                }
+            }
+            stolen
+        } else {
+            None
+        };
+
+        let (start, end) = range?;
+        let slot = Arc::new(Slot {
+            id,
+            start,
+            url_idx: AtomicUsize::new(id % self.urls.len()),
+            state: Mutex::new(SlotState { pos: start, end }),
+        });
+        plan.slots.push(slot.clone());
+        Some(slot)
+    }
+
+    fn finish_slot(&self, slot: &Slot) {
+        self.plan.lock().slots.retain(|s| s.id != slot.id);
+    }
+
+    /// Puts whatever is left of `slot` back in the queue for another worker.
+    fn give_back(&self, slot: &Slot) {
+        let mut plan = self.plan.lock();
+        plan.slots.retain(|s| s.id != slot.id);
+        let st = *slot.state.lock();
+        if st.pos < st.end {
+            plan.todo.push_front((st.pos, st.end));
+        }
+    }
+
+    fn has_unfinished_work(&self) -> bool {
+        let plan = self.plan.lock();
+        !plan.todo.is_empty() || !plan.slots.is_empty()
+    }
+
+    /// Is there anything a brand-new worker could start on right now?
+    fn can_feed_another_worker(&self) -> bool {
+        let plan = self.plan.lock();
+        if !plan.todo.is_empty() {
+            return true;
+        }
+        plan.slots.iter().any(|s| {
+            let st = s.state.lock();
+            steal_point(st.pos, st.end, self.min_steal).is_some()
+        })
+    }
+
+    /// Finished ranges plus the ranges currently in flight, for the UI's byte map.
+    fn snapshot_segments(&self) -> Vec<DownloadSegment> {
+        let mut segments = segments_from_done(&self.done.lock());
+        let base = segments.len();
+        let plan = self.plan.lock();
+        for (i, s) in plan.slots.iter().enumerate() {
+            let st = *s.state.lock();
+            segments.push(DownloadSegment {
+                segment_index: base + i,
+                start_byte: s.start,
+                end_byte: st.end.saturating_sub(1),
+                downloaded_bytes: st.pos.saturating_sub(s.start),
+                total_bytes: st.end.saturating_sub(s.start),
+                status: "downloading".to_string(),
+            });
+        }
+        segments
+    }
+}
+
+fn segments_from_done(done: &DoneMap) -> Vec<DownloadSegment> {
+    done.ranges()
+        .iter()
+        .enumerate()
+        .map(|(i, &(s, e))| DownloadSegment {
+            segment_index: i,
+            start_byte: s,
+            end_byte: e - 1,
+            downloaded_bytes: e - s,
+            total_bytes: e - s,
+            status: "completed".to_string(),
+        })
+        .collect()
+}
+
+fn spawn_writer(
+    file: Arc<std::fs::File>,
+    done: Arc<Mutex<DoneMap>>,
+    mut rx: mpsc::Receiver<WriterMsg>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    std::thread::Builder::new()
+        .name("nexdrop-writer".to_string())
+        .spawn(move || {
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    WriterMsg::Stop => break,
+                    WriterMsg::Write { offset, data } => {
+                        write_all_at(&file, &data, offset)?;
+                        done.lock().insert(offset, offset + data.len() as u64);
+                    }
+                }
+            }
+            file.sync_data()
+        })
+        .expect("failed to start disk writer thread")
+}
+
+// ──────────────────────────────── workers ────────────────────────────────
+
+struct WriteBuffer {
+    offset: u64,
+    data: Vec<u8>,
+    since: Instant,
+}
+
+impl WriteBuffer {
+    fn new() -> Self {
+        Self { offset: 0, data: Vec::with_capacity(WRITE_BATCH_BYTES + 64 * 1024), since: Instant::now() }
+    }
+    fn push(&mut self, offset: u64, bytes: &[u8]) {
+        if self.data.is_empty() {
+            self.offset = offset;
+            self.since = Instant::now();
+        }
+        debug_assert_eq!(self.offset + self.data.len() as u64, offset, "write buffer must stay contiguous");
+        self.data.extend_from_slice(bytes);
+    }
+    fn due(&self) -> bool {
+        self.data.len() >= WRITE_BATCH_BYTES || (!self.data.is_empty() && self.since.elapsed() >= WRITE_BATCH_MAX_AGE)
+    }
+    fn take(&mut self) -> Option<WriterMsg> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let data = std::mem::replace(&mut self.data, Vec::with_capacity(WRITE_BATCH_BYTES + 64 * 1024));
+        Some(WriterMsg::Write { offset: self.offset, data })
+    }
+}
+
+async fn flush(shared: &Shared, buf: &mut WriteBuffer) -> bool {
+    match buf.take() {
+        None => true,
+        Some(msg) => shared.writer_tx.send(msg).await.is_ok(),
+    }
+}
+
+enum SlotEnd {
+    Done,
+    Cancelled,
+    /// Throttled: this connection leaves and its range goes back to the queue.
+    GiveBack,
+    Fatal(RoundFailure),
+}
+
+enum AttemptEnd {
+    Complete,
+    Cancelled,
+    Fatal(RoundFailure),
+    Retry {
+        reason: String,
+        made_progress: bool,
+        retry_after: Option<Duration>,
+        throttled: bool,
+    },
+}
+
+fn retry(reason: String, made_progress: bool) -> AttemptEnd {
+    AttemptEnd::Retry { reason, made_progress, retry_after: None, throttled: false }
+}
+
+struct ActiveGuard(Arc<Shared>);
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn worker(shared: Arc<Shared>) {
+    shared.active.fetch_add(1, Ordering::Relaxed);
+    let _active = ActiveGuard(shared.clone());
+    let mut cancel = shared.cancel.subscribe();
+    let mut buf = WriteBuffer::new();
+
+    while let Some(slot) = shared.take_range() {
+        let outcome = run_slot(&shared, &slot, &mut buf, &mut cancel).await;
+        // Whatever was received is handed to the writer in every case, so a
+        // pause or a failure never throws away data that has already arrived.
+        if !flush(&shared, &mut buf).await && !matches!(outcome, SlotEnd::Cancelled) {
+            shared.fail(RoundFailure::Failed("Disk write failed".to_string()));
+            return;
+        }
+        match outcome {
+            SlotEnd::Done => shared.finish_slot(&slot),
+            SlotEnd::Cancelled => return,
+            SlotEnd::GiveBack => {
+                shared.give_back(&slot);
+                return;
+            }
+            SlotEnd::Fatal(failure) => {
+                shared.fail(failure);
+                return;
+            }
         }
     }
 }
 
-async fn transfer_segment(ctx: &mut SegmentContext) -> Result<(), SegmentEnd> {
-    let index = ctx.segment.segment_index;
-    let total = ctx.segment.total_bytes;
-    let fail = |msg: String| SegmentEnd::Failed(msg);
+async fn run_slot(
+    shared: &Arc<Shared>,
+    slot: &Arc<Slot>,
+    buf: &mut WriteBuffer,
+    cancel: &mut watch::Receiver<bool>,
+) -> SlotEnd {
+    let mut failures = 0u32;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&ctx.path)
-        .await
-        .map_err(|e| fail(format!("Cannot open segment file: {e}")))?;
+    loop {
+        match attempt(shared, slot, buf, cancel).await {
+            AttemptEnd::Complete => return SlotEnd::Done,
+            AttemptEnd::Cancelled => return SlotEnd::Cancelled,
+            AttemptEnd::Fatal(failure) => {
+                // A bad mirror shouldn't sink the download: fall back to the original URL.
+                if matches!(failure, RoundFailure::Failed(_)) && slot.url_idx.load(Ordering::Relaxed) != 0 {
+                    slot.url_idx.store(0, Ordering::Relaxed);
+                    failures += 1;
+                    if failures > MAX_CONSECUTIVE_FAILURES {
+                        return SlotEnd::Fatal(failure);
+                    }
+                    continue;
+                }
+                return SlotEnd::Fatal(failure);
+            }
+            AttemptEnd::Retry { reason, made_progress, retry_after, throttled } => {
+                if made_progress {
+                    failures = 0;
+                }
+                failures += 1;
 
-    // The file on disk is the truth about what we have: bytes are appended
-    // strictly in order, so its length is exactly how far this segment got.
-    let disk_len = file
-        .metadata()
-        .await
-        .map_err(|e| fail(format!("Cannot inspect segment file: {e}")))?
-        .len();
-    let already = disk_len.min(total);
-    if disk_len != already {
-        file.set_len(already)
-            .await
-            .map_err(|e| fail(format!("Cannot trim segment file: {e}")))?;
+                if throttled {
+                    shared.note_throttle();
+                    // Fewer connections: this one steps aside if others are running.
+                    if shared.active.load(Ordering::Relaxed) > 1 {
+                        return SlotEnd::GiveBack;
+                    }
+                }
+                if failures > MAX_CONSECUTIVE_FAILURES {
+                    return SlotEnd::Fatal(RoundFailure::Failed(format!(
+                        "{reason} (gave up after {MAX_CONSECUTIVE_FAILURES} retries)"
+                    )));
+                }
+
+                // Flush before sleeping so a long wait doesn't hold data back.
+                if !flush(shared, buf).await {
+                    return SlotEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
+                }
+                let delay = backoff_delay(shared.retry_base, failures, retry_after);
+                tokio::select! {
+                    biased;
+                    _ = wait_paused(cancel) => return SlotEnd::Cancelled,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
     }
-    file.seek(SeekFrom::Start(already))
-        .await
-        .map_err(|e| fail(format!("Cannot seek segment file: {e}")))?;
+}
 
-    if ctx.tx.send(WorkerMessage::Started { segment_index: index, already }).await.is_err() {
-        return Err(SegmentEnd::Cancelled);
+/// One request/response cycle for a slot, resuming from wherever it got to.
+async fn attempt(
+    shared: &Arc<Shared>,
+    slot: &Arc<Slot>,
+    buf: &mut WriteBuffer,
+    cancel: &mut watch::Receiver<bool>,
+) -> AttemptEnd {
+    let st = *slot.state.lock();
+    if st.pos >= st.end {
+        return AttemptEnd::Complete;
     }
-    if already >= total {
-        return Ok(());
+
+    let url_idx = slot.url_idx.load(Ordering::Relaxed) % shared.urls.len();
+    let mut req = shared
+        .client
+        .get(&shared.urls[url_idx])
+        .header(USER_AGENT, &shared.user_agent)
+        .header(RANGE, format!("bytes={}-{}", st.pos, st.end - 1));
+    if let Some(referer) = &shared.referer {
+        req = req.header("Referer", referer);
+    }
+    // When resuming, ask the server to answer with the *same* file or not at all.
+    let sent_if_range = shared.resumed && url_idx == 0 && shared.validator.is_some();
+    if sent_if_range {
+        if let Some(v) = &shared.validator {
+            req = req.header("If-Range", v);
+        }
     }
 
-    let start_offset = ctx.segment.start_byte + already;
-    let end_offset = ctx.segment.end_byte;
-
-    let req = build_request(
-        &ctx.client,
-        &ctx.url,
-        &ctx.user_agent,
-        ctx.referer.as_deref(),
-        Some(format!("bytes={start_offset}-{end_offset}")),
-    );
-    let resp = match send_or_pause(req, &mut ctx.cancel).await {
-        Ok(Some(resp)) => resp,
-        Ok(None) => return Err(SegmentEnd::Cancelled),
-        Err(e) => return Err(fail(e)),
+    let resp = tokio::select! {
+        biased;
+        _ = wait_paused(cancel) => return AttemptEnd::Cancelled,
+        r = req.send() => r,
+    };
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return retry(format!("Request failed: {e}"), false),
     };
 
     let status = resp.status();
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        // The server must be answering the range we asked for.
-        if let Some(first) = resp
+    if status == StatusCode::PARTIAL_CONTENT {
+        shared.range_ok.store(true, Ordering::Relaxed);
+        if let Some((first, total)) = resp
             .headers()
             .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .and_then(parse_content_range_start)
+            .and_then(parse_content_range)
         {
-            if first != start_offset {
-                return Err(fail(format!(
-                    "Server returned bytes starting at {first} but {start_offset} was requested"
+            if first != st.pos {
+                return AttemptEnd::Fatal(RoundFailure::Failed(format!(
+                    "Server returned bytes starting at {first} but {} was requested",
+                    st.pos
                 )));
             }
+            if let Some(total) = total {
+                if total != shared.total {
+                    return if url_idx == 0 {
+                        AttemptEnd::Fatal(RoundFailure::FileChanged)
+                    } else {
+                        // This mirror serves a different file; use the original instead.
+                        slot.url_idx.store(0, Ordering::Relaxed);
+                        retry("Mirror serves a different file".to_string(), false)
+                    };
+                }
+            }
         }
-    } else if status == reqwest::StatusCode::OK && start_offset == 0 && end_offset + 1 >= ctx.file_total {
-        // Whole file requested and whole file returned: fine.
-    } else if status == reqwest::StatusCode::OK {
-        return Err(fail(
-            "Server ignored the Range request (HTTP 200), so this file can't be downloaded in parts. \
-             Set connections to 1 and retry."
-                .to_string(),
-        ));
+    } else if status == StatusCode::OK {
+        if st.pos == 0 && st.end >= shared.total {
+            // The whole file was requested and the whole file is coming: fine.
+        } else if sent_if_range {
+            // A full answer to a conditional range request means the file changed.
+            return AttemptEnd::Fatal(RoundFailure::FileChanged);
+        } else {
+            return AttemptEnd::Fatal(RoundFailure::Failed(
+                "Server ignored the Range request (HTTP 200), so this file can't be downloaded in parts. \
+                 Set connections to 1 and retry."
+                    .to_string(),
+            ));
+        }
+    } else if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return AttemptEnd::Retry {
+            reason: format!("Server is busy (HTTP {status})"),
+            made_progress: false,
+            retry_after,
+            throttled: true,
+        };
+    } else if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+        return retry(format!("Server error (HTTP {status})"), false);
     } else {
-        return Err(fail(format!("HTTP error: {status}")));
+        return AttemptEnd::Fatal(RoundFailure::Failed(format!("HTTP error: {status}")));
     }
 
     let mut stream = resp.bytes_stream();
-    let mut received = already;
+    let mut made_progress = false;
+    let mut flush_tick = tokio::time::interval(WRITE_BATCH_MAX_AGE);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    while received < total {
+    loop {
         let next = tokio::select! {
             biased;
-            _ = wait_paused(&mut ctx.cancel) => {
-                let _ = file.flush().await;
-                return Err(SegmentEnd::Cancelled);
+            _ = wait_paused(cancel) => return AttemptEnd::Cancelled,
+            _ = flush_tick.tick() => {
+                if buf.due() && !flush(shared, buf).await {
+                    return AttemptEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
+                }
+                continue;
             }
             next = stream.next() => next,
         };
 
-        let Some(chunk_res) = next else { break };
-        let chunk = chunk_res.map_err(|e| fail(format!("Stream read error: {e}")))?;
+        let chunk = match next {
+            None => break,
+            Some(Err(e)) => return retry(format!("Connection error: {e}"), made_progress),
+            Some(Ok(chunk)) => chunk,
+        };
 
-        // Never write past the end of this segment, whatever the server sends.
-        let take = (chunk.len() as u64).min(total - received) as usize;
-        if take > 0 {
-            file.write_all(&chunk[..take])
-                .await
-                .map_err(|e| fail(format!("Disk write error: {e}")))?;
-            received += take as u64;
-            // Progress is a lossy absolute counter; dropping one when the
-            // channel is busy is harmless and keeps workers from stalling.
-            let _ = ctx.tx.try_send(WorkerMessage::Progress {
-                segment_index: index,
-                bytes_downloaded: received,
-            });
+        // Reserve the bytes under the slot lock: this is what makes work
+        // stealing exact, because `end` may have been lowered meanwhile.
+        let (take, offset, finished) = {
+            let mut s = slot.state.lock();
+            let take = (chunk.len() as u64).min(s.end.saturating_sub(s.pos));
+            let offset = s.pos;
+            s.pos += take;
+            (take, offset, s.pos >= s.end)
+        };
+        if take == 0 {
+            return AttemptEnd::Complete;
+        }
+
+        buf.push(offset, &chunk[..take as usize]);
+        shared.received.fetch_add(take, Ordering::Relaxed);
+        made_progress = true;
+
+        // Bandwidth limits (the wait is interruptible so Pause stays instant).
+        let limited = async {
+            shared.task_limit.acquire(take).await;
+            shared.global_limit.acquire(take).await;
+        };
+        tokio::select! {
+            biased;
+            _ = wait_paused(cancel) => return AttemptEnd::Cancelled,
+            _ = limited => {}
+        }
+
+        if (buf.due() || finished) && !flush(shared, buf).await {
+            return AttemptEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
+        }
+        if finished {
+            return AttemptEnd::Complete;
         }
     }
 
-    file.flush()
-        .await
-        .map_err(|e| fail(format!("Failed to flush segment file: {e}")))?;
-
-    if received < total {
-        return Err(fail(format!(
-            "Connection closed early: segment {} received {} of {} bytes",
-            index + 1,
-            received,
-            total
-        )));
+    let st = *slot.state.lock();
+    if st.pos >= st.end {
+        AttemptEnd::Complete
+    } else {
+        retry(
+            format!("Connection closed early ({} bytes short)", st.end - st.pos),
+            made_progress,
+        )
     }
-    Ok(())
 }
 
 // ─────────────────────────────── helpers ───────────────────────────────
+
+/// 1s, 2s, 4s ... capped at 30s, ±25% jitter; never shorter than a server's `Retry-After`.
+fn backoff_delay(base: Duration, failures: u32, retry_after: Option<Duration>) -> Duration {
+    let exp = failures.saturating_sub(1).min(5);
+    let raw = base.saturating_mul(1u32 << exp).min(base.saturating_mul(30));
+    let unit = (std::collections::hash_map::RandomState::new().build_hasher().finish() % 1000) as f64 / 1000.0;
+    let jittered = raw.mul_f64(0.75 + 0.5 * unit);
+    match retry_after {
+        Some(ra) => jittered.max(ra.min(Duration::from_secs(60))),
+        None => jittered,
+    }
+}
+
+/// `bytes 100-199/1000` → (100, Some(1000)); `bytes 0-9/*` → (0, None)
+fn parse_content_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let first = range.split('-').next()?.trim().parse().ok()?;
+    Some((first, total.trim().parse().ok()))
+}
+
+/// A strong validator for `If-Range` (weak ETags aren't allowed there).
+fn resume_validator(etag: Option<&str>, last_modified: Option<&str>) -> Option<String> {
+    match etag {
+        Some(etag) if !etag.starts_with("W/") && !etag.is_empty() => Some(etag.to_string()),
+        _ => last_modified.filter(|m| !m.is_empty()).map(str::to_string),
+    }
+}
 
 fn build_request(
     client: &reqwest::Client,
@@ -624,15 +1184,6 @@ async fn send_or_pause(
     }
 }
 
-/// Waits (bounded) for workers to notice cancellation and drop their senders,
-/// so nothing is still writing to the segment files when we return.
-async fn drain_workers(rx: &mut mpsc::Receiver<WorkerMessage>) {
-    let _ = tokio::time::timeout(Duration::from_secs(10), async {
-        while rx.recv().await.is_some() {}
-    })
-    .await;
-}
-
 fn paused(mut task: DownloadTask) -> DownloadTask {
     task.status = DownloadStatus::Paused;
     task.speed_bps = 0;
@@ -658,48 +1209,37 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| "download.bin".to_string())
 }
 
-/// `bytes 100-199/1000` → 100
-fn parse_content_range_start(value: &str) -> Option<u64> {
-    let rest = value.trim().strip_prefix("bytes")?.trim_start();
-    let range = rest.split('/').next()?;
-    range.split('-').next()?.trim().parse().ok()
-}
-
-async fn merge_segments(seg_paths: &[PathBuf], target: &Path, expected_len: u64) -> Result<(), String> {
-    let mut out = File::create(target)
-        .await
-        .map_err(|e| format!("Failed to create merged file: {e}"))?;
-
-    for (i, path) in seg_paths.iter().enumerate() {
-        let src = File::open(path)
-            .await
-            .map_err(|e| format!("Failed to open segment file {}: {e}", i + 1))?;
-        let mut reader = BufReader::with_capacity(1024 * 1024, src);
-        tokio::io::copy_buf(&mut reader, &mut out)
-            .await
-            .map_err(|e| format!("Failed while merging segment {}: {e}", i + 1))?;
-    }
-
-    out.flush().await.map_err(|e| format!("Failed to flush merged file: {e}"))?;
-    out.sync_all().await.map_err(|e| format!("Failed to sync merged file: {e}"))?;
-    drop(out);
-
-    let len = tokio::fs::metadata(target).await.map(|m| m.len()).unwrap_or(0);
-    if len != expected_len {
-        return Err(format!("Merged file is {len} bytes, expected {expected_len}"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_content_range_start;
+    use super::*;
 
     #[test]
     fn parses_content_range() {
-        assert_eq!(parse_content_range_start("bytes 100-199/1000"), Some(100));
-        assert_eq!(parse_content_range_start("bytes 0-0/10"), Some(0));
-        assert_eq!(parse_content_range_start("bytes */1000"), None);
-        assert_eq!(parse_content_range_start("garbage"), None);
+        assert_eq!(parse_content_range("bytes 100-199/1000"), Some((100, Some(1000))));
+        assert_eq!(parse_content_range("bytes 0-0/10"), Some((0, Some(10))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, None)));
+        assert_eq!(parse_content_range("bytes */1000"), None);
+        assert_eq!(parse_content_range("garbage"), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let base = Duration::from_secs(1);
+        let d1 = backoff_delay(base, 1, None);
+        let d4 = backoff_delay(base, 4, None);
+        let d20 = backoff_delay(base, 20, None);
+        assert!(d1 >= Duration::from_millis(750) && d1 <= Duration::from_millis(1250), "{d1:?}");
+        assert!(d4 >= Duration::from_secs(6) && d4 <= Duration::from_secs(10), "{d4:?}");
+        assert!(d20 <= Duration::from_millis(37_500), "{d20:?}");
+        // Retry-After wins when it's longer.
+        assert!(backoff_delay(base, 1, Some(Duration::from_secs(20))) >= Duration::from_secs(20));
+    }
+
+    #[test]
+    fn weak_etags_are_not_used_for_if_range() {
+        let lm = Some("Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(resume_validator(Some("W/\"abc\""), lm).as_deref(), lm);
+        assert_eq!(resume_validator(Some("\"strong\""), lm).as_deref(), Some("\"strong\""));
+        assert_eq!(resume_validator(None, None), None);
     }
 }
