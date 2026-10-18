@@ -1,9 +1,9 @@
 """End-to-end check of the real Nexdrop app through its browser bridge.
 
-    cargo build --manifest-path src-tauri/Cargo.toml
+    pnpm build && cargo build --release --manifest-path src-tauri/Cargo.toml
     python scripts/e2e_bridge.py
 
-Starts a local HTTP server, runs the built app (debug build), queues downloads
+Starts a local HTTP server, runs the built app (release build), queues downloads
 over 127.0.0.1:18888 exactly as the browser extension would, and inspects the
 results: Mark of the Web, expected-checksum verification, saved logins, queue
 advancement and the bridge's origin rules.
@@ -15,7 +15,7 @@ Close Nexdrop before running (it refuses to run if the bridge port is busy).
 import base64, hashlib, http.server, json, os, shutil, socketserver, sqlite3, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, 'src-tauri', 'target', 'debug', 'nexdrop.exe')
+EXE = os.path.join(ROOT, 'src-tauri', 'target', 'release', 'nexdrop.exe')
 DATA = os.path.join(os.environ['LOCALAPPDATA'], 'Nexdrop')
 DB = os.path.join(DATA, 'nexdrop.db')
 BACKUP = os.path.join(tempfile.gettempdir(), 'nexdrop_e2e_db_backup')
@@ -24,6 +24,8 @@ PORT = 8765
 AUTH = 'Basic ' + base64.b64encode(b'e2euser:e2epass').decode()
 
 FILES = {
+    'nexdrop_e2e_crlf.bin': bytes((i * 3 + 7) % 251 for i in range(100_000)),
+    'nexdrop_e2e_cookie.bin': bytes((i * 13 + 1) % 251 for i in range(300_000)),
     'nexdrop_e2e_ok.bin': bytes((i * 7 + 3) % 251 for i in range(2_000_000)),
     'nexdrop_e2e_bad.bin': bytes((i * 5 + 1) % 251 for i in range(1_000_000)),
     'nexdrop_e2e_auth.bin': bytes((i * 11 + 9) % 251 for i in range(500_000)),
@@ -32,6 +34,7 @@ for i in range(6):
     FILES[f'nexdrop_e2e_q{i}.bin'] = bytes((i + j) % 251 for j in range(300_000))
 
 seen_auth = []
+seen_cookies = []
 results = []
 
 
@@ -49,6 +52,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = FILES.get(name)
         if data is None:
             self.send_response(404); self.end_headers(); return
+        if 'cookie' in name:
+            seen_cookies.append(self.headers.get('Cookie'))
         if 'auth' in name:
             seen_auth.append(self.headers.get('Authorization'))
             if self.headers.get('Authorization') != AUTH:
@@ -146,6 +151,31 @@ def main():
         time.sleep(1.0)
         print(f'app running, destination = {dest}')
 
+        # --- like IDM: with the default setting a browser link opens the download window first
+        code, body = bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_cookie.bin', 'cookies': 'sid=abc123; theme=dark'})
+        time.sleep(1.5)
+        check('browser link: the download window is shown instead of starting blindly', code == 200 and body.get('prompt') is True and rows() == [], (code, body, len(rows())))
+        # now switch to "start immediately" and restart, as a user would
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+        time.sleep(1.5)
+        con = sqlite3.connect(DB, timeout=10)
+        r = con.execute("SELECT value FROM settings WHERE key='app_settings'").fetchone()
+        cfg = json.loads(r[0]) if r else {}
+        cfg['browser_prompt'] = False
+        con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?)", (json.dumps(cfg),))
+        con.commit(); con.close()
+        proc = subprocess.Popen([EXE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(60):
+            try:
+                urllib.request.urlopen(BRIDGE + '/status', timeout=1); break
+            except Exception:
+                time.sleep(0.5)
+        time.sleep(1.0)
+
         # --- bridge hardening
         code, _ = bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_ok.bin'}, origin='https://evil.example')
         check('bridge rejects a web page origin', code == 403, code)
@@ -168,13 +198,17 @@ def main():
         check('queue download with WRONG expected hash', code == 200, code)
         code, _ = bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_auth.bin'})
         check('queue download that needs a saved login', code == 200, code)
+        code, body = bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_cookie.bin', 'cookies': 'sid=abc123; theme=dark'})
+        check('browser link with cookies starts immediately when the window is turned off', code == 200 and body.get('task_id'), (code, body))
+        code, _ = bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_crlf.bin', 'cookies': 'a=1\r\nInjected: yes'})
+        check('a cookie value with line breaks is dropped, not forwarded', code == 200, code)
         for i in range(6):
             bridge('/download', {'url': f'http://127.0.0.1:{PORT}/nexdrop_e2e_q{i}.bin'})
 
         deadline = time.time() + 60
         while time.time() < deadline:
             rs = rows()
-            if len(rs) >= 9 and all(r['status'] in ('completed', 'failed') for r in rs):
+            if len(rs) >= 11 and all(r['status'] in ('completed', 'failed') for r in rs):
                 break
             time.sleep(0.5)
         rs = {r['url'].rsplit('/', 1)[1]: r for r in rows()}
@@ -204,6 +238,10 @@ def main():
         ap = os.path.join(au.get('destination_path', ''), au.get('filename', ''))
         check('saved login: file bytes are exact', os.path.exists(ap) and open(ap, 'rb').read() == FILES['nexdrop_e2e_auth.bin'])
 
+        ck = rs.get('nexdrop_e2e_cookie.bin', {})
+        cp = os.path.join(ck.get('destination_path', ''), ck.get('filename', ''))
+        check('cookies: the server received the browser Cookie header', 'sid=abc123; theme=dark' in seen_cookies, seen_cookies)
+        check('cookies: file bytes are exact', os.path.exists(cp) and open(cp, 'rb').read() == FILES['nexdrop_e2e_cookie.bin'])
         q = [rs.get(f'nexdrop_e2e_q{i}.bin', {}) for i in range(6)]
         check('queue advances: all 6 downloads (limit 3 at a time) completed', all(r.get('status') == 'completed' for r in q), [r.get('status') for r in q])
     finally:

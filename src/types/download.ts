@@ -148,6 +148,8 @@ export interface AppSettings {
   torrent_upload_limit: number;
   torrent_dht: boolean;
   torrent_upnp: boolean;
+  /** Links sent by the browser open the download window first. */
+  browser_prompt: boolean;
 }
 
 export interface UrlProbeResult {
@@ -258,4 +260,14 @@ export interface StreamProbe {
   variants: StreamVariant[];
   /** Why it can't be downloaded (live stream, DRM...). */
   unsupported?: string | null;
+}
+
+/** What a browser sent along with a link, so the download behaves as it would in the browser. */
+export interface BrowserRequest {
+  filename?: string;
+  referer?: string;
+  userAgent?: string;
+  /** Private request headers (the browser's cookies for the link). */
+  headers?: Record<string, string>;
+  checksum?: string;
 }

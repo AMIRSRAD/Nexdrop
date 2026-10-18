@@ -13,8 +13,14 @@ use crate::engine::manager::DownloadManager;
 pub type AppState = Arc<DownloadManager>;
 
 #[tauri::command]
-pub async fn probe_url_cmd(state: State<'_, AppState>, url: String) -> Result<UrlProbeResult, String> {
-    let probe = state.probe_with_settings(&url).await?;
+pub async fn probe_url_cmd(
+    state: State<'_, AppState>,
+    url: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    headers: Option<HashMap<String, String>>,
+) -> Result<UrlProbeResult, String> {
+    let probe = state.probe_with_settings(&url, referer, user_agent, headers.unwrap_or_default()).await?;
     let settings = state.get_settings();
 
     Ok(UrlProbeResult {

@@ -65,10 +65,26 @@
       color: #e2e8f0;
     }
     .video-row .kind {
+      flex: none;
       font-size: 9.5px;
-      color: #94a3b8;
-      margin-left: 6px;
+      font-weight: 700;
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: rgba(91, 140, 255, 0.18);
+      color: #9db9ff;
     }
+    .video-row .size {
+      flex: none;
+      font-size: 10.5px;
+      color: #8b8f9b;
+    }
+    .more {
+      margin-top: 10px;
+      text-align: center;
+      font-size: 10.5px;
+    }
+    .more a { color: #8b8f9b; text-decoration: none; }
+    .more a:hover { color: #e2e8f0; }
     .btn-small {
       background: #5b8cff;
       color: #fff;
@@ -207,6 +223,8 @@
       <span class="slider"></span>
     </label>
   </div>
+
+  <div class="more"><a id="optionsLink" href="#">Capture settings</a></div>
 
   <script src="popup.js"></script>
 </body>

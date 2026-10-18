@@ -45,12 +45,18 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 ## 4. Browser integration
 
-- [ ] Settings for which file types are captured (currently hard-coded)
-- [ ] Never-intercept list of sites
-- [ ] Alt-click to force a download, Shift-click to skip
-- [ ] Capture downloads that need cookies or a POST request
-- [ ] Firefox build of the extension
-- [ ] Panel listing the downloadable files on the current page
+- [x] Downloads the browser starts go to Nexdrop, with the page's cookies, referer and user agent (Chrome, Edge, Firefox)
+- [x] The download window opens first, like IDM (setting: "Show the download window first")
+- [x] Settings for which file types are captured, and a minimum size for other files (extension options page)
+- [x] Never-intercept list of sites
+- [x] Alt-click leaves a link to the browser
+- [x] Videos and PDFs you click download instead of opening in the tab
+- [x] Download button over playing videos, finding HLS/DASH streams and video files the page loaded, with a picker when there are several
+- [x] Panel listing the videos and files on the current page (toolbar popup, with a badge count)
+- [x] Firefox support (same package; verified in real Firefox and Edge by `scripts/e2e_extension.py`)
+- [ ] Publish the extension to the Chrome Web Store, Edge Add-ons and Mozilla Add-ons (needed for one-click install and for Firefox to keep it after restarts)
+- [ ] POST-based downloads (forms that return a file)
+- [ ] Start Nexdrop automatically when the browser sends a download and it isn't running
 
 ## 5. Failed and expired downloads
 

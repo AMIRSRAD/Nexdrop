@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  BrowserRequest,
   StreamProbe,
   DownloadQueue,
   QueueInfo,
@@ -268,12 +269,18 @@ let mockSettings: AppSettings = {
   torrent_upload_limit: 0,
   torrent_dht: true,
   torrent_upnp: false,
+  browser_prompt: true,
 };
 
 export const api = {
-  async probeUrl(url: string): Promise<UrlProbeResult> {
+  async probeUrl(url: string, from?: BrowserRequest): Promise<UrlProbeResult> {
     if (isTauri()) {
-      return await invoke<UrlProbeResult>('probe_url_cmd', { url });
+      return await invoke<UrlProbeResult>('probe_url_cmd', {
+        url,
+        referer: from?.referer || null,
+        userAgent: from?.userAgent || null,
+        headers: from?.headers && Object.keys(from.headers).length ? from.headers : null,
+      });
     }
     // Browser mock probe
     const filename = url.split('/').filter(Boolean).pop()?.split('?')[0] || 'file.bin';
