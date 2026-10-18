@@ -61,6 +61,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
       {/* Omnibox — the primary way in: paste a link, press Enter */}
       <form
+        data-tauri-drag-region
         className="flex min-w-0 flex-1 justify-center"
         onSubmit={(e) => {
           e.preventDefault();
@@ -113,7 +114,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
       </form>
 
       {/* Actions */}
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div data-tauri-drag-region className="flex shrink-0 items-center gap-0.5">
         <IconButton icon={Magnet} label="Add torrent" shortcut="Ctrl+T" onClick={onAddTorrent} />
         <IconButton icon={ListPlus} label="Add multiple" shortcut="Ctrl+B" onClick={onAddMultiple} />
         {canPauseAll || !canResumeAll ? (
