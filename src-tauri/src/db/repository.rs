@@ -196,29 +196,42 @@ impl Repository {
         Ok(())
     }
 
+    /// Records live progress. Only touches a task that is still downloading, so a
+    /// late write can never undo a pause, cancel or delete the user just made.
     pub fn update_progress(
         conn: &Connection,
         id: &str,
         downloaded_bytes: i64,
-        status: DownloadStatus,
         speed_bps: u64,
         eta_seconds: Option<u64>,
         now: i64,
     ) -> Result<()> {
         conn.execute(
-            "UPDATE downloads 
-             SET downloaded_bytes = ?1, status = ?2, speed_bps = ?3, eta_seconds = ?4, updated_at = ?5 
-             WHERE id = ?6",
-            params![
-                downloaded_bytes,
-                status.as_str(),
-                speed_bps as i64,
-                eta_seconds.map(|e| e as i64),
-                now,
-                id
-            ],
+            "UPDATE downloads
+             SET downloaded_bytes = ?1, speed_bps = ?2, eta_seconds = ?3, updated_at = ?4
+             WHERE id = ?5 AND status = 'downloading'",
+            params![downloaded_bytes, speed_bps as i64, eta_seconds.map(|e| e as i64), now, id],
         )?;
         Ok(())
+    }
+
+    /// Saves how many bytes a stopped task has, without touching its status.
+    pub fn update_downloaded_bytes(conn: &Connection, id: &str, downloaded_bytes: i64) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads SET downloaded_bytes = ?1, speed_bps = 0, eta_seconds = NULL WHERE id = ?2",
+            params![downloaded_bytes, id],
+        )?;
+        Ok(())
+    }
+
+    /// Startup recovery: tasks left as `downloading` by a crash or quit have no
+    /// running engine; move them to `status` so they can be resumed.
+    pub fn reset_interrupted(conn: &Connection, status: DownloadStatus, now: i64) -> Result<usize> {
+        conn.execute(
+            "UPDATE downloads SET status = ?1, speed_bps = 0, eta_seconds = NULL, updated_at = ?2
+             WHERE status = 'downloading'",
+            params![status.as_str(), now],
+        )
     }
 
     pub fn update_status(
@@ -469,7 +482,14 @@ impl Repository {
                 password = excluded.password,
                 token = excluded.token,
                 notes = excluded.notes;",
-            params![cred.id, cred.domain.to_lowercase().trim(), cred.username, cred.password, cred.token, cred.notes],
+            params![
+                cred.id,
+                cred.domain.to_lowercase().trim(),
+                cred.username.clone().unwrap_or_default(),
+                cred.password,
+                cred.token_or_cookie,
+                cred.notes
+            ],
         )?;
         Ok(())
     }
@@ -480,9 +500,9 @@ impl Repository {
             Ok(SiteCredential {
                 id: row.get(0)?,
                 domain: row.get(1)?,
-                username: row.get(2)?,
+                username: row.get::<_, Option<String>>(2)?.filter(|u| !u.is_empty()),
                 password: row.get(3)?,
-                token: row.get(4)?,
+                token_or_cookie: row.get(4)?,
                 notes: row.get(5)?,
             })
         })?;
@@ -496,14 +516,14 @@ impl Repository {
 
     pub fn get_site_credential_for_domain(conn: &Connection, domain: &str) -> Result<Option<SiteCredential>> {
         let clean_domain = domain.to_lowercase().trim().to_string();
-        let mut stmt = conn.prepare("SELECT id, domain, username, password, token, notes FROM site_credentials WHERE domain = ?1 OR ?1 LIKE '%' || domain LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT id, domain, username, password, token, notes FROM site_credentials WHERE domain = ?1 OR ?1 LIKE '%.' || domain LIMIT 1")?;
         let mut rows = stmt.query_map(params![clean_domain], |row| {
             Ok(SiteCredential {
                 id: row.get(0)?,
                 domain: row.get(1)?,
-                username: row.get(2)?,
+                username: row.get::<_, Option<String>>(2)?.filter(|u| !u.is_empty()),
                 password: row.get(3)?,
-                token: row.get(4)?,
+                token_or_cookie: row.get(4)?,
                 notes: row.get(5)?,
             })
         })?;
@@ -641,8 +661,9 @@ mod tests {
         assert_eq!(fetched.status, DownloadStatus::Queued);
         assert_eq!(fetched.segments.len(), 2);
 
-        // 3. Progress update
-        Repository::update_progress(&conn, "test-uuid-1", 5000000, DownloadStatus::Downloading, 1024000, Some(5), 1050).unwrap();
+        // 3. Progress update (only applies while the task is downloading)
+        Repository::update_status(&conn, "test-uuid-1", DownloadStatus::Downloading, None, None, 1040).unwrap();
+        Repository::update_progress(&conn, "test-uuid-1", 5000000, 1024000, Some(5), 1050).unwrap();
         let fetched2 = Repository::get_download(&conn, "test-uuid-1").unwrap().unwrap();
         assert_eq!(fetched2.downloaded_bytes, 5000000);
         assert_eq!(fetched2.status, DownloadStatus::Downloading);
@@ -684,9 +705,9 @@ mod tests {
         let cred = SiteCredential {
             id: "cred-1".to_string(),
             domain: "example.com".to_string(),
-            username: "admin".to_string(),
+            username: Some("admin".to_string()),
             password: Some("secret123".to_string()),
-            token: None,
+            token_or_cookie: None,
             notes: Some("Test note".to_string()),
         };
 
@@ -697,11 +718,107 @@ mod tests {
         assert_eq!(list[0].domain, "example.com");
 
         let fetched = Repository::get_site_credential_for_domain(&conn, "sub.example.com").unwrap().unwrap();
-        assert_eq!(fetched.username, "admin");
+        assert_eq!(fetched.username.as_deref(), Some("admin"));
+
+        // Only the exact host or a real subdomain may match: never a look-alike.
+        assert!(Repository::get_site_credential_for_domain(&conn, "evilexample.com").unwrap().is_none());
+        assert!(Repository::get_site_credential_for_domain(&conn, "example.com").unwrap().is_some());
 
         Repository::delete_site_credential(&conn, "cred-1").unwrap();
         let list_empty = Repository::get_all_site_credentials(&conn).unwrap();
         assert_eq!(list_empty.len(), 0);
     }
-}
 
+    #[test]
+    fn test_token_only_credential_round_trips() {
+        let conn = setup_test_db();
+        let cred = SiteCredential {
+            id: "cred-2".to_string(),
+            domain: "files.example.org".to_string(),
+            username: None,
+            password: None,
+            token_or_cookie: Some("sessionid=abc".to_string()),
+            notes: None,
+        };
+        Repository::save_site_credential(&conn, &cred).unwrap();
+        let list = Repository::get_all_site_credentials(&conn).unwrap();
+        assert_eq!(list[0].username, None);
+        assert_eq!(list[0].token_or_cookie.as_deref(), Some("sessionid=abc"));
+
+        // The shape the UI sends (`token_or_cookie`, no username) must deserialize.
+        let parsed: SiteCredential =
+            serde_json::from_str(r#"{"id":"x","domain":"a.com","token_or_cookie":"t"}"#).unwrap();
+        assert_eq!(parsed.token_or_cookie.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn test_late_progress_never_overwrites_a_pause() {
+        let conn = setup_test_db();
+        let mut task = sample_task("pause-race");
+        task.status = DownloadStatus::Downloading;
+        Repository::save_download(&conn, &task).unwrap();
+
+        Repository::update_status(&conn, "pause-race", DownloadStatus::Paused, None, None, 10).unwrap();
+        // A progress tick that was already in flight when the user paused:
+        Repository::update_progress(&conn, "pause-race", 999, 500, Some(3), 11).unwrap();
+
+        let t = Repository::get_download(&conn, "pause-race").unwrap().unwrap();
+        assert_eq!(t.status, DownloadStatus::Paused);
+        assert_eq!(t.downloaded_bytes, 0);
+    }
+
+    #[test]
+    fn test_interrupted_downloads_are_recovered() {
+        let conn = setup_test_db();
+        let mut running = sample_task("was-running");
+        running.status = DownloadStatus::Downloading;
+        let mut done = sample_task("was-done");
+        done.status = DownloadStatus::Completed;
+        Repository::save_download(&conn, &running).unwrap();
+        Repository::save_download(&conn, &done).unwrap();
+
+        let n = Repository::reset_interrupted(&conn, DownloadStatus::Queued, 50).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(Repository::get_download(&conn, "was-running").unwrap().unwrap().status, DownloadStatus::Queued);
+        assert_eq!(Repository::get_download(&conn, "was-done").unwrap().unwrap().status, DownloadStatus::Completed);
+    }
+
+    fn sample_task(id: &str) -> DownloadTask {
+        DownloadTask {
+            id: id.to_string(),
+            url: "https://example.com/f.bin".to_string(),
+            final_url: None,
+            filename: "f.bin".to_string(),
+            destination_path: "C:/Downloads".to_string(),
+            temp_path: "C:/Downloads/f.bin.nexpart".to_string(),
+            total_bytes: 1000,
+            downloaded_bytes: 0,
+            status: DownloadStatus::Queued,
+            resumable: true,
+            etag: None,
+            last_modified: None,
+            mime_type: None,
+            category: FileCategory::Other,
+            connections: 1,
+            speed_limit: 0,
+            priority: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            segments: vec![],
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+            error_message: None,
+            scheduled_time: None,
+            checksum_sha256: None,
+            checksum_md5: None,
+            user_agent: None,
+            referer: None,
+            mirrors: vec![],
+            min_chunk_size: 1048576,
+            proxy_mode: None,
+            custom_proxy_url: None,
+            antivirus_status: None,
+        }
+    }
+}

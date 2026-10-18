@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::db::models::{
@@ -18,7 +20,12 @@ use crate::engine::segment::{calculate_segments, calculate_segments_with_chunk_s
 pub struct DownloadManager {
     db_path: PathBuf,
     engine: DownloadEngine,
+    /// Pause switches for runs that are in flight. An entry stays until its
+    /// run has fully ended (not merely until it was asked to pause), so a
+    /// task can never have two engines writing to the same files.
     active_controllers: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    /// Serialises queue scheduling so concurrent callers can't start a task twice.
+    queue_lock: AsyncMutex<()>,
     app_handle: AppHandle,
 }
 
@@ -28,6 +35,7 @@ impl DownloadManager {
             db_path,
             engine: DownloadEngine::new(),
             active_controllers: Arc::new(Mutex::new(HashMap::new())),
+            queue_lock: AsyncMutex::new(()),
             app_handle,
         }
     }
@@ -65,7 +73,7 @@ impl DownloadManager {
         Repository::delete_site_credential(&conn, id).map_err(|e| e.to_string())
     }
 
-    pub async fn add_download(&self, req: AddDownloadRequest) -> Result<DownloadTask, String> {
+    pub async fn add_download(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
         let settings = self.get_settings();
         let proxy_mode_to_use = req.proxy_mode.as_deref().unwrap_or(&settings.proxy_mode);
         let custom_proxy_to_use = req.custom_proxy_url.as_deref().or(settings.custom_proxy_url.as_deref());
@@ -165,7 +173,25 @@ impl DownloadManager {
         Ok(task)
     }
 
-    pub async fn process_queue(&self) {
+    /// Called once at startup: anything still marked as downloading was cut off
+    /// by a crash or quit. Put it back in the queue (or on hold) so it can be
+    /// resumed instead of sitting in a state nothing will ever act on.
+    pub fn recover_interrupted(&self) {
+        let settings = self.get_settings();
+        let target = if settings.auto_resume_on_launch {
+            DownloadStatus::Queued
+        } else {
+            DownloadStatus::Paused
+        };
+        if let Ok(conn) = self.get_db_conn() {
+            let _ = Repository::reset_interrupted(&conn, target, chrono::Utc::now().timestamp());
+        }
+    }
+
+    pub async fn process_queue(self: &Arc<Self>) {
+        // Only one scheduling pass at a time.
+        let _guard = self.queue_lock.lock().await;
+
         let settings = self.get_settings();
         let active_count = self.active_controllers.lock().len();
 
@@ -174,12 +200,7 @@ impl DownloadManager {
         }
 
         let slots_available = settings.max_active_downloads - active_count;
-        let conn = match self.get_db_conn() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let all = match Repository::get_all_downloads(&conn) {
+        let all = match self.get_db_conn().and_then(|conn| Repository::get_all_downloads(&conn)) {
             Ok(tasks) => tasks,
             Err(_) => return,
         };
@@ -192,15 +213,27 @@ impl DownloadManager {
 
         queued.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.created_at.cmp(&b.created_at)));
 
-        for task in queued.into_iter().take(slots_available) {
-            self.start_download(task).await;
+        let mut started = 0;
+        for task in queued {
+            if started >= slots_available {
+                break;
+            }
+            if self.start_download(task) {
+                started += 1;
+            }
         }
     }
 
-    pub async fn start_download(&self, mut task: DownloadTask) {
+    /// Starts a run for `task`. Returns `false` if it was already running
+    /// (e.g. paused and resumed again before the previous run finished
+    /// stopping); that run's final queue pass will pick it up afterwards.
+    fn start_download(self: &Arc<Self>, mut task: DownloadTask) -> bool {
         let (pause_tx, pause_rx) = watch::channel(false);
         {
             let mut active = self.active_controllers.lock();
+            if active.contains_key(&task.id) {
+                return false;
+            }
             active.insert(task.id.clone(), pause_tx);
         }
 
@@ -210,82 +243,121 @@ impl DownloadManager {
             let _ = Repository::update_status(&conn, &task.id, DownloadStatus::Downloading, None, None, now);
         }
 
-        let app_handle_clone = self.app_handle.clone();
-        let db_path_clone = self.db_path.clone();
-        let active_controllers_clone = self.active_controllers.clone();
+        let manager = Arc::clone(self);
         let task_id = task.id.clone();
-
         let engine = self.engine.clone();
 
         tauri::async_runtime::spawn(async move {
-            let app_h = app_handle_clone.clone();
-            let db_p = db_path_clone.clone();
+            let app_handle = manager.app_handle.clone();
+            let db_path = manager.db_path.clone();
+
+            // Progress goes to the UI on every tick, but to the database only
+            // every couple of seconds and off the async threads.
+            let clock = Instant::now();
+            let last_db_write = Arc::new(AtomicU64::new(0));
+            let progress_app = app_handle.clone();
+            let progress_db = db_path.clone();
 
             let res = engine
                 .run_download(task, pause_rx, move |event: DownloadProgressEvent| {
-                    let _ = app_h.emit("download-progress", &event);
-                    if let Ok(conn) = Repository::open_or_create(&db_p) {
-                        let now = chrono::Utc::now().timestamp();
-                        let _ = Repository::update_progress(
-                            &conn,
-                            &event.id,
-                            event.downloaded_bytes,
-                            event.status,
-                            event.speed_bps,
-                            event.eta_seconds,
-                            now,
-                        );
+                    let _ = progress_app.emit("download-progress", &event);
+                    if event.status != DownloadStatus::Downloading {
+                        return;
                     }
+                    let now_ms = clock.elapsed().as_millis() as u64;
+                    if now_ms.saturating_sub(last_db_write.load(Ordering::Relaxed)) < 2000 {
+                        return;
+                    }
+                    last_db_write.store(now_ms, Ordering::Relaxed);
+                    let db = progress_db.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        if let Ok(conn) = Repository::open_or_create(&db) {
+                            let now = chrono::Utc::now().timestamp();
+                            let _ = Repository::update_progress(
+                                &conn,
+                                &event.id,
+                                event.downloaded_bytes,
+                                event.speed_bps,
+                                event.eta_seconds,
+                                now,
+                            );
+                            let _ = Repository::save_segments(&conn, &event.id, &event.segments);
+                        }
+                    });
                 })
                 .await;
 
-            // Remove from active controllers
-            {
-                let mut active = active_controllers_clone.lock();
-                active.remove(&task_id);
-            }
+            match res {
+                // Stopped on request. The pause (or delete) already updated the
+                // task's status; just remember how far we got. This is NOT a
+                // completed download, so no hashing, scanning or "done" event.
+                Ok(task) if task.status == DownloadStatus::Paused => {
+                    if let Ok(conn) = Repository::open_or_create(&db_path) {
+                        let _ = Repository::update_downloaded_bytes(&conn, &task_id, task.downloaded_bytes);
+                        let _ = Repository::save_segments(&conn, &task_id, &task.segments);
+                    }
+                }
+                Ok(mut final_task) => {
+                    let final_path = Path::new(&final_task.destination_path).join(&final_task.filename);
+                    let settings = Repository::open_or_create(&db_path)
+                        .ok()
+                        .and_then(|c| Repository::load_settings(&c).ok())
+                        .unwrap_or_default();
 
-            if let Ok(conn) = Repository::open_or_create(&db_path_clone) {
-                let now = chrono::Utc::now().timestamp();
-                match res {
-                    Ok(mut final_task) => {
-                        let final_path = Path::new(&final_task.destination_path).join(&final_task.filename);
-                        if let Ok((sha256, md5)) = crate::engine::compute_checksums(&final_path) {
-                            final_task.checksum_sha256 = Some(sha256.clone());
-                            final_task.checksum_md5 = Some(md5.clone());
-                            let _ = Repository::update_checksum(&conn, &task_id, Some(&sha256), Some(&md5));
-                        }
+                    // Hashing and scanning are slow and blocking: keep them off the async threads.
+                    let hash_path = final_path.clone();
+                    let hashes = tauri::async_runtime::spawn_blocking(move || {
+                        crate::engine::compute_checksums(&hash_path)
+                    })
+                    .await;
+                    if let Ok(Ok((sha256, md5))) = hashes {
+                        final_task.checksum_sha256 = Some(sha256);
+                        final_task.checksum_md5 = Some(md5);
+                    }
 
-                        // Antivirus / Windows Defender post-download scan
-                        let settings = Repository::load_settings(&conn).unwrap_or_default();
-                        if settings.scan_with_antivirus {
-                            let scan_result = scan_file_with_antivirus(&final_path, settings.antivirus_path.as_deref());
-                            final_task.antivirus_status = Some(scan_result.clone());
-                            let _ = Repository::update_antivirus_status(&conn, &task_id, &scan_result);
-                        }
+                    if settings.scan_with_antivirus {
+                        let scan_path = final_path.clone();
+                        let av_path = settings.antivirus_path.clone();
+                        let scan = tauri::async_runtime::spawn_blocking(move || {
+                            scan_file_with_antivirus(&scan_path, av_path.as_deref())
+                        })
+                        .await
+                        .unwrap_or_else(|_| "skipped".to_string());
+                        final_task.antivirus_status = Some(scan);
+                    }
 
+                    if let Ok(conn) = Repository::open_or_create(&db_path) {
                         let _ = Repository::save_download(&conn, &final_task);
-                        let _ = app_handle_clone.emit("download-completed", &final_task);
                     }
-                    Err(err) => {
+                    let _ = app_handle.emit("download-completed", &final_task);
+                }
+                Err(err) => {
+                    if let Ok(conn) = Repository::open_or_create(&db_path) {
+                        let now = chrono::Utc::now().timestamp();
                         let _ = Repository::update_status(&conn, &task_id, DownloadStatus::Failed, Some(&err), None, now);
-                        let _ = app_handle_clone.emit("download-failed", serde_json::json!({
-                            "id": task_id,
-                            "error": err,
-                        }));
                     }
+                    let _ = app_handle.emit("download-failed", serde_json::json!({
+                        "id": task_id,
+                        "error": err,
+                    }));
                 }
             }
 
-            // Trigger next item in queue
-            let _ = app_handle_clone.emit("download-status-changed", serde_json::json!({ "id": task_id }));
+            // The run is over: free its slot, then let the next queued download start.
+            manager.active_controllers.lock().remove(&task_id);
+            let _ = app_handle.emit("download-status-changed", serde_json::json!({ "id": task_id }));
+            manager.process_queue().await;
         });
+
+        true
     }
 
     pub fn pause_download(&self, id: &str) -> Result<(), String> {
-        let mut active = self.active_controllers.lock();
-        if let Some(tx) = active.remove(id) {
-            let _ = tx.send(true);
+        {
+            let active = self.active_controllers.lock();
+            if let Some(tx) = active.get(id) {
+                let _ = tx.send(true);
+            }
         }
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -300,7 +372,7 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub async fn resume_download(&self, id: &str) -> Result<(), String> {
+    pub async fn resume_download(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         let task_opt = Repository::get_download(&conn, id).map_err(|e| e.to_string())?;
 
@@ -314,7 +386,7 @@ impl DownloadManager {
         }
     }
 
-    pub async fn retry_download(&self, id: &str) -> Result<(), String> {
+    pub async fn retry_download(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         let task_opt = Repository::get_download(&conn, id).map_err(|e| e.to_string())?;
 
@@ -423,8 +495,7 @@ impl DownloadManager {
 
         #[cfg(target_os = "windows")]
         {
-            use std::process::Command;
-            Command::new("explorer")
+            crate::process::command("explorer")
                 .arg("/select,")
                 .arg(file_path)
                 .spawn()
@@ -433,8 +504,7 @@ impl DownloadManager {
 
         #[cfg(target_os = "macos")]
         {
-            use std::process::Command;
-            Command::new("open")
+            crate::process::command("open")
                 .arg("-R")
                 .arg(file_path)
                 .spawn()
@@ -456,11 +526,13 @@ impl DownloadManager {
     }
 }
 
+/// Returns "clean", "threat_detected" or "skipped". Anything that isn't a
+/// definite verdict (no scanner installed, scanner failed to run, unexpected
+/// exit code) is "skipped" so we never claim a file was checked when it wasn't.
 fn scan_file_with_antivirus(file_path: &Path, custom_av_path: Option<&str>) -> String {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        let av_path = if let Some(p) = custom_av_path {
+        let av_path = if let Some(p) = custom_av_path.filter(|p| !p.trim().is_empty()) {
             PathBuf::from(p)
         } else {
             let p1 = PathBuf::from(r"C:\Program Files\Windows Defender\MpCmdRun.exe");
@@ -471,26 +543,22 @@ fn scan_file_with_antivirus(file_path: &Path, custom_av_path: Option<&str>) -> S
             }
         };
 
-        if av_path.exists() {
-            let res = Command::new(&av_path)
-                .args(["-Scan", "-ScanType", "3", "-File"])
-                .arg(file_path)
-                .output();
+        if !av_path.exists() {
+            return "skipped".to_string();
+        }
 
-            match res {
-                Ok(output) => {
-                    if output.status.code() == Some(0) {
-                        "clean".to_string()
-                    } else if output.status.code() == Some(2) {
-                        "threat_detected".to_string()
-                    } else {
-                        "clean".to_string()
-                    }
-                }
-                Err(_) => "skipped".to_string(),
-            }
-        } else {
-            "clean".to_string()
+        let res = crate::process::command(&av_path)
+            .args(["-Scan", "-ScanType", "3", "-File"])
+            .arg(file_path)
+            .output();
+
+        match res {
+            Ok(output) => match output.status.code() {
+                Some(0) => "clean".to_string(),
+                Some(2) => "threat_detected".to_string(),
+                _ => "skipped".to_string(),
+            },
+            Err(_) => "skipped".to_string(),
         }
     }
 
@@ -498,6 +566,6 @@ fn scan_file_with_antivirus(file_path: &Path, custom_av_path: Option<&str>) -> S
     {
         let _ = file_path;
         let _ = custom_av_path;
-        "clean".to_string()
+        "skipped".to_string()
     }
 }
