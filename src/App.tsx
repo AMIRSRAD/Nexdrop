@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Download } from 'lucide-react';
+import { CheckSquare, ClipboardPaste, Copy, Download, Link2, ListPlus, Magnet, Settings as SettingsIcon } from 'lucide-react';
 import { api, isTauri } from './services/api';
 import { listen } from '@tauri-apps/api/event';
 import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
@@ -11,7 +11,7 @@ import { hasOpenLayer } from './lib/layers';
 import { STATUS_FILTERS, categoryMeta, extractUrls, isMagnet, isTorrentUrl, looksLikeCurl, matchesStatus, progressOf, type StatusFilter } from './lib/meta';
 import { plural } from './utils/format';
 import { useToast } from './components/ui/Toast';
-import { Menu } from './components/ui/Menu';
+import { Menu, type MenuItem } from './components/ui/Menu';
 import { TitleBar } from './components/shell/TitleBar';
 import { FilterBar } from './components/shell/FilterBar';
 import { StatusBar } from './components/shell/StatusBar';
@@ -69,6 +69,7 @@ export default function App() {
   const [settingsView, setSettingsView] = useState<{ open: boolean; section: SettingsSection }>({ open: false, section: 'general' });
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [appMenu, setAppMenu] = useState<{ x: number; y: number; selection: string } | null>(null);
 
   const openAdd = useCallback((text = '') => setAddState({ open: true, text }), []);
   const openMultiple = useCallback((tab: AddMultipleTab = 'paste', text = '') => setMultiState({ open: true, tab, text }), []);
@@ -374,6 +375,47 @@ export default function App() {
     };
   }, [openAdd, openMultiple, openTorrent, routeText, settingsView.open, selection.size, expandedId]);
 
+  // Right-click: never show the browser's menu. Text fields keep the native
+  // cut/copy/paste menu; selected text gets Copy; empty space gets the quick actions.
+  useEffect(() => {
+    const onContext = (e: MouseEvent) => {
+      if (e.defaultPrevented) return; // a row (or other component) already handled it
+      const target = e.target as HTMLElement;
+      if (target.closest('input, textarea, [contenteditable="true"]')) return;
+      e.preventDefault();
+      if (hasOpenLayer()) return;
+      if (target.closest('header')) return; // title bar: nothing to offer
+      const selection = window.getSelection()?.toString().trim() ?? '';
+      setAppMenu({ x: e.clientX, y: e.clientY, selection });
+    };
+    document.addEventListener('contextmenu', onContext);
+    return () => document.removeEventListener('contextmenu', onContext);
+  }, []);
+
+  const appMenuItems: MenuItem[] = useMemo(() => {
+    const sel = appMenu?.selection ?? '';
+    if (sel) {
+      return [{ label: 'Copy', icon: Copy, shortcut: 'Ctrl+C', onSelect: () => void navigator.clipboard.writeText(sel) }];
+    }
+    return [
+      { label: 'Add download…', icon: Link2, shortcut: 'Ctrl+N', onSelect: () => openAdd() },
+      { label: 'Add torrent…', icon: Magnet, shortcut: 'Ctrl+T', onSelect: () => openTorrent() },
+      { label: 'Add multiple…', icon: ListPlus, shortcut: 'Ctrl+B', onSelect: () => openMultiple() },
+      {
+        label: 'Paste link',
+        icon: ClipboardPaste,
+        onSelect: () =>
+          navigator.clipboard
+            .readText()
+            .then((t) => (t.trim() ? routeText(t) : toast.show({ tone: 'info', title: 'Clipboard is empty', duration: 1800 })))
+            .catch(() => toast.show({ tone: 'error', title: "Couldn't read the clipboard" })),
+      },
+      { separator: true },
+      { label: 'Select all', icon: CheckSquare, shortcut: 'Ctrl+A', onSelect: () => selectAll(true) },
+      { label: 'Settings', icon: SettingsIcon, shortcut: 'Ctrl+,', onSelect: () => setSettingsView((v) => ({ ...v, open: true })) },
+    ];
+  }, [appMenu, openAdd, openTorrent, openMultiple, routeText, selectAll, toast]);
+
   // Offer copied file links when the window regains focus
   const lastClip = useRef('');
   const downloadsRef = useRef(downloads);
@@ -566,6 +608,7 @@ export default function App() {
         items={menuTask ? buildTaskMenu(menuTask, handlers, expandedId === menuTask.id) : []}
         minWidth={210}
       />
+      <Menu position={appMenu ? { x: appMenu.x, y: appMenu.y } : null} onClose={() => setAppMenu(null)} items={appMenuItems} minWidth={190} />
       <AddDownloadDialog
         open={addState.open}
         initialText={addState.text}
