@@ -892,6 +892,11 @@ const Integrations: React.FC<SectionProps & { browsers: BrowserInfo[]; onSetup: 
             </SettingRow>
           ))
         )}
+        <SettingRow title="Set up browsers again" description="Opens the setup for any browser, for example after reinstalling it or if the extension was removed.">
+          <Button size="sm" variant="secondary" onClick={onSetup}>
+            Connect browsers…
+          </Button>
+        </SettingRow>
         <SettingRow title="Install by hand" description="The steps, if you prefer to do it yourself.">
           <Button size="sm" variant="ghost" onClick={() => setManual((v) => !v)}>
             {manual ? 'Hide steps' : 'Show steps'}

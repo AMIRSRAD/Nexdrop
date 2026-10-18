@@ -1,8 +1,10 @@
 """Gets the Firefox extension signed by Mozilla (unlisted: self-distributed).
 
-    set AMO_JWT_ISSUER=user:12345:67          (from addons.mozilla.org/developers/addon/api/key/)
-    set AMO_JWT_SECRET=...
     python scripts/sign_firefox.py
+
+The Mozilla API keys (AMO_JWT_ISSUER / AMO_JWT_SECRET, from
+addons.mozilla.org/developers/addon/api/key/) are read from the environment or
+from the git-ignored file .env.amo in the repo root.
 
 What happens: the Firefox package is built, uploaded to Mozilla, checked
 automatically (minutes, usually), and the signed .xpi is saved to
@@ -18,7 +20,19 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 signed_dir = os.path.join(root, 'extensions', 'signed')
 
 
+def load_env_file():
+    """Reads AMO_JWT_* from the git-ignored .env.amo in the repo root, if present."""
+    path = os.path.join(root, '.env.amo')
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding='utf-8'):
+        key, sep, value = line.strip().partition('=')
+        if sep and key.startswith('AMO_') and key not in os.environ:
+            os.environ[key] = value
+
+
 def main():
+    load_env_file()
     issuer = os.environ.get('AMO_JWT_ISSUER')
     secret = os.environ.get('AMO_JWT_SECRET')
     if not issuer or not secret:
