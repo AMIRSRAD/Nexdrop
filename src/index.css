@@ -220,12 +220,12 @@
 /* Transfer table columns: select | name | size | progress | speed | eta | added | actions */
 .nx-grid {
   display: grid;
-  grid-template-columns: 36px minmax(220px, 1fr) 84px minmax(140px, 210px) 92px 76px 84px 104px;
+  grid-template-columns: 36px minmax(220px, 1fr) 84px minmax(140px, 210px) 92px 76px 84px 124px;
   align-items: center;
 }
 @media (max-width: 1080px) {
   .nx-grid {
-    grid-template-columns: 36px minmax(200px, 1fr) 80px minmax(120px, 170px) 88px 72px 104px;
+    grid-template-columns: 36px minmax(200px, 1fr) 80px minmax(120px, 170px) 88px 72px 124px;
   }
   .nx-col-added {
     display: none;

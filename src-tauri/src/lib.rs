@@ -89,6 +89,10 @@ pub fn run() {
             parse_curl_command_cmd,
             grab_page_links_cmd,
             cancel_completion_action_cmd,
+            probe_torrent_cmd,
+            add_torrent_cmd,
+            stop_seeding_cmd,
+            start_seeding_cmd,
         ])
         .run(tauri::generate_context!()) {
         let msg = format!("error while running tauri application: {e}");

@@ -187,6 +187,22 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         Err(e) => return Reply::error("400 Bad Request", &format!("Invalid JSON: {e}")),
     };
 
+    // Magnet links and .torrent files don't download straight away: the app asks
+    // which files to take (and where to put them) before anything starts.
+    let lower = grab.url.trim().to_lowercase();
+    let torrent_file = url::Url::parse(grab.url.trim())
+        .map(|u| matches!(u.scheme(), "http" | "https") && u.path().to_lowercase().ends_with(".torrent"))
+        .unwrap_or(false);
+    if lower.starts_with("magnet:?") || torrent_file {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            let _ = window.emit("torrent-requested", serde_json::json!({ "source": grab.url.trim() }));
+        }
+        return Reply::json("200 OK", serde_json::json!({ "success": true, "torrent": true }));
+    }
+
     if !is_http_url(&grab.url) {
         return Reply::error("400 Bad Request", "Only http and https links can be downloaded");
     }

@@ -10,7 +10,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::db::models::{
-    AddDownloadRequest, AppSettings, DownloadProgressEvent, DownloadStatus, DownloadTask, FileCategory,
+    AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadProgressEvent, DownloadStatus, DownloadTask, FileCategory,
     SiteCredential,
 };
 use crate::db::Repository;
@@ -19,6 +19,7 @@ use crate::engine::auth::{build_header_list, headers_for_credential, is_forbidde
 use crate::engine::checksum::{check_expected, normalize_expected_checksum};
 use crate::engine::probe::{probe_url_with, sanitize_filename, ProbeOptions, ProbeResult};
 use crate::engine::security;
+use crate::engine::torrent::{TorrentEngine, TorrentLive, TorrentSettings, TorrentSource};
 use crate::engine::segment::{calculate_segments, calculate_segments_with_chunk_size};
 
 pub struct DownloadManager {
@@ -40,6 +41,8 @@ pub struct DownloadManager {
     scheduler_paused: Mutex<HashSet<String>>,
     /// Cancel flag of a pending sleep/shutdown countdown, if one is running.
     pending_power: Mutex<Option<Arc<AtomicBool>>>,
+    /// BitTorrent session (created on first use).
+    torrents: TorrentEngine,
     app_handle: AppHandle,
 }
 
@@ -55,6 +58,7 @@ impl DownloadManager {
             scheduler_window_open: AtomicBool::new(false),
             scheduler_paused: Mutex::new(HashSet::new()),
             pending_power: Mutex::new(None),
+            torrents: TorrentEngine::new(),
             app_handle,
         }
     }
@@ -139,6 +143,23 @@ impl DownloadManager {
             limit = if limit == 0 { settings.scheduler_speed_limit } else { limit.min(settings.scheduler_speed_limit) };
         }
         self.engine.set_global_speed_limit(limit);
+        self.torrents.apply_limits(settings.torrent_upload_limit, limit);
+    }
+
+    fn torrent_settings(&self) -> TorrentSettings {
+        let settings = self.get_settings();
+        let mut limit = settings.global_speed_limit;
+        if settings.scheduler_enabled && self.scheduler_window_open.load(Ordering::Relaxed) && settings.scheduler_speed_limit > 0 {
+            limit = if limit == 0 { settings.scheduler_speed_limit } else { limit.min(settings.scheduler_speed_limit) };
+        }
+        TorrentSettings {
+            upload_limit: settings.torrent_upload_limit,
+            download_limit: limit,
+            dht: settings.torrent_dht,
+            upnp: settings.torrent_upnp,
+            seed_after_download: settings.torrent_seed_after_download,
+            default_dir: PathBuf::from(&settings.default_destination),
+        }
     }
 
     pub fn set_scheduler_window(&self, open: bool) {
@@ -296,6 +317,12 @@ impl DownloadManager {
             antivirus_status: None,
             expected_checksum,
             custom_headers,
+            kind: "http".to_string(),
+            info_hash: None,
+            uploaded_bytes: 0,
+            peers: 0,
+            seeding: false,
+            torrent_files: vec![],
         };
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -334,6 +361,8 @@ impl DownloadManager {
         self.apply_runtime_settings();
 
         self.recover_interrupted();
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move { manager.resume_seeding_after_start().await });
         if !settings.auto_resume_on_launch {
             return;
         }
@@ -349,6 +378,229 @@ impl DownloadManager {
             }
         } else {
             self.process_queue().await;
+        }
+    }
+
+    // ───────────────────────────── torrents ─────────────────────────────
+
+    /// Resolves a torrent's contents (files, sizes) without downloading anything.
+    pub async fn probe_torrent(&self, source: TorrentSource) -> Result<crate::db::models::TorrentProbeInfo, String> {
+        if let TorrentSource::Url(url) = &source {
+            let lower = url.trim().to_lowercase();
+            let ok = lower.starts_with("magnet:?") || lower.starts_with("http://") || lower.starts_with("https://");
+            if !ok {
+                return Err("That isn't a magnet link or a link to a .torrent file".to_string());
+            }
+        }
+        let probe = self.torrents.probe(source, &self.torrent_settings()).await?;
+        Ok(crate::db::models::TorrentProbeInfo {
+            info_hash: probe.info_hash,
+            name: probe.name,
+            total_bytes: probe.total_bytes,
+            files: probe.files,
+        })
+    }
+
+    /// Adds a torrent to the list (and starts it when there's room in the queue).
+    pub async fn add_torrent(self: &Arc<Self>, req: AddTorrentRequest) -> Result<DownloadTask, String> {
+        let settings = self.get_settings();
+
+        // The details come from an earlier probe when there was one, otherwise fetch them now.
+        let cached = req.info_hash.as_deref().and_then(|h| self.torrents.cached_torrent_bytes(h));
+        let (probe, torrent_bytes) = match cached {
+            Some(bytes) => {
+                let p = self.torrents.probe(TorrentSource::Bytes(bytes.clone()), &self.torrent_settings()).await?;
+                (p, bytes)
+            }
+            None => {
+                let source = req.source.clone().ok_or_else(|| "Give a magnet link or a .torrent file".to_string())?;
+                let p = self.torrents.probe(TorrentSource::Url(source), &self.torrent_settings()).await?;
+                let bytes = p.torrent_bytes.clone();
+                (p, bytes)
+            }
+        };
+
+        if let Ok(conn) = self.get_db_conn() {
+            if Repository::find_by_info_hash(&conn, &probe.info_hash).ok().flatten().is_some() {
+                return Err("This torrent is already in your list".to_string());
+            }
+        }
+
+        let selected: Vec<usize> = match &req.selected_files {
+            Some(list) => list.clone(),
+            None => probe.files.iter().map(|f| f.index).collect(),
+        };
+        let files: Vec<crate::db::models::TorrentFile> = probe
+            .files
+            .iter()
+            .map(|f| crate::db::models::TorrentFile { selected: selected.contains(&f.index), ..f.clone() })
+            .collect();
+        let total: u64 = files.iter().filter(|f| f.selected).map(|f| f.length).sum();
+        if total == 0 {
+            return Err("Select at least one file to download".to_string());
+        }
+
+        let dest_dir = req
+            .destination_path
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| settings.default_destination.clone());
+        let _ = std::fs::create_dir_all(&dest_dir);
+
+        // Display / open name: the file itself for single-file torrents, the folder otherwise.
+        let filename = if files.len() == 1 {
+            files[0].path.rsplit('/').next().unwrap_or(&files[0].path).to_string()
+        } else {
+            sanitize_filename(&probe.name)
+        };
+        let category = if files.len() == 1 { FileCategory::from_filename_or_mime(&filename, None) } else { FileCategory::Other };
+
+        let now = chrono::Utc::now().timestamp();
+        let id = Uuid::new_v4().to_string();
+        let task = DownloadTask {
+            id: id.clone(),
+            url: req.source.clone().unwrap_or_else(|| format!("magnet:?xt=urn:btih:{}", probe.info_hash)),
+            final_url: None,
+            filename,
+            destination_path: dest_dir,
+            temp_path: String::new(),
+            total_bytes: total as i64,
+            downloaded_bytes: 0,
+            status: DownloadStatus::Queued,
+            resumable: true,
+            etag: None,
+            last_modified: None,
+            mime_type: None,
+            category,
+            connections: 1,
+            speed_limit: 0,
+            priority: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            segments: vec![],
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            error_message: None,
+            scheduled_time: None,
+            checksum_sha256: None,
+            checksum_md5: None,
+            user_agent: None,
+            referer: None,
+            mirrors: vec![],
+            min_chunk_size: 0,
+            proxy_mode: None,
+            custom_proxy_url: None,
+            antivirus_status: None,
+            expected_checksum: None,
+            custom_headers: HashMap::new(),
+            kind: "torrent".to_string(),
+            info_hash: Some(probe.info_hash.clone()),
+            uploaded_bytes: 0,
+            peers: 0,
+            seeding: false,
+            torrent_files: files,
+        };
+
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::save_download(&conn, &task).map_err(|e| e.to_string())?;
+        Repository::save_torrent_bytes(&conn, &id, &torrent_bytes).map_err(|e| e.to_string())?;
+        drop(conn);
+
+        self.process_queue().await;
+        Ok(task)
+    }
+
+    /// Runs one torrent task through the torrent engine (called from `start_download`).
+    async fn run_torrent_task<F>(
+        self: &Arc<Self>,
+        task: DownloadTask,
+        pause_rx: watch::Receiver<bool>,
+        on_progress: F,
+    ) -> Result<DownloadTask, String>
+    where
+        F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
+    {
+        let (bytes, resume) = match self.get_db_conn() {
+            Ok(conn) => {
+                let bytes = Repository::get_torrent_bytes(&conn, &task.id).ok().flatten();
+                let resume = Repository::torrent_started(&conn, &task.id).unwrap_or(false);
+                let _ = Repository::mark_torrent_started(&conn, &task.id);
+                (bytes, resume)
+            }
+            Err(_) => (None, false),
+        };
+        let app = self.app_handle.clone();
+        self.torrents
+            .run(task, bytes, resume, pause_rx, &self.torrent_settings(), on_progress, move |live: TorrentLive| {
+                let _ = app.emit("torrent-live", &live);
+            })
+            .await
+    }
+
+    /// Stops sharing a finished torrent (it stays in the list, completed).
+    pub async fn stop_seeding(&self, id: &str) -> Result<(), String> {
+        let task = self.get_download(id)?.ok_or_else(|| "Download not found".to_string())?;
+        if let Some(hash) = &task.info_hash {
+            self.torrents.stop(hash).await;
+        }
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::update_torrent_state(&conn, id, task.uploaded_bytes, false).map_err(|e| e.to_string())?;
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
+        Ok(())
+    }
+
+    /// Starts sharing a finished torrent again.
+    pub async fn start_seeding(&self, id: &str) -> Result<(), String> {
+        let task = self.get_download(id)?.ok_or_else(|| "Download not found".to_string())?;
+        if task.kind != "torrent" || task.status != DownloadStatus::Completed {
+            return Err("Only finished torrents can be shared".to_string());
+        }
+        let bytes = self.get_db_conn().ok().and_then(|c| Repository::get_torrent_bytes(&c, id).ok().flatten());
+        self.torrents.start_seeding(&task, bytes, &self.torrent_settings()).await?;
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::update_torrent_state(&conn, id, task.uploaded_bytes, true).map_err(|e| e.to_string())?;
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
+        Ok(())
+    }
+
+    /// Housekeeping for torrents that are being shared: report their live numbers
+    /// and stop them once the ratio goal is reached. Called every few seconds.
+    pub async fn seeding_tick(&self) {
+        if !self.torrents.has_session() {
+            return;
+        }
+        let settings = self.get_settings();
+        let Ok(tasks) = self.get_all_downloads() else { return };
+        for task in tasks.iter().filter(|t| t.kind == "torrent" && t.status == DownloadStatus::Completed && t.seeding) {
+            let Some(live) = self.torrents.live(task) else { continue };
+            let _ = self.app_handle.emit("torrent-live", &live);
+            if let Ok(conn) = self.get_db_conn() {
+                let _ = Repository::update_torrent_state(&conn, &task.id, live.uploaded_bytes as i64, true);
+            }
+            let goal_met = settings.torrent_ratio_limit > 0.0 && live.ratio >= settings.torrent_ratio_limit;
+            if goal_met || !settings.torrent_seed_after_download {
+                let _ = self.stop_seeding(&task.id).await;
+            }
+        }
+    }
+
+    /// After a restart: bring finished torrents that were being shared back online.
+    async fn resume_seeding_after_start(self: &Arc<Self>) {
+        let settings = self.get_settings();
+        if !settings.torrent_seed_after_download {
+            return;
+        }
+        let Ok(tasks) = self.get_all_downloads() else { return };
+        for task in tasks.into_iter().filter(|t| t.kind == "torrent" && t.status == DownloadStatus::Completed && t.seeding) {
+            let bytes = self.get_db_conn().ok().and_then(|c| Repository::get_torrent_bytes(&c, &task.id).ok().flatten());
+            if let Err(e) = self.torrents.start_seeding(&task, bytes, &self.torrent_settings()).await {
+                log::warn!("Could not resume sharing {}: {e}", task.filename);
+                if let Ok(conn) = self.get_db_conn() {
+                    let _ = Repository::update_torrent_state(&conn, &task.id, task.uploaded_bytes, false);
+                }
+            }
         }
     }
 
@@ -551,6 +803,7 @@ impl DownloadManager {
         let manager = Arc::clone(self);
         let task_id = task.id.clone();
         let engine = self.engine.clone();
+        let is_torrent = task.kind == "torrent";
         // Saved-login headers are looked up fresh on every start (the login may have changed).
         let vault_headers = self.vault_headers(&task.url);
 
@@ -565,8 +818,7 @@ impl DownloadManager {
             let progress_app = app_handle.clone();
             let progress_db = db_path.clone();
 
-            let res = engine
-                .run_download_with(task, pause_rx, vault_headers, move |event: DownloadProgressEvent| {
+            let on_progress = move |event: DownloadProgressEvent| {
                     let _ = progress_app.emit("download-progress", &event);
                     if event.status != DownloadStatus::Downloading {
                         return;
@@ -591,8 +843,12 @@ impl DownloadManager {
                             let _ = Repository::replace_segments(&conn, &event.id, &event.segments);
                         }
                     });
-                })
-                .await;
+            };
+            let res = if is_torrent {
+                manager.run_torrent_task(task, pause_rx, on_progress).await
+            } else {
+                engine.run_download_with(task, pause_rx, vault_headers, on_progress).await
+            };
 
             match res {
                 // Stopped on request. The pause (or delete) already updated the
@@ -602,6 +858,9 @@ impl DownloadManager {
                     if let Ok(conn) = Repository::open_or_create(&db_path) {
                         let _ = Repository::update_downloaded_bytes(&conn, &task_id, task.downloaded_bytes);
                         let _ = Repository::replace_segments(&conn, &task_id, &task.segments);
+                        if task.kind == "torrent" {
+                            let _ = Repository::update_torrent_state(&conn, &task_id, task.uploaded_bytes, false);
+                        }
                     }
                 }
                 Ok(mut final_task) => {
@@ -617,7 +876,13 @@ impl DownloadManager {
                     let job_path = final_path.clone();
                     let host_url = final_task.final_url.clone().or_else(|| Some(final_task.url.clone()));
                     let referer = final_task.referer.clone();
+                    let skip_file_checks = final_task.kind == "torrent";
                     let hashes = tauri::async_runtime::spawn_blocking(move || {
+                        if skip_file_checks {
+                            // Torrents are verified piece by piece by the protocol, and their
+                            // files were marked individually; there is no single file to hash.
+                            return Err(std::io::Error::new(std::io::ErrorKind::Other, "torrent"));
+                        }
                         security::mark_of_the_web(&job_path, host_url.as_deref(), referer.as_deref());
                         crate::engine::compute_checksums(&job_path)
                     })
@@ -775,13 +1040,43 @@ impl DownloadManager {
         }
     }
 
+    /// Removes a torrent from the engine and, if asked, deletes the files it downloaded.
+    async fn remove_torrent(&self, task: &DownloadTask, delete_files: bool) {
+        if let Some(hash) = &task.info_hash {
+            self.torrents.remove(hash, delete_files).await;
+        }
+        if delete_files {
+            // The engine only knows torrents it has loaded this session; make sure the files go either way.
+            let folder = crate::engine::torrent::output_folder(task);
+            for file in task.torrent_files.iter().filter(|f| f.selected) {
+                let _ = std::fs::remove_file(folder.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR)));
+            }
+            if task.torrent_files.len() > 1 {
+                // Remove emptied sub-folders, deepest first, and never anything that still has files.
+                let mut dirs: Vec<PathBuf> = task
+                    .torrent_files
+                    .iter()
+                    .filter_map(|f| Path::new(&f.path.replace('/', std::path::MAIN_SEPARATOR_STR)).parent().map(|p| folder.join(p)))
+                    .collect();
+                dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+                dirs.dedup();
+                for d in dirs {
+                    let _ = std::fs::remove_dir(d);
+                }
+                let _ = std::fs::remove_dir(&folder);
+            }
+        }
+    }
+
     pub async fn cancel_download(&self, id: &str, delete_file: bool) -> Result<(), String> {
         let _ = self.pause_download(id);
         self.wait_until_idle(id).await;
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         if let Ok(Some(task)) = Repository::get_download(&conn, id) {
-            if delete_file {
+            if task.kind == "torrent" {
+                self.remove_torrent(&task, delete_file).await;
+            } else if delete_file {
                 remove_partial_files(&task);
             }
 
@@ -803,7 +1098,9 @@ impl DownloadManager {
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         if let Ok(Some(task)) = Repository::get_download(&conn, id) {
-            if delete_file {
+            if task.kind == "torrent" {
+                self.remove_torrent(&task, delete_file).await;
+            } else if delete_file {
                 let _ = std::fs::remove_file(Path::new(&task.destination_path).join(&task.filename));
                 remove_partial_files(&task);
             }

@@ -2,12 +2,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   AddDownloadRequest,
+  AddTorrentRequest,
   AppSettings,
   DownloadProgressEvent,
   DownloadTask,
   SiteCredential,
   UrlProbeResult,
   GrabbedLink,
+  TorrentLive,
+  TorrentProbeInfo,
 } from '../types/download';
 
 export const isTauri = (): boolean => {
@@ -26,6 +29,64 @@ let mockSiteCredentials: SiteCredential[] = [
 ];
 
 let mockDownloads: DownloadTask[] = [
+  {
+    id: 'mock-t1',
+    url: 'magnet:?xt=urn:btih:6f1c2a9e7d3b4a58c0e91f2b7a6d4c3e8f905a12&dn=Open+Source+Wallpapers',
+    filename: 'Open Source Wallpapers',
+    destination_path: 'C:/Downloads',
+    temp_path: '',
+    total_bytes: 1288490188,
+    downloaded_bytes: 515396075,
+    status: 'downloading',
+    resumable: true,
+    category: 'other',
+    connections: 1,
+    speed_limit: 0,
+    priority: 0,
+    speed_bps: 9400000,
+    eta_seconds: 82,
+    created_at: Date.now() - 120000,
+    updated_at: Date.now(),
+    segments: [],
+    kind: 'torrent',
+    info_hash: '6f1c2a9e7d3b4a58c0e91f2b7a6d4c3e8f905a12',
+    uploaded_bytes: 41943040,
+    peers: 14,
+    upload_bps: 620000,
+    seeding: false,
+    torrent_files: [
+      { index: 0, path: 'wallpapers/mountains.png', length: 524288000, selected: true },
+      { index: 1, path: 'wallpapers/forest.png', length: 482344960, selected: true },
+      { index: 2, path: 'wallpapers/ocean.png', length: 281857228, selected: true },
+    ],
+  },
+  {
+    id: 'mock-t2',
+    url: 'magnet:?xt=urn:btih:a41b9c0d5e7f2318c6d4e0b9a8f7c6d5e4b3a291&dn=ubuntu-24.04-desktop-amd64.iso',
+    filename: 'ubuntu-24.04-desktop-amd64.iso',
+    destination_path: 'C:/Downloads',
+    temp_path: '',
+    total_bytes: 6144000000,
+    downloaded_bytes: 6144000000,
+    status: 'completed',
+    resumable: true,
+    category: 'compressed',
+    connections: 1,
+    speed_limit: 0,
+    priority: 0,
+    speed_bps: 0,
+    created_at: Date.now() - 86400000,
+    updated_at: Date.now() - 80000000,
+    completed_at: Date.now() - 80000000,
+    segments: [],
+    kind: 'torrent',
+    info_hash: 'a41b9c0d5e7f2318c6d4e0b9a8f7c6d5e4b3a291',
+    uploaded_bytes: 3500000000,
+    peers: 6,
+    upload_bps: 1250000,
+    seeding: true,
+    torrent_files: [{ index: 0, path: 'ubuntu-24.04-desktop-amd64.iso', length: 6144000000, selected: true }],
+  },
   {
     id: 'mock-1',
     url: 'https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso',
@@ -179,6 +240,11 @@ let mockSettings: AppSettings = {
   scheduler_action: 'none',
   scan_with_antivirus: true,
   antivirus_path: undefined,
+  torrent_seed_after_download: true,
+  torrent_ratio_limit: 1,
+  torrent_upload_limit: 0,
+  torrent_dht: true,
+  torrent_upnp: false,
 };
 
 export const api = {
@@ -435,6 +501,64 @@ export const api = {
       return await invoke<boolean>('cancel_completion_action_cmd');
     }
     return false;
+  },
+
+  /** Looks inside a torrent (magnet link, link to a .torrent, or the file's bytes). */
+  async probeTorrent(args: { url?: string; bytes?: number[] }): Promise<TorrentProbeInfo> {
+    if (isTauri()) {
+      return await invoke<TorrentProbeInfo>('probe_torrent_cmd', { url: args.url ?? null, bytes: args.bytes ?? null });
+    }
+    await new Promise((r) => setTimeout(r, 900));
+    return {
+      info_hash: '9b2f5e8c1d4a7036f8e1c2b5a9d0e3f47a6c8b15',
+      name: 'Nexdrop Sample Collection',
+      total_bytes: 2147483648,
+      files: [
+        { index: 0, path: 'Sample Collection/video/intro.mkv', length: 1288490188, selected: true },
+        { index: 1, path: 'Sample Collection/video/outro.mkv', length: 524288000, selected: true },
+        { index: 2, path: 'Sample Collection/audio/theme.flac', length: 262144000, selected: true },
+        { index: 3, path: 'Sample Collection/README.txt', length: 2048, selected: true },
+        { index: 4, path: 'Sample Collection/cover.jpg', length: 3145728, selected: true },
+      ],
+    };
+  },
+
+  async addTorrent(req: AddTorrentRequest): Promise<DownloadTask> {
+    if (isTauri()) {
+      return await invoke<DownloadTask>('add_torrent_cmd', { req });
+    }
+    const task: DownloadTask = {
+      ...mockDownloads[0],
+      id: `task-${Date.now()}`,
+      filename: 'Nexdrop Sample Collection',
+      status: 'downloading',
+      downloaded_bytes: 0,
+      info_hash: req.info_hash,
+      created_at: Date.now(),
+    };
+    mockDownloads.unshift(task);
+    return task;
+  },
+
+  async stopSeeding(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('stop_seeding_cmd', { id });
+    }
+    mockDownloads = mockDownloads.map((t) => (t.id === id ? { ...t, seeding: false } : t));
+  },
+
+  async startSeeding(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('start_seeding_cmd', { id });
+    }
+    mockDownloads = mockDownloads.map((t) => (t.id === id ? { ...t, seeding: true } : t));
+  },
+
+  onTorrentLive(callback: (live: TorrentLive) => void): Promise<UnlistenFn> {
+    if (isTauri()) {
+      return listen<TorrentLive>('torrent-live', (e) => callback(e.payload));
+    }
+    return Promise.resolve(() => {});
   },
 
   onProgress(callback: (event: DownloadProgressEvent) => void): Promise<UnlistenFn> {

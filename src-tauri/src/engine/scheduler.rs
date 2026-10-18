@@ -94,6 +94,7 @@ impl DownloadScheduler {
                 tokio::time::sleep(TICK).await;
 
                 manager.start_due_scheduled().await;
+                manager.seeding_tick().await;
 
                 let settings = manager.get_settings();
                 if !settings.scheduler_enabled {

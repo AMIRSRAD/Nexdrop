@@ -1,4 +1,4 @@
-import { Copy, ExternalLink, FolderOpen, Info, Pause, Play, RotateCw, Terminal, Trash } from 'lucide-react';
+import { Copy, ExternalLink, FolderOpen, Info, Pause, Play, Radio, RotateCw, Square, Terminal, Trash } from 'lucide-react';
 import type { DownloadTask } from '../../types/download';
 import type { MenuItem } from '../ui/Menu';
 
@@ -10,6 +10,8 @@ export interface TaskHandlers {
   reveal: (id: string) => void;
   copyLink: (task: DownloadTask) => void;
   copyCurl: (task: DownloadTask) => void;
+  stopSeeding: (id: string) => void;
+  startSeeding: (id: string) => void;
   requestRemove: (ids: string[]) => void;
   toggleExpand: (id: string) => void;
   toggleSelect: (id: string, range?: boolean) => void;
@@ -34,6 +36,13 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
       { label: 'Open', icon: ExternalLink, shortcut: 'Enter', onSelect: () => h.open(task.id) },
       { label: 'Show in folder', icon: FolderOpen, onSelect: () => h.reveal(task.id) },
     );
+    if (task.kind === 'torrent') {
+      items.push(
+        task.seeding
+          ? { label: 'Stop sharing', icon: Square, onSelect: () => h.stopSeeding(task.id) }
+          : { label: 'Start sharing', icon: Radio, onSelect: () => h.startSeeding(task.id) },
+      );
+    }
   } else {
     if (canPause(task)) items.push({ label: 'Pause', icon: Pause, shortcut: 'Space', onSelect: () => h.pause(task.id) });
     if (canResume(task))
@@ -44,8 +53,8 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
   items.push(
     { label: expanded ? 'Hide details' : 'Details', icon: Info, onSelect: () => h.toggleExpand(task.id) },
     { separator: true },
-    { label: 'Copy link', icon: Copy, onSelect: () => h.copyLink(task) },
-    { label: 'Copy as cURL', icon: Terminal, onSelect: () => h.copyCurl(task) },
+    { label: task.kind === 'torrent' ? 'Copy magnet link' : 'Copy link', icon: Copy, onSelect: () => h.copyLink(task) },
+    ...(task.kind === 'torrent' ? [] : [{ label: 'Copy as cURL', icon: Terminal, onSelect: () => h.copyCurl(task) }]),
     { separator: true },
     { label: 'Remove…', icon: Trash, shortcut: 'Del', danger: true, onSelect: () => h.requestRemove([task.id]) },
   );

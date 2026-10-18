@@ -1211,7 +1211,7 @@ fn build_request(
 
 /// Resolves when the watched flag becomes `true`. If the sender goes away the
 /// flag can never change again, so this then waits forever (never "pauses").
-async fn wait_paused(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_paused(rx: &mut watch::Receiver<bool>) {
     if rx.wait_for(|paused| *paused).await.is_err() {
         std::future::pending::<()>().await;
     }

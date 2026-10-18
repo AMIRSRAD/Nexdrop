@@ -3,7 +3,10 @@ use tauri::State;
 
 use std::collections::HashMap;
 
-use crate::db::models::{AddDownloadRequest, AppSettings, DownloadTask, SiteCredential, UrlProbeResult};
+use crate::db::models::{
+    AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, SiteCredential, TorrentProbeInfo, UrlProbeResult,
+};
+use crate::engine::torrent::TorrentSource;
 use crate::engine::auth::{base64, is_forbidden_header};
 use crate::engine::manager::DownloadManager;
 
@@ -377,6 +380,36 @@ fn tokenize_command(cmd: &str) -> Vec<String> {
 #[tauri::command]
 pub async fn grab_page_links_cmd(url: String) -> Result<Vec<crate::grabber_server::GrabbedLink>, String> {
     crate::grabber_server::extract_links_from_page(&url).await
+}
+
+/// Looks inside a torrent (magnet link, link to a `.torrent`, or the file's bytes) without downloading it.
+#[tauri::command]
+pub async fn probe_torrent_cmd(
+    state: State<'_, AppState>,
+    url: Option<String>,
+    bytes: Option<Vec<u8>>,
+) -> Result<TorrentProbeInfo, String> {
+    let source = match (bytes, url) {
+        (Some(bytes), _) if !bytes.is_empty() => TorrentSource::Bytes(bytes),
+        (_, Some(url)) if !url.trim().is_empty() => TorrentSource::Url(url.trim().to_string()),
+        _ => return Err("Give a magnet link or choose a .torrent file".to_string()),
+    };
+    state.probe_torrent(source).await
+}
+
+#[tauri::command]
+pub async fn add_torrent_cmd(state: State<'_, AppState>, req: AddTorrentRequest) -> Result<DownloadTask, String> {
+    state.add_torrent(req).await
+}
+
+#[tauri::command]
+pub async fn stop_seeding_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.stop_seeding(&id).await
+}
+
+#[tauri::command]
+pub async fn start_seeding_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.start_seeding(&id).await
 }
 
 /// Cancels a pending "sleep/shut down when finished" countdown.

@@ -172,6 +172,37 @@ pub struct DownloadTask {
     /// cURL command). Stored encrypted; sent only to the original host.
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    /// "http" (a normal download) or "torrent".
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// BitTorrent info hash (hex), for torrents.
+    #[serde(default)]
+    pub info_hash: Option<String>,
+    /// Bytes uploaded to other peers so far (torrents).
+    #[serde(default)]
+    pub uploaded_bytes: i64,
+    /// Connected peers right now (torrents, live only; not stored).
+    #[serde(default)]
+    pub peers: u32,
+    /// A finished torrent that is still being shared with other peers.
+    #[serde(default)]
+    pub seeding: bool,
+    /// The files inside a torrent and which of them are being downloaded.
+    #[serde(default)]
+    pub torrent_files: Vec<TorrentFile>,
+}
+
+pub fn default_kind() -> String {
+    "http".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentFile {
+    pub index: usize,
+    /// Path inside the torrent, `/`-separated.
+    pub path: String,
+    pub length: u64,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +251,17 @@ pub struct AppSettings {
     pub scheduler_action: String,             // "none", "sleep", "shutdown", "exit"
     pub scan_with_antivirus: bool,
     pub antivirus_path: Option<String>,
+    // Torrents
+    /// Keep sharing a torrent after it has finished downloading.
+    pub torrent_seed_after_download: bool,
+    /// Stop sharing once uploaded/downloaded reaches this ratio (0 = never stop on ratio).
+    pub torrent_ratio_limit: f64,
+    /// Upload cap for torrents in bytes/s (0 = unlimited).
+    pub torrent_upload_limit: u64,
+    /// Find peers through the distributed hash table (works without trackers).
+    pub torrent_dht: bool,
+    /// Ask the router to forward the torrent port (UPnP). Off by default.
+    pub torrent_upnp: bool,
 }
 
 impl Default for AppSettings {
@@ -260,6 +302,11 @@ impl Default for AppSettings {
             scheduler_action: "none".to_string(),
             scan_with_antivirus: true,
             antivirus_path: None,
+            torrent_seed_after_download: true,
+            torrent_ratio_limit: 1.0,
+            torrent_upload_limit: 0,
+            torrent_dht: true,
+            torrent_upnp: false,
         }
     }
 }
@@ -292,6 +339,27 @@ pub struct AddDownloadRequest {
     pub min_chunk_size: Option<u64>,
     pub proxy_mode: Option<String>,
     pub custom_proxy_url: Option<String>,
+}
+
+/// Adding a torrent: either a magnet/`.torrent` link or an `info_hash` from an earlier probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTorrentRequest {
+    /// Magnet link or http(s) link to a `.torrent` file.
+    pub source: Option<String>,
+    /// Hash returned by `probe_torrent_cmd` (its metadata is cached for a while).
+    pub info_hash: Option<String>,
+    pub destination_path: Option<String>,
+    /// Indices of the files to download; `None` means all of them.
+    pub selected_files: Option<Vec<usize>>,
+}
+
+/// What the "Add torrent" dialog shows before anything is downloaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentProbeInfo {
+    pub info_hash: String,
+    pub name: String,
+    pub total_bytes: u64,
+    pub files: Vec<TorrentFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
