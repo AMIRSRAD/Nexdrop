@@ -321,17 +321,18 @@ async fn progress_map_for_a_different_file_is_ignored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A server that ignores `Range` must not get its whole body written into every part.
+/// A server that ignores `Range` must not get its whole body written into every
+/// part: the download switches to a single stream and still comes out exact.
 #[tokio::test]
-async fn server_ignoring_range_is_rejected_not_corrupted() {
+async fn server_ignoring_range_falls_back_to_a_single_stream() {
     let payload = patterned(600_000);
-    let server = start_server(payload, Mode::IgnoreRange).await;
+    let server = start_server(payload.clone(), Mode::IgnoreRange).await;
     let dir = temp_dir("norange");
 
     let task = make_task(&server.url("norange.bin"), &dir, 600_000, "norange.bin", 4);
-    let err = run(&fast_engine(), task).await.expect_err("must fail, not assemble a bad file");
-    assert!(err.to_lowercase().contains("range"), "unexpected error: {err}");
-    assert!(!dir.join("norange.bin").exists());
+    let done = run(&fast_engine(), task).await.expect("falls back to one stream");
+    assert_file_equals(&dir, &done, &payload);
+    assert!(!done.resumable, "the task should now be marked as not resumable");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

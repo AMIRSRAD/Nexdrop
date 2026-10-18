@@ -14,8 +14,14 @@
 //! * Each range retries transient failures with exponential backoff; a
 //!   throttling server (429/503) makes the engine use fewer connections.
 //! * Connections ramp up gradually instead of all opening at once.
+//! * A connection that stops delivering data is replaced after a short stall.
+//! * Network outages (Wi-Fi drop, VPN reconnect, sleep) are waited out for up
+//!   to ten minutes instead of failing the download.
+//! * Redirected links are followed once; the resolved address is reused for
+//!   every range, and refreshed when a signed link expires.
 //!
-//! Servers that cannot do ranges fall back to a plain single-stream download.
+//! Servers that cannot do ranges fall back to a plain single-stream download,
+//! which also retries (from the start, since it can't resume).
 
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
@@ -51,13 +57,25 @@ const MAP_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 /// A range gives up after this many failures in a row that made no progress.
 const MAX_CONSECUTIVE_FAILURES: u32 = 6;
 /// Connections opened immediately; the rest ramp up while the server cooperates.
-const INITIAL_CONNECTIONS: usize = 8;
-const RAMP_INTERVAL: Duration = Duration::from_millis(500);
-const RAMP_STEP: usize = 2;
+const INITIAL_CONNECTIONS: usize = 16;
+const RAMP_INTERVAL: Duration = Duration::from_millis(250);
+const RAMP_STEP: usize = 4;
 /// After a 429/503, don't open more connections for this long.
 const THROTTLE_COOLDOWN: Duration = Duration::from_secs(15);
 /// Never split off a range smaller than this.
 const MIN_STEAL_BYTES: u64 = 256 * 1024;
+/// A connection that delivers nothing for this long is dropped and retried.
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// ...or for this long if other connections kept receiving data after it went
+/// quiet (then it's this connection, not the network, that's stuck).
+const SHORT_STALL: Duration = Duration::from_secs(6);
+/// How long a range keeps retrying while the network is unreachable.
+const NETWORK_GIVE_UP: Duration = Duration::from_secs(10 * 60);
+/// Longest pause between retries while the network is down (short, so the
+/// download picks up again soon after the connection comes back).
+const NETWORK_RETRY_CAP: Duration = Duration::from_secs(8);
+/// Restarts allowed for a download that can't be resumed (no range support).
+const SINGLE_STREAM_ATTEMPTS: u32 = 5;
 
 #[derive(Clone)]
 pub struct DownloadEngine {
@@ -169,25 +187,102 @@ impl DownloadEngine {
             check_disk_space(final_dest.parent().unwrap_or(Path::new(".")), task.total_bytes as u64)?;
         }
 
-        // Without range support a partial file can't be continued: start over.
-        let mut file = OpenOptions::new()
+        // Without range support a partial file can't be continued, so every
+        // attempt starts over; a dropped connection still isn't the end.
+        let mut attempt_no = 0u32;
+        loop {
+            attempt_no += 1;
+            match self
+                .single_stream_attempt(&mut task, &part_file, &client, &headers, &mut pause_rx, &on_progress)
+                .await
+            {
+                Ok(SingleEnd::Done) => break,
+                Ok(SingleEnd::Paused) => {
+                    // Nothing can be resumed without range support, so a pause
+                    // simply discards the partial file.
+                    let _ = tokio::fs::remove_file(&part_file).await;
+                    task.downloaded_bytes = 0;
+                    return Ok(paused(task));
+                }
+                Err((msg, transient)) => {
+                    if !transient || attempt_no >= SINGLE_STREAM_ATTEMPTS {
+                        return Err(msg);
+                    }
+                    let delay = backoff_delay(self.retry_base, attempt_no, None);
+                    tokio::select! {
+                        biased;
+                        _ = wait_paused(&mut pause_rx) => {
+                            let _ = tokio::fs::remove_file(&part_file).await;
+                            task.downloaded_bytes = 0;
+                            return Ok(paused(task));
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+        }
+
+        let final_path = reserve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest))
+            .map_err(|e| format!("Cannot create the final file: {e}"))?;
+        if let Err(e) = tokio::fs::rename(&part_file, &final_path).await {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(format!("Failed to rename completed file: {e}"));
+        }
+
+        finish_task(&mut task, &final_path);
+        task.downloaded_bytes = task.downloaded_bytes.max(task.total_bytes);
+
+        on_progress(DownloadProgressEvent {
+            id: task.id.clone(),
+            downloaded_bytes: task.downloaded_bytes,
+            total_bytes: task.total_bytes,
+            speed_bps: 0,
+            eta_seconds: None,
+            status: DownloadStatus::Completed,
+            segments: vec![],
+        });
+
+        Ok(task)
+    }
+
+    /// One full pass of a single-stream download. `Err((message, transient))`.
+    async fn single_stream_attempt<F>(
+        &self,
+        task: &mut DownloadTask,
+        part_file: &Path,
+        client: &reqwest::Client,
+        headers: &[(HeaderName, HeaderValue)],
+        pause_rx: &mut watch::Receiver<bool>,
+        on_progress: &F,
+    ) -> Result<SingleEnd, (String, bool)>
+    where
+        F: Fn(DownloadProgressEvent) + Send + Sync + 'static,
+    {
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&part_file)
+            .open(part_file)
             .await
-            .map_err(|e| format!("Failed to create download file: {e}"))?;
+            .map_err(|e| (format!("Failed to create download file: {e}"), false))?;
+        // Big buffered writes: one disk call per MiB instead of one per network packet.
+        let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
         task.downloaded_bytes = 0;
 
         let ua = task.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
-        let req = build_request(&client, &task.url, ua, task.referer.as_deref(), None, &headers);
+        let url = task.final_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&task.url).to_string();
+        let send_headers: Vec<_> = if same_host(&url, &task.url) { headers.to_vec() } else { Vec::new() };
+        let req = build_request(client, &url, ua, task.referer.as_deref(), None, &send_headers);
 
-        let res = match send_or_pause(req, &mut pause_rx).await? {
-            Some(res) => res,
-            None => return Ok(paused(task)),
+        let res = tokio::select! {
+            biased;
+            _ = wait_paused(pause_rx) => return Ok(SingleEnd::Paused),
+            r = req.send() => r.map_err(|e| (format!("HTTP request failed: {e}"), !e.is_redirect()))?,
         };
-        if !res.status().is_success() {
-            return Err(format!("Server returned HTTP status: {}", res.status()));
+        let status = res.status();
+        if !status.is_success() {
+            let transient = status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT;
+            return Err((format!("Server returned HTTP status: {status}"), transient));
         }
 
         let mut stream = res.bytes_stream();
@@ -198,24 +293,20 @@ impl DownloadEngine {
         loop {
             let next = tokio::select! {
                 biased;
-                _ = wait_paused(&mut pause_rx) => {
-                    // Nothing can be resumed without range support, so a pause
-                    // simply discards the partial file.
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&part_file).await;
-                    task.downloaded_bytes = 0;
-                    return Ok(paused(task));
-                }
-                next = stream.next() => next,
+                _ = wait_paused(pause_rx) => return Ok(SingleEnd::Paused),
+                next = tokio::time::timeout(STALL_TIMEOUT, stream.next()) => next,
+            };
+            let Ok(next) = next else {
+                return Err(("Connection stalled".to_string(), true));
             };
 
             let Some(chunk_res) = next else { break };
-            let chunk = chunk_res.map_err(|e| format!("Network read error: {e}"))?;
+            let chunk = chunk_res.map_err(|e| (format!("Network read error: {e}"), true))?;
             let chunk_len = chunk.len();
 
             file.write_all(&chunk)
                 .await
-                .map_err(|e| format!("Disk write error: {e}"))?;
+                .map_err(|e| (format!("Disk write error: {e}"), false))?;
 
             task.downloaded_bytes += chunk_len as i64;
             speed_calc.record_bytes(chunk_len as u64);
@@ -226,12 +317,7 @@ impl DownloadEngine {
             };
             tokio::select! {
                 biased;
-                _ = wait_paused(&mut pause_rx) => {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&part_file).await;
-                    task.downloaded_bytes = 0;
-                    return Ok(paused(task));
-                }
+                _ = wait_paused(pause_rx) => return Ok(SingleEnd::Paused),
                 _ = limited => {}
             }
 
@@ -262,38 +348,20 @@ impl DownloadEngine {
             }
         }
 
-        file.flush().await.map_err(|e| format!("Failed to flush file: {e}"))?;
+        file.flush().await.map_err(|e| (format!("Failed to flush file: {e}"), false))?;
         drop(file);
 
         // A connection that closes early must not be mistaken for a finished file.
         if task.total_bytes > 0 && task.downloaded_bytes < task.total_bytes {
-            return Err(format!(
-                "Connection closed early ({} of {} bytes received)",
-                task.downloaded_bytes, task.total_bytes
+            return Err((
+                format!(
+                    "Connection closed early ({} of {} bytes received)",
+                    task.downloaded_bytes, task.total_bytes
+                ),
+                true,
             ));
         }
-
-        let final_path = reserve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest))
-            .map_err(|e| format!("Cannot create the final file: {e}"))?;
-        if let Err(e) = tokio::fs::rename(&part_file, &final_path).await {
-            let _ = tokio::fs::remove_file(&final_path).await;
-            return Err(format!("Failed to rename completed file: {e}"));
-        }
-
-        finish_task(&mut task, &final_path);
-        task.downloaded_bytes = task.downloaded_bytes.max(task.total_bytes);
-
-        on_progress(DownloadProgressEvent {
-            id: task.id.clone(),
-            downloaded_bytes: task.downloaded_bytes,
-            total_bytes: task.total_bytes,
-            speed_bps: 0,
-            eta_seconds: None,
-            status: DownloadStatus::Completed,
-            segments: vec![],
-        });
-
-        Ok(task)
+        Ok(SingleEnd::Done)
     }
 
     // ───────────────────────────── range engine ─────────────────────────────
@@ -322,6 +390,17 @@ impl DownloadEngine {
                 Err(RoundFailure::FileChanged) if round == 0 => fresh = true,
                 Err(RoundFailure::FileChanged) => {
                     return Err("The file on the server changed while it was being downloaded".to_string())
+                }
+                Err(RoundFailure::NoRanges) => {
+                    // It said it could serve parts but it can't: download it in one piece.
+                    let dest_dir = final_dest.parent().unwrap_or(Path::new(".")).to_path_buf();
+                    let part = dest_dir.join(format!("{}.nexpart", task.filename));
+                    let _ = tokio::fs::remove_file(dest_dir.join(format!("{}.nexpart.map", task.filename))).await;
+                    task.resumable = false;
+                    task.connections = 1;
+                    return self
+                        .run_single_stream(task, final_dest, part, client, headers, pause_rx, on_progress)
+                        .await;
                 }
                 Err(RoundFailure::Failed(msg)) => return Err(msg),
             }
@@ -387,6 +466,7 @@ impl DownloadEngine {
 
         let shared = Arc::new(Shared {
             client: client.clone(),
+            resolved: Mutex::new(task.final_url.clone().filter(|u| !u.is_empty() && *u != task.url)),
             urls,
             user_agent: task.user_agent.clone().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             referer: task.referer.clone(),
@@ -409,6 +489,7 @@ impl DownloadEngine {
             next_slot_id: AtomicUsize::new(0),
             clock: Instant::now(),
             last_throttle_ms: AtomicU64::new(u64::MAX),
+            last_rx_ms: AtomicU64::new(0),
             retry_base: self.retry_base,
         });
 
@@ -608,7 +689,14 @@ impl DownloadEngine {
 enum RoundFailure {
     /// The server's file no longer matches what we started downloading.
     FileChanged,
+    /// The server ignores Range requests: only a single stream can work.
+    NoRanges,
     Failed(String),
+}
+
+enum SingleEnd {
+    Done,
+    Paused,
 }
 
 enum WriterMsg {
@@ -639,6 +727,9 @@ struct Plan {
 struct Shared {
     client: reqwest::Client,
     urls: Vec<String>,
+    /// Where the original link redirects to. Ranges go straight there (saving a
+    /// redirect per request); cleared when a signed link expires.
+    resolved: Mutex<Option<String>>,
     user_agent: String,
     referer: Option<String>,
     /// Extra headers (cookies, auth). Only ever sent to the original URL.
@@ -666,6 +757,8 @@ struct Shared {
     next_slot_id: AtomicUsize,
     clock: Instant,
     last_throttle_ms: AtomicU64,
+    /// When any connection last received data (ms on `clock`).
+    last_rx_ms: AtomicU64,
     retry_base: Duration,
 }
 
@@ -684,6 +777,13 @@ impl Shared {
         let _ = self
             .cap
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1).max(1)));
+    }
+
+    /// Did any connection receive data well after `quiet_since`? Then the
+    /// network is fine and it's the quiet connection that's stuck.
+    fn received_since(&self, quiet_since: Instant) -> bool {
+        let since_ms = quiet_since.saturating_duration_since(self.clock).as_millis() as u64;
+        self.last_rx_ms.load(Ordering::Relaxed) > since_ms + 1000
     }
 
     fn recently_throttled(&self) -> bool {
@@ -877,16 +977,26 @@ enum AttemptEnd {
     Complete,
     Cancelled,
     Fatal(RoundFailure),
+    /// The resolved (redirected) link stopped working: go back to the original
+    /// link for a fresh one, right away.
+    Refresh,
     Retry {
         reason: String,
         made_progress: bool,
         retry_after: Option<Duration>,
         throttled: bool,
+        /// No HTTP answer at all (the network or host is unreachable), as opposed
+        /// to a server that answered and then misbehaved.
+        network: bool,
     },
 }
 
 fn retry(reason: String, made_progress: bool) -> AttemptEnd {
-    AttemptEnd::Retry { reason, made_progress, retry_after: None, throttled: false }
+    AttemptEnd::Retry { reason, made_progress, retry_after: None, throttled: false, network: false }
+}
+
+fn net_retry(reason: String, made_progress: bool) -> AttemptEnd {
+    AttemptEnd::Retry { reason, made_progress, retry_after: None, throttled: false, network: true }
 }
 
 struct ActiveGuard(Arc<Shared>);
@@ -932,11 +1042,22 @@ async fn run_slot(
     cancel: &mut watch::Receiver<bool>,
 ) -> SlotEnd {
     let mut failures = 0u32;
+    let mut offline_since: Option<Instant> = None;
+    let mut offline_retries = 0u32;
+    let mut refreshes = 0u32;
 
     loop {
         match attempt(shared, slot, buf, cancel).await {
             AttemptEnd::Complete => return SlotEnd::Done,
             AttemptEnd::Cancelled => return SlotEnd::Cancelled,
+            AttemptEnd::Refresh => {
+                refreshes += 1;
+                if refreshes > MAX_CONSECUTIVE_FAILURES {
+                    return SlotEnd::Fatal(RoundFailure::Failed(
+                        "The download link keeps expiring; open the page again to get a fresh link".to_string(),
+                    ));
+                }
+            }
             AttemptEnd::Fatal(failure) => {
                 // A bad mirror shouldn't sink the download: fall back to the original URL.
                 if matches!(failure, RoundFailure::Failed(_)) && slot.url_idx.load(Ordering::Relaxed) != 0 {
@@ -949,9 +1070,35 @@ async fn run_slot(
                 }
                 return SlotEnd::Fatal(failure);
             }
-            AttemptEnd::Retry { reason, made_progress, retry_after, throttled } => {
+            AttemptEnd::Retry { reason, made_progress, retry_after, throttled, network } => {
                 if made_progress {
                     failures = 0;
+                    refreshes = 0;
+                    offline_since = None;
+                    offline_retries = 0;
+                }
+
+                // No answer at all: the network is down (Wi-Fi drop, VPN, sleep).
+                // Don't burn through the retries; keep knocking every few seconds.
+                if network && !made_progress {
+                    let since = *offline_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= NETWORK_GIVE_UP {
+                        return SlotEnd::Fatal(RoundFailure::Failed(format!(
+                            "{reason} (no connection for {} minutes)",
+                            NETWORK_GIVE_UP.as_secs() / 60
+                        )));
+                    }
+                    offline_retries += 1;
+                    if !flush(shared, buf).await {
+                        return SlotEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
+                    }
+                    let delay = backoff_delay(shared.retry_base, offline_retries, None).min(NETWORK_RETRY_CAP);
+                    tokio::select! {
+                        biased;
+                        _ = wait_paused(cancel) => return SlotEnd::Cancelled,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
                 failures += 1;
 
@@ -996,16 +1143,19 @@ async fn attempt(
     }
 
     let url_idx = slot.url_idx.load(Ordering::Relaxed) % shared.urls.len();
+    let resolved = if url_idx == 0 { shared.resolved.lock().clone() } else { None };
+    let target = resolved.as_deref().unwrap_or(&shared.urls[url_idx]);
     let mut req = shared
         .client
-        .get(&shared.urls[url_idx])
+        .get(target)
         .header(USER_AGENT, &shared.user_agent)
         .header(RANGE, format!("bytes={}-{}", st.pos, st.end - 1));
     if let Some(referer) = &shared.referer {
         req = req.header("Referer", referer);
     }
-    // Credentials and cookies belong to the original host; a mirror must never see them.
-    if url_idx == 0 {
+    // Credentials and cookies belong to the original host; a mirror (or the CDN a
+    // link redirects to) must never see them.
+    if url_idx == 0 && (resolved.is_none() || same_host(target, &shared.urls[0])) {
         for (name, value) in &shared.headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -1025,10 +1175,29 @@ async fn attempt(
     };
     let resp = match resp {
         Ok(r) => r,
-        Err(e) => return retry(format!("Request failed: {e}"), false),
+        // Refusing an HTTPS -> HTTP redirect (or too many hops) won't get better by retrying.
+        Err(e) if e.is_redirect() => return AttemptEnd::Fatal(RoundFailure::Failed(format!("Request failed: {e}"))),
+        Err(e) => {
+            // The resolved host may be the problem; the original link knows where to go now.
+            forget_resolved(shared, resolved.as_deref());
+            return net_retry(format!("Request failed: {e}"), false);
+        }
     };
 
     let status = resp.status();
+    // Remember where the original link led, so later ranges skip the redirect.
+    if url_idx == 0 && resolved.is_none() && status.is_success() && resp.url().as_str() != shared.urls[0] {
+        *shared.resolved.lock() = Some(resp.url().to_string());
+    }
+    // A signed/temporary link expired: get a fresh one through the original link.
+    if resolved.is_some() && matches!(status.as_u16(), 401 | 403 | 404 | 410) {
+        forget_resolved(shared, resolved.as_deref());
+        return AttemptEnd::Refresh;
+    }
+    if status == StatusCode::RANGE_NOT_SATISFIABLE && url_idx == 0 {
+        // The file got shorter than the part we asked for.
+        return AttemptEnd::Fatal(RoundFailure::FileChanged);
+    }
     if status == StatusCode::PARTIAL_CONTENT {
         shared.range_ok.store(true, Ordering::Relaxed);
         if let Some((first, total)) = resp
@@ -1061,12 +1230,12 @@ async fn attempt(
         } else if sent_if_range {
             // A full answer to a conditional range request means the file changed.
             return AttemptEnd::Fatal(RoundFailure::FileChanged);
+        } else if shared.range_ok.load(Ordering::Relaxed) {
+            // Ranges worked before (e.g. one server behind a load balancer doesn't do them): try again.
+            return retry("Server ignored the Range request once".to_string(), false);
         } else {
-            return AttemptEnd::Fatal(RoundFailure::Failed(
-                "Server ignored the Range request (HTTP 200), so this file can't be downloaded in parts. \
-                 Set connections to 1 and retry."
-                    .to_string(),
-            ));
+            // It can't serve parts at all: switch to a single stream.
+            return AttemptEnd::Fatal(RoundFailure::NoRanges);
         }
     } else if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
         let retry_after = resp
@@ -1080,6 +1249,7 @@ async fn attempt(
             made_progress: false,
             retry_after,
             throttled: true,
+            network: false,
         };
     } else if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
         return retry(format!("Server error (HTTP {status})"), false);
@@ -1089,6 +1259,7 @@ async fn attempt(
 
     let mut stream = resp.bytes_stream();
     let mut made_progress = false;
+    let mut last_data = Instant::now();
     let mut flush_tick = tokio::time::interval(WRITE_BATCH_MAX_AGE);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1100,6 +1271,11 @@ async fn attempt(
                 if buf.due() && !flush(shared, buf).await {
                     return AttemptEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
                 }
+                // A connection that went quiet holds its range hostage: drop it and reconnect.
+                let quiet = last_data.elapsed();
+                if quiet >= STALL_TIMEOUT || (quiet >= SHORT_STALL && shared.received_since(last_data)) {
+                    return retry("Connection stalled".to_string(), made_progress);
+                }
                 continue;
             }
             next = stream.next() => next,
@@ -1110,6 +1286,7 @@ async fn attempt(
             Some(Err(e)) => return retry(format!("Connection error: {e}"), made_progress),
             Some(Ok(chunk)) => chunk,
         };
+        shared.last_rx_ms.store(shared.clock.elapsed().as_millis() as u64, Ordering::Relaxed);
 
         // Reserve the bytes under the slot lock: this is what makes work
         // stealing exact, because `end` may have been lowered meanwhile.
@@ -1138,6 +1315,8 @@ async fn attempt(
             _ = wait_paused(cancel) => return AttemptEnd::Cancelled,
             _ = limited => {}
         }
+        // Time spent waiting on the speed limit isn't a stall.
+        last_data = Instant::now();
 
         if (buf.due() || finished) && !flush(shared, buf).await {
             return AttemptEnd::Fatal(RoundFailure::Failed("Disk write failed".to_string()));
@@ -1169,6 +1348,24 @@ fn backoff_delay(base: Duration, failures: u32, retry_after: Option<Duration>) -
     match retry_after {
         Some(ra) => jittered.max(ra.min(Duration::from_secs(60))),
         None => jittered,
+    }
+}
+
+/// Drops the resolved link, unless another connection already replaced it.
+fn forget_resolved(shared: &Shared, stale: Option<&str>) {
+    let mut resolved = shared.resolved.lock();
+    if stale.is_some() && resolved.as_deref() == stale {
+        *resolved = None;
+    }
+}
+
+/// Same scheme, host and port: safe to send that site's cookies and logins.
+fn same_host(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
     }
 }
 
@@ -1214,18 +1411,6 @@ fn build_request(
 pub(crate) async fn wait_paused(rx: &mut watch::Receiver<bool>) {
     if rx.wait_for(|paused| *paused).await.is_err() {
         std::future::pending::<()>().await;
-    }
-}
-
-/// Sends the request, but gives up early (returning `None`) if paused first.
-async fn send_or_pause(
-    req: reqwest::RequestBuilder,
-    pause_rx: &mut watch::Receiver<bool>,
-) -> Result<Option<reqwest::Response>, String> {
-    tokio::select! {
-        biased;
-        _ = wait_paused(pause_rx) => Ok(None),
-        res = req.send() => res.map(Some).map_err(|e| format!("HTTP request failed: {e}")),
     }
 }
 

@@ -45,33 +45,88 @@ pub async fn probe_url(client: &reqwest::Client, url_str: &str) -> Result<ProbeR
 pub async fn probe_url_with(client: &reqwest::Client, url_str: &str, opts: &ProbeOptions) -> Result<ProbeResult, String> {
     let _parsed = Url::parse(url_str).map_err(|e| format!("Invalid URL: {e}"))?;
 
-    // Attempt 1: HEAD request
-    let head_res = opts.apply(client.head(url_str)).send().await;
-
-    match head_res {
-        Ok(res) if res.status().is_success() => {
-            let final_url = res.url().to_string();
-            let headers = res.headers().clone();
-            parse_headers_into_probe(url_str, &final_url, &headers, None)
+    // A dropped packet or a busy moment shouldn't stop a download before it starts.
+    let mut last_error = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << (attempt - 1)))).await;
         }
-        _ => {
-            // Attempt 2: Fallback to GET with Range: bytes=0-0 to test range support & avoid downloading entire file
-            let get_res = opts
-                .apply(client.get(url_str))
-                .header(reqwest::header::RANGE, "bytes=0-0")
-                .send()
-                .await
-                .map_err(|e| format!("Network request failed: {e}"))?;
-
-            let final_url = get_res.url().to_string();
-            let status = get_res.status();
-            let headers = get_res.headers().clone();
-
-            // Status 206 Partial Content proves Range request is supported!
-            let range_supported = status == reqwest::StatusCode::PARTIAL_CONTENT;
-            parse_headers_into_probe(url_str, &final_url, &headers, Some(range_supported))
+        match probe_once(client, url_str, opts).await {
+            Ok(result) => return Ok(result),
+            Err(ProbeError::Transient(e)) => last_error = e,
+            Err(ProbeError::Permanent(e)) => return Err(e),
         }
     }
+    Err(last_error)
+}
+
+enum ProbeError {
+    Transient(String),
+    Permanent(String),
+}
+
+/// A real one-byte range request: the only reliable way to know whether a
+/// server can serve parts of the file (many support ranges without saying so).
+async fn range_probe(client: &reqwest::Client, url_str: &str, opts: &ProbeOptions) -> Result<reqwest::Response, ProbeError> {
+    opts.apply(client.get(url_str))
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_redirect() || e.is_builder() {
+                ProbeError::Permanent(format!("Network request failed: {e}"))
+            } else {
+                ProbeError::Transient(format!("Network request failed: {e}"))
+            }
+        })
+}
+
+async fn probe_once(client: &reqwest::Client, url_str: &str, opts: &ProbeOptions) -> Result<ProbeResult, ProbeError> {
+    let head = match opts.apply(client.head(url_str)).send().await {
+        Ok(res) if res.status().is_success() => {
+            let final_url = res.url().to_string();
+            Some(parse_headers_into_probe(url_str, &final_url, res.headers(), None).map_err(ProbeError::Permanent)?)
+        }
+        _ => None,
+    };
+
+    // HEAD told us everything we need: size known and ranges advertised.
+    if let Some(h) = &head {
+        if h.resumable && h.total_bytes > 0 {
+            return Ok(h.clone());
+        }
+    }
+
+    // Otherwise ask for one byte. A 206 proves ranges work, so the file can be
+    // downloaded over many connections and resumed.
+    let res = match range_probe(client, url_str, opts).await {
+        Ok(res) => res,
+        Err(e) => return head.ok_or(e),
+    };
+    let status = res.status();
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+        return head.ok_or_else(|| ProbeError::Transient(format!("Server returned HTTP {status}")));
+    }
+    if !status.is_success() {
+        return head.ok_or_else(|| ProbeError::Permanent(format!("Server returned HTTP {status}")));
+    }
+    let final_url = res.url().to_string();
+    let range_supported = status == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut result = parse_headers_into_probe(url_str, &final_url, res.headers(), Some(range_supported)).map_err(ProbeError::Permanent)?;
+    // Keep what only HEAD knew (a GET may omit the size when it isn't a range answer).
+    if let Some(h) = head {
+        if result.total_bytes <= 0 {
+            result.total_bytes = h.total_bytes;
+        }
+        result.etag = result.etag.or(h.etag);
+        result.last_modified = result.last_modified.or(h.last_modified);
+        result.mime_type = result.mime_type.or(h.mime_type);
+        if result.filename == "download.bin" {
+            result.filename = h.filename;
+            result.category = h.category;
+        }
+    }
+    Ok(result)
 }
 
 fn parse_headers_into_probe(
