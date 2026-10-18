@@ -5,74 +5,84 @@ document.addEventListener('DOMContentLoaded', async () => {
   const downloadBtn = document.getElementById('downloadBtn');
   const interceptToggle = document.getElementById('interceptToggle');
 
-  // Streaming videos the page loaded (HLS / DASH)
+  const sizeText = (n) => (n > 0 ? (n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1048576)) + ' MB') : '');
+
+  // Videos and media files this tab has loaded (HLS / DASH playlists, video and audio files)
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  chrome.runtime.sendMessage({ type: 'GET_STREAMS', tabId: tab?.id }, (reply) => {
-    if (chrome.runtime.lastError || !reply || !reply.streams || reply.streams.length === 0) return;
+  chrome.runtime.sendMessage({ type: 'GET_MEDIA', tabId: tab && tab.id }, (reply) => {
+    if (chrome.runtime.lastError || !reply || !reply.media || reply.media.length === 0) return;
     const box = document.getElementById('videos');
     const list = document.getElementById('videoList');
     box.hidden = false;
-    reply.streams.forEach((s) => {
-      const u = new URL(s.url);
+    reply.media.forEach((m) => {
+      const u = new URL(m.url);
       const row = document.createElement('div');
       row.className = 'video-row';
+
+      const tag = document.createElement('span');
+      tag.className = 'kind';
+      tag.textContent = m.kind === 'stream' ? (/\.mpd$/i.test(u.pathname) ? 'DASH' : 'HLS') : ((m.mime || 'file').split('/').pop() || 'file').toUpperCase().slice(0, 5);
+
       const name = document.createElement('div');
       name.className = 'name';
-      name.title = s.url;
-      name.textContent = u.pathname.split('/').filter(Boolean).slice(-2).join('/') || u.hostname;
-      const kind = document.createElement('span');
-      kind.className = 'kind';
-      kind.textContent = /\.mpd$/i.test(u.pathname) ? 'DASH' : 'HLS';
-      name.appendChild(kind);
+      name.title = m.url;
+      name.textContent = decodeURIComponent(u.pathname.split('/').filter(Boolean).slice(-2).join('/')) || u.hostname;
+
+      const size = document.createElement('span');
+      size.className = 'size';
+      size.textContent = sizeText(m.size);
+
       const btn = document.createElement('button');
       btn.className = 'btn-small';
       btn.textContent = 'Download';
       btn.addEventListener('click', () => {
-        chrome.runtime.sendMessage({ type: 'SEND_STREAM', url: s.url, page: s.page }, (res) => {
-          btn.textContent = res && res.success ? 'Sent' : 'Failed';
-          setTimeout(() => { btn.textContent = 'Download'; }, 1500);
+        chrome.runtime.sendMessage({ type: 'SEND_MEDIA', url: m.url, tabId: tab && tab.id, page: m.page }, (res) => {
+          btn.textContent = res && res.success ? 'Sent' : 'Not running';
+          setTimeout(() => { btn.textContent = 'Download'; }, 1600);
         });
       });
-      row.append(name, btn);
+      row.append(tag, name, size, btn);
       list.appendChild(row);
     });
   });
 
-  // Check connection status
+  // Connection to the desktop app
   chrome.runtime.sendMessage({ type: 'CHECK_CONNECTION' }, (response) => {
     if (response && response.connected) {
       statusBadge.className = 'status-badge status-online';
-      statusText.textContent = 'Desktop Online (:18888)';
+      statusText.textContent = 'Nexdrop is running';
     } else {
       statusBadge.className = 'status-badge status-offline';
-      statusText.textContent = 'App Offline';
+      statusText.textContent = 'Nexdrop isn’t running';
     }
   });
 
-  // Load saved settings
-  const { autoIntercept } = await chrome.storage.local.get(['autoIntercept']);
-  if (autoIntercept !== undefined) {
-    interceptToggle.checked = autoIntercept;
-  }
-
-  interceptToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ autoIntercept: interceptToggle.checked });
+  // Capture switch (kept in the settings object the options page edits)
+  const { settings } = await chrome.storage.local.get('settings');
+  interceptToggle.checked = settings ? settings.autoIntercept !== false : true;
+  interceptToggle.addEventListener('change', async () => {
+    const stored = (await chrome.storage.local.get('settings')).settings || {};
+    await chrome.storage.local.set({ settings: { ...stored, autoIntercept: interceptToggle.checked } });
   });
 
-  downloadBtn.addEventListener('click', async () => {
+  document.getElementById('optionsLink').addEventListener('click', (e) => {
+    e.preventDefault();
+    chrome.runtime.openOptionsPage();
+    window.close();
+  });
+
+  downloadBtn.addEventListener('click', () => {
     const url = urlInput.value.trim();
     if (!url) return;
-
-    downloadBtn.textContent = 'Sending...';
-    chrome.runtime.sendMessage({ type: 'SEND_TO_NEXDROP', url }, (res) => {
+    downloadBtn.textContent = 'Sending…';
+    chrome.runtime.sendMessage({ type: 'SEND_TO_NEXDROP', url, referer: tab && tab.url }, (res) => {
       if (res && res.success) {
-        downloadBtn.textContent = 'Download Started!';
+        downloadBtn.textContent = 'Sent to Nexdrop';
         urlInput.value = '';
-        setTimeout(() => { downloadBtn.textContent = 'Download with Nexdrop'; }, 1500);
       } else {
-        downloadBtn.textContent = 'Failed to Send';
-        setTimeout(() => { downloadBtn.textContent = 'Download with Nexdrop'; }, 2000);
+        downloadBtn.textContent = 'Nexdrop isn’t running';
       }
+      setTimeout(() => { downloadBtn.textContent = 'Download with Nexdrop'; }, 1800);
     });
   });
 });

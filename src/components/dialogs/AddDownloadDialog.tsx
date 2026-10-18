@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
-import type { AddDownloadRequest, AppSettings, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
+import type { AddDownloadRequest, AppSettings, BrowserRequest, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
 import { formatBytes, formatDuration } from '../../utils/format';
 import { CHUNK_SIZES, PRIORITIES, USER_AGENTS, categoryMeta, isHttpUrl, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
@@ -21,8 +21,8 @@ interface AddDownloadDialogProps {
   queues?: QueueInfo[];
   /** Queue preselected in the picker. */
   defaultQueue?: string;
-  /** The page a link was found on (many video servers insist on it). */
-  initialReferer?: string;
+  /** What the browser sent with the link: name, page, user agent and cookies. */
+  initialRequest?: BrowserRequest;
 }
 
 const STREAM_URL_RE = /\.(m3u8?|mpd)(\?|#|$)/i;
@@ -34,7 +34,7 @@ type ProbeState =
   | { kind: 'ok'; result: UrlProbeResult }
   | { kind: 'error'; message: string };
 
-export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue, initialReferer }) => (
+export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue, initialRequest }) => (
   <Dialog open={open} onClose={onClose} title="New download" width={560} bare>
     {open && (
       <AddDownloadForm
@@ -44,24 +44,24 @@ export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, init
         onSubmit={onSubmit}
         queues={queues}
         defaultQueue={defaultQueue}
-        initialReferer={initialReferer}
+        initialRequest={initialRequest}
       />
     )}
   </Dialog>
 );
 
-const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue, initialReferer }) => {
+const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue, initialRequest }) => {
   // A streaming-video link (HLS / DASH): shows a quality picker instead of file details.
   const [stream, setStream] = useState<StreamProbe | null>(null);
   const [variantId, setVariantId] = useState('');
   const [queueId, setQueueId] = useState(defaultQueue && queues.some((q) => q.id === defaultQueue) ? defaultQueue : 'main');
   const [url, setUrl] = useState('');
-  const [filename, setFilename] = useState('');
-  const filenameTouched = useRef(false);
+  const [filename, setFilename] = useState(initialRequest?.filename ?? '');
+  const filenameTouched = useRef(!!initialRequest?.filename);
   const [destination, setDestination] = useState(settings.default_destination);
   const [probe, setProbe] = useState<ProbeState>({ kind: 'idle' });
   const [curlNote, setCurlNote] = useState<string | null>(null);
-  const [customHeaders, setCustomHeaders] = useState<Record<string, string>>({});
+  const [customHeaders, setCustomHeaders] = useState<Record<string, string>>(initialRequest?.headers ?? {});
 
   const [when, setWhen] = useState<'now' | 'later'>('now');
   const [scheduledAt, setScheduledAt] = useState(defaultScheduleValue(settings.scheduler_start_time));
@@ -73,9 +73,9 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   const [proxyMode, setProxyMode] = useState<AddDownloadRequest['proxy_mode']>(settings.proxy_mode || 'system');
   const [proxyUrl, setProxyUrl] = useState(settings.custom_proxy_url ?? '');
   const [mirrors, setMirrors] = useState('');
-  const [checksum, setChecksum] = useState('');
-  const [referer, setReferer] = useState(initialReferer ?? '');
-  const [userAgent, setUserAgent] = useState('');
+  const [checksum, setChecksum] = useState(initialRequest?.checksum ?? '');
+  const [referer, setReferer] = useState(initialRequest?.referer ?? '');
+  const [userAgent, setUserAgent] = useState(initialRequest?.userAgent ?? '');
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -92,7 +92,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
       let result: UrlProbeResult | null = null;
       let isStream = STREAM_URL_RE.test(target);
       if (!isStream) {
-        result = await api.probeUrl(target);
+        result = await api.probeUrl(target, { referer: referer.trim() || undefined, userAgent: userAgent || undefined, headers: customHeaders });
         isStream = STREAM_MIME_RE.test(result.mime_type ?? '');
       }
       if (isStream) {
@@ -155,8 +155,13 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
     setCurlNote(null);
   };
 
-  // Initial text from omnibox / clipboard / drag-drop
+  // Initial text from omnibox / clipboard / drag-drop / the browser
   useEffect(() => {
+    if (initialRequest && Object.keys(initialRequest.headers ?? {}).length > 0) {
+      setCurlNote('Sent from your browser, with your login for this site');
+    } else if (initialRequest) {
+      setCurlNote('Sent from your browser');
+    }
     if (initialText) handleUrlInput(initialText.trim());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

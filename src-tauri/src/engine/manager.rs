@@ -221,12 +221,22 @@ impl DownloadManager {
         Ok(result)
     }
 
-    /// Probe for the "new download" dialog, using the proxy from settings.
-    pub async fn probe_with_settings(&self, url: &str) -> Result<ProbeResult, String> {
+    /// Probe for the "new download" dialog, using the proxy from settings. A link
+    /// that came from the browser can bring its referer, user agent and cookies,
+    /// so files behind a login can be inspected too.
+    pub async fn probe_with_settings(
+        &self,
+        url: &str,
+        referer: Option<String>,
+        user_agent: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> Result<ProbeResult, String> {
         let settings = self.get_settings();
+        let headers: HashMap<String, String> = headers.into_iter().filter(|(k, _)| !is_forbidden_header(k)).collect();
         let opts = ProbeOptions {
-            headers: build_header_list(&HashMap::new(), &self.vault_headers(url)),
-            ..Default::default()
+            headers: build_header_list(&headers, &self.vault_headers(url)),
+            referer,
+            user_agent,
         };
         self.probe(url, Some(&settings.proxy_mode), settings.custom_proxy_url.as_deref(), &opts).await
     }

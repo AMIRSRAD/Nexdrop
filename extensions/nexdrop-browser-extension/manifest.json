@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Nexdrop — Modern Download Manager Integration",
-  "version": "1.1.0",
-  "description": "Seamlessly intercepts downloads, finds streaming videos (HLS / DASH) on the page, and sends them to Nexdrop Desktop.",
+  "version": "1.2.0",
+  "description": "Sends downloads, videos and streams from your browser to Nexdrop, like IDM.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -17,14 +17,18 @@
     "contextMenus",
     "storage",
     "activeTab",
-    "webRequest"
+    "webRequest",
+    "cookies"
   ],
   "host_permissions": [
     "http://127.0.0.1:18888/*",
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "scripts": [
+      "background.js"
+    ]
   },
   "content_scripts": [
     {
@@ -34,7 +38,18 @@
       "js": [
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
-  ]
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "nexdrop@nexdrop.app",
+      "strict_min_version": "115.0"
+    }
+  }
 }

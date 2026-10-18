@@ -132,7 +132,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'security' && <Security s={settings} set={onChange} />}
           {section === 'torrents' && <Torrents s={settings} set={onChange} />}
           {section === 'logins' && <Logins />}
-          {section === 'integrations' && <Integrations />}
+          {section === 'integrations' && <Integrations s={settings} set={onChange} />}
         </div>
       </div>
     </motion.div>
@@ -811,12 +811,35 @@ const Logins: React.FC = () => {
   );
 };
 
-const Integrations: React.FC = () => {
+const Integrations: React.FC<SectionProps> = ({ s, set }) => {
   const [copied, setCopied] = useState(false);
   const [dir, setDir] = useState<string | null>(null);
+  const [browser, setBrowser] = useState<'chromium' | 'firefox'>('chromium');
   useEffect(() => {
     api.getExtensionDir().then(setDir).catch(() => setDir(''));
   }, []);
+  const folder = (
+    <div className="mt-2 flex items-center gap-2 rounded-lg bg-surface-2 py-1 pr-1 pl-3 shadow-[inset_0_0_0_1px_var(--line)]">
+      <span className="selectable min-w-0 flex-1 truncate font-mono text-[12px] text-fg">{dir === null ? 'Looking…' : dir || 'Not found'}</span>
+      <Button
+        size="sm"
+        variant="ghost"
+        icon={copied ? Check : Copy}
+        disabled={!dir}
+        onClick={() =>
+          navigator.clipboard.writeText(dir ?? '').then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          })
+        }
+      >
+        {copied ? 'Copied' : 'Copy'}
+      </Button>
+      <Button size="sm" variant="ghost" icon={Folder} disabled={!dir} onClick={() => api.openExtensionDir()}>
+        Open
+      </Button>
+    </div>
+  );
   return (
     <>
       <Group>
@@ -828,45 +851,61 @@ const Integrations: React.FC = () => {
         </SettingRow>
       </Group>
 
+      <Group title="When the browser sends a link">
+        <SettingRow
+          title="Show the download window first"
+          description="Pick the folder, name and queue before it starts, like IDM. Turn off to start downloads immediately."
+        >
+          <Switch checked={s.browser_prompt} onChange={(v) => set({ browser_prompt: v })} label="Show the download window first" />
+        </SettingRow>
+      </Group>
+
       <Group title="Install the extension">
         <div className="space-y-4 px-4 py-4 text-[13px] text-fg-2">
-          <Step n={1}>
-            Open <code className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[12px] text-fg">chrome://extensions</code> or{' '}
-            <code className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[12px] text-fg">edge://extensions</code>
-          </Step>
-          <Step n={2}>Turn on Developer mode</Step>
-          <Step n={3}>
-            Choose <span className="font-medium text-fg">Load unpacked</span> and select this folder:
-            <div className="mt-2 flex items-center gap-2 rounded-lg bg-surface-2 py-1 pr-1 pl-3 shadow-[inset_0_0_0_1px_var(--line)]">
-              <span className="selectable min-w-0 flex-1 truncate font-mono text-[12px] text-fg">{dir === null ? 'Looking…' : dir || 'Not found'}</span>
-              <Button
-                size="sm"
-                variant="ghost"
-                icon={copied ? Check : Copy}
-                disabled={!dir}
-                onClick={() =>
-                  navigator.clipboard.writeText(dir ?? '').then(() => {
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 1500);
-                  })
-                }
-              >
-                {copied ? 'Copied' : 'Copy'}
-              </Button>
-              <Button size="sm" variant="ghost" icon={Folder} disabled={!dir} onClick={() => api.openExtensionDir()}>
-                Open
-              </Button>
-            </div>
-          </Step>
+          <Segmented
+            value={browser}
+            onChange={setBrowser}
+            options={[
+              { value: 'chromium', label: 'Chrome / Edge' },
+              { value: 'firefox', label: 'Firefox' },
+            ]}
+          />
+          {browser === 'chromium' ? (
+            <>
+              <Step n={1}>
+                Open <code className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[12px] text-fg">chrome://extensions</code> or{' '}
+                <code className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[12px] text-fg">edge://extensions</code>
+              </Step>
+              <Step n={2}>Turn on Developer mode</Step>
+              <Step n={3}>
+                Choose <span className="font-medium text-fg">Load unpacked</span> and select this folder:
+                {folder}
+              </Step>
+            </>
+          ) : (
+            <>
+              <Step n={1}>
+                Open <code className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[12px] text-fg">about:debugging#/runtime/this-firefox</code>
+              </Step>
+              <Step n={2}>
+                Choose <span className="font-medium text-fg">Load Temporary Add-on…</span> and select <span className="font-mono text-[12px] text-fg">manifest.json</span> in this folder:
+                {folder}
+              </Step>
+              <p className="text-[12.5px] text-fg-3">
+                Firefox forgets temporary add-ons when it closes, so repeat this after restarting it. A permanent install needs the extension to be signed by Mozilla.
+              </p>
+            </>
+          )}
         </div>
       </Group>
 
       <Group title="What it adds">
         <ul className="space-y-2 px-4 py-4 text-[13px] text-fg-2">
-          <li>“Download with Nexdrop” on any link or media in the right-click menu</li>
-          <li>“Grab all links on page” to bulk-add files</li>
-          <li>A download button over HTML5 video players</li>
-          <li>Automatic capture of archives, installers, videos and other large files</li>
+          <li>Downloads your browser starts go to Nexdrop, with your login for the site. Hold Alt on a link to let the browser handle it.</li>
+          <li>A Download button over videos and audio. It finds streaming videos (HLS, DASH) and video files the page loaded.</li>
+          <li>Videos and PDFs you click download instead of opening in the tab.</li>
+          <li>“Download with Nexdrop” and “Grab all links on this page” in the right-click menu.</li>
+          <li>Choose which file types are caught and which sites are ignored in the extension’s options (click its toolbar icon, then Capture settings).</li>
         </ul>
       </Group>
     </>

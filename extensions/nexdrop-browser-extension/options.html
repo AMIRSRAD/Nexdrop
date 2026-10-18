@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexdrop capture settings</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d0e11; color: #ecedf1; font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 640px; margin: 0 auto; padding: 36px 24px 64px; }
+    header { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    header img { width: 32px; height: 32px; border-radius: 8px; }
+    h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+    h2 { font-size: 12px; font-weight: 600; color: #8b8f9b; margin: 28px 0 8px; }
+    .card { background: #131418; border-radius: 12px; box-shadow: 0 0 0 1px rgba(255,255,255,.07); }
+    .row { display: flex; align-items: center; gap: 24px; padding: 14px 16px; }
+    .row + .row { border-top: 1px solid rgba(255,255,255,.07); }
+    .row .text { flex: 1; min-width: 0; }
+    .title { font-weight: 500; }
+    .hint { color: #8b8f9b; font-size: 12.5px; margin-top: 2px; }
+    .stack { display: block; }
+    textarea, input[type=number] { background: #1a1b20; color: #ecedf1; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; padding: 8px 10px; font: 12.5px/1.5 ui-monospace, Consolas, monospace; outline: none; }
+    textarea { width: 100%; min-height: 88px; resize: vertical; margin-top: 8px; }
+    input[type=number] { width: 90px; font-family: inherit; }
+    textarea:focus, input[type=number]:focus { border-color: #5b8cff; }
+    .switch { position: relative; width: 36px; height: 20px; flex: none; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: #3a3d48; border-radius: 20px; cursor: pointer; transition: .15s; }
+    .slider:before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .15s; }
+    input:checked + .slider { background: #5b8cff; }
+    input:checked + .slider:before { transform: translateX(16px); }
+    footer { margin-top: 22px; display: flex; align-items: center; gap: 14px; color: #8b8f9b; font-size: 12.5px; }
+    button { background: none; border: 0; color: #9db9ff; cursor: pointer; font: inherit; padding: 0; }
+    button:hover { color: #c3d4ff; }
+    #saved { color: #34d399; opacity: 0; transition: opacity .2s; }
+    #saved.on { opacity: 1; }
+  </style>
+</head>
+<body>
+<main>
+  <header><img src="icons/icon128.png" alt=""><h1>Nexdrop capture settings</h1></header>
+
+  <h2>Downloads</h2>
+  <div class="card">
+    <div class="row"><div class="text"><div class="title">Send browser downloads to Nexdrop</div><div class="hint">Files your browser starts downloading are handed to Nexdrop. Hold Alt while clicking a link to let the browser handle it.</div></div>
+      <label class="switch"><input type="checkbox" id="autoIntercept"><span class="slider"></span></label></div>
+    <div class="row"><div class="text"><div class="title">Catch videos, audio and PDFs you click</div><div class="hint">These open inside the tab by default; with this on, clicking one downloads it instead.</div></div>
+      <label class="switch"><input type="checkbox" id="interceptLinks"><span class="slider"></span></label></div>
+    <div class="row"><div class="text"><div class="title">Show the Download button over videos</div><div class="hint">Appears when you point at or play a video.</div></div>
+      <label class="switch"><input type="checkbox" id="videoButton"><span class="slider"></span></label></div>
+  </div>
+
+  <h2>What counts as a download</h2>
+  <div class="card">
+    <div class="row stack"><div class="title">File types</div><div class="hint">Always sent to Nexdrop. Separate with spaces or commas.</div><textarea id="fileTypes" spellcheck="false"></textarea></div>
+    <div class="row"><div class="text"><div class="title">Other files from this size</div><div class="hint">Types not listed above are sent when they are at least this big.</div></div>
+      <div><input type="number" id="minSizeMB" min="1" max="10000"> MB</div></div>
+  </div>
+
+  <h2>Sites to leave alone</h2>
+  <div class="card">
+    <div class="row stack"><div class="title">Ignored sites</div><div class="hint">Downloads from these sites stay with the browser. One per line, for example <code>intranet.example.com</code>.</div><textarea id="ignoreSites" spellcheck="false"></textarea></div>
+  </div>
+
+  <footer><button id="reset">Restore defaults</button><span id="saved">Saved</span></footer>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

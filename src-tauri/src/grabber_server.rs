@@ -39,6 +39,10 @@ pub struct GrabRequest {
     /// Optional hash the page published for the file (MD5 or SHA-256).
     #[serde(default)]
     pub expected_checksum: Option<String>,
+    /// The browser's cookies for this address (a `Cookie` header value), so files
+    /// behind a login download the same way they would in the browser.
+    #[serde(default)]
+    pub cookies: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -221,6 +225,36 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         return Reply::error("400 Bad Request", "Only http and https links can be downloaded");
     }
 
+    // Cookies belong to the page's login, never anywhere else: they travel with the
+    // download as a private header that is only sent to the link's own host.
+    let custom_headers: Option<HashMap<String, String>> = grab
+        .cookies
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && c.len() <= 16 * 1024 && !c.contains(['\r', '\n']))
+        .map(|c| HashMap::from([("Cookie".to_string(), c.to_string())]));
+
+    // Like IDM: show the download window so the folder, name and queue can be chosen.
+    if mgr.get_settings().browser_prompt {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            let _ = window.emit(
+                "download-requested",
+                serde_json::json!({
+                    "url": grab.url.trim(),
+                    "filename": grab.filename,
+                    "referer": grab.referer,
+                    "user_agent": grab.user_agent,
+                    "headers": custom_headers,
+                    "expected_checksum": grab.expected_checksum,
+                }),
+            );
+            return Reply::json("200 OK", serde_json::json!({ "success": true, "prompt": true }));
+        }
+    }
+
     let req = AddDownloadRequest {
         url: grab.url,
         filename: grab.filename,
@@ -231,7 +265,7 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         scheduled_time: None,
         user_agent: grab.user_agent,
         referer: grab.referer,
-        custom_headers: None,
+        custom_headers,
         expected_checksum: grab.expected_checksum,
         mirrors: None,
         min_chunk_size: None,

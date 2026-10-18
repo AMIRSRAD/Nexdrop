@@ -332,6 +332,8 @@ pub struct AppSettings {
     pub torrent_dht: bool,
     /// Ask the router to forward the torrent port (UPnP). Off by default.
     pub torrent_upnp: bool,
+    /// Links sent by the browser open the download window first (like IDM) instead of starting at once.
+    pub browser_prompt: bool,
 }
 
 impl Default for AppSettings {
@@ -377,6 +379,7 @@ impl Default for AppSettings {
             torrent_upload_limit: 0,
             torrent_dht: true,
             torrent_upnp: false,
+            browser_prompt: true,
         }
     }
 }

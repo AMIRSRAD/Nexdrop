@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { CheckSquare, ClipboardPaste, Copy, Download, Link2, ListPlus, Magnet, Settings as SettingsIcon } from 'lucide-react';
 import { api, isTauri } from './services/api';
+import type { BrowserRequest } from './types/download';
 import { QueuesContext, useQueues } from './hooks/useQueues';
 import { listen } from '@tauri-apps/api/event';
 import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
@@ -55,6 +56,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   torrent_upload_limit: 0,
   torrent_dht: true,
   torrent_upnp: false,
+  browser_prompt: true,
 };
 
 const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|xz|bz2|iso|img|exe|msi|dmg|pkg|deb|rpm|apk|mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|pdf|epub|bin)(\?|#|$)/i;
@@ -63,7 +65,7 @@ export default function App() {
   const toast = useToast();
 
   /* ── dialogs & views ─────────────────────────────── */
-  const [addState, setAddState] = useState<{ open: boolean; text: string; referer?: string }>({ open: false, text: '' });
+  const [addState, setAddState] = useState<{ open: boolean; text: string; request?: BrowserRequest }>({ open: false, text: '' });
   const [multiState, setMultiState] = useState<{ open: boolean; tab: AddMultipleTab; text: string }>({ open: false, tab: 'paste', text: '' });
   const [removeIds, setRemoveIds] = useState<string[]>([]);
   const [statsOpen, setStatsOpen] = useState(false);
@@ -72,7 +74,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [appMenu, setAppMenu] = useState<{ x: number; y: number; selection: string } | null>(null);
 
-  const openAdd = useCallback((text = '', referer?: string) => setAddState({ open: true, text, referer }), []);
+  const openAdd = useCallback((text = '', request?: BrowserRequest) => setAddState({ open: true, text, request }), []);
   const openMultiple = useCallback((tab: AddMultipleTab = 'paste', text = '') => setMultiState({ open: true, tab, text }), []);
   const [torrentState, setTorrentState] = useState<{ open: boolean; source: string; file: File | null }>({ open: false, source: '', file: null });
   const openTorrent = useCallback((source = '', file: File | null = null) => setTorrentState({ open: true, source, file }), []);
@@ -332,9 +334,29 @@ export default function App() {
   // The browser extension found a streaming video: let the user pick its quality.
   useEffect(() => {
     if (!isTauri()) return;
-    const un = listen<{ url: string; referer?: string | null }>('stream-requested', (e) => openAdd(e.payload.url, e.payload.referer ?? undefined));
+    const un = listen<{ url: string; referer?: string | null; user_agent?: string | null }>('stream-requested', (e) =>
+      openAdd(e.payload.url, { referer: e.payload.referer ?? undefined, userAgent: e.payload.user_agent ?? undefined }),
+    );
+    // A link the browser handed over: show the download window, filled in like the browser had it.
+    const un2 = listen<{
+      url: string;
+      filename?: string | null;
+      referer?: string | null;
+      user_agent?: string | null;
+      headers?: Record<string, string> | null;
+      expected_checksum?: string | null;
+    }>('download-requested', (e) =>
+      openAdd(e.payload.url, {
+        filename: e.payload.filename ?? undefined,
+        referer: e.payload.referer ?? undefined,
+        userAgent: e.payload.user_agent ?? undefined,
+        headers: e.payload.headers ?? undefined,
+        checksum: e.payload.expected_checksum ?? undefined,
+      }),
+    );
     return () => {
       un.then((f) => f()).catch(() => {});
+      un2.then((f) => f()).catch(() => {});
     };
   }, [openAdd]);
 
@@ -656,7 +678,7 @@ export default function App() {
         onSubmit={addOne}
         queues={queues}
         defaultQueue={queueFilter === 'all' ? undefined : queueFilter}
-        initialReferer={addState.referer}
+        initialRequest={addState.request}
       />
       <AddTorrentDialog
         open={torrentState.open}
