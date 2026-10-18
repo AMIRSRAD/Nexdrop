@@ -23,7 +23,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import type { AppSettings, DownloadQueue, QueueInfo, SiteCredential } from '../../types/download';
+import type { AppSettings, BrowserInfo, DownloadQueue, QueueInfo, SiteCredential } from '../../types/download';
 import { api } from '../../services/api';
 import { CHUNK_SIZES, GRABBER_PORT } from '../../lib/meta';
 import { cn } from '../../lib/cn';
@@ -65,9 +65,11 @@ interface SettingsViewProps {
   saveState: 'idle' | 'saving' | 'saved';
   queues: QueueInfo[];
   onQueuesChanged: () => void;
+  browsers: BrowserInfo[];
+  onSetupBrowsers: () => void;
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, onClose, section, onSection, saveState, queues, onQueuesChanged }) => {
+export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, onClose, section, onSection, saveState, queues, onQueuesChanged, browsers, onSetupBrowsers }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
@@ -132,7 +134,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'security' && <Security s={settings} set={onChange} />}
           {section === 'torrents' && <Torrents s={settings} set={onChange} />}
           {section === 'logins' && <Logins />}
-          {section === 'integrations' && <Integrations s={settings} set={onChange} />}
+          {section === 'integrations' && <Integrations s={settings} set={onChange} browsers={browsers} onSetup={onSetupBrowsers} />}
         </div>
       </div>
     </motion.div>
@@ -811,7 +813,9 @@ const Logins: React.FC = () => {
   );
 };
 
-const Integrations: React.FC<SectionProps> = ({ s, set }) => {
+const Integrations: React.FC<SectionProps & { browsers: BrowserInfo[]; onSetup: () => void }> = ({ s, set, browsers, onSetup }) => {
+  const [manual, setManual] = useState(false);
+  const found = browsers.filter((b) => b.installed);
   const [copied, setCopied] = useState(false);
   const [dir, setDir] = useState<string | null>(null);
   const [browser, setBrowser] = useState<'chromium' | 'firefox'>('chromium');
@@ -860,6 +864,42 @@ const Integrations: React.FC<SectionProps> = ({ s, set }) => {
         </SettingRow>
       </Group>
 
+      <Group title="Your browsers">
+        {found.length === 0 ? (
+          <SettingRow title="No supported browser found" description="Chrome, Edge, Brave and Firefox are supported." />
+        ) : (
+          found.map((b) => (
+            <SettingRow
+              key={b.id}
+              title={b.name}
+              description={
+                b.connected
+                  ? `Connected${b.version ? ` · extension ${b.version}` : ''}`
+                  : b.ever_connected
+                    ? 'Connected earlier. It reconnects when the browser is open.'
+                    : 'Not connected yet'
+              }
+            >
+              {b.connected ? (
+                <span className="flex items-center gap-1.5 text-[12.5px] font-medium text-success">
+                  <Check size={14} /> Connected
+                </span>
+              ) : (
+                <Button size="sm" variant="secondary" onClick={onSetup}>
+                  Set up
+                </Button>
+              )}
+            </SettingRow>
+          ))
+        )}
+        <SettingRow title="Install by hand" description="The steps, if you prefer to do it yourself.">
+          <Button size="sm" variant="ghost" onClick={() => setManual((v) => !v)}>
+            {manual ? 'Hide steps' : 'Show steps'}
+          </Button>
+        </SettingRow>
+      </Group>
+
+      {manual && (
       <Group title="Install the extension">
         <div className="space-y-4 px-4 py-4 text-[13px] text-fg-2">
           <Segmented
@@ -898,6 +938,7 @@ const Integrations: React.FC<SectionProps> = ({ s, set }) => {
           )}
         </div>
       </Group>
+      )}
 
       <Group title="What it adds">
         <ul className="space-y-2 px-4 py-4 text-[13px] text-fg-2">

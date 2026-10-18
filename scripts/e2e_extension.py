@@ -230,7 +230,7 @@ def wait_for(cond, timeout=12, step=0.25):
 
 
 def posts_since(n):
-    return POSTS[n:]
+    return [p for p in POSTS[n:] if p.get('path') == '/download']
 
 
 def run_browser(kind, site_base, download_dir):
@@ -242,6 +242,8 @@ def run_browser(kind, site_base, download_dir):
         return
     try:
         time.sleep(3)  # let the extension's background start
+        hello = wait_for(lambda: [p for p in POSTS if p.get('path') == '/hello'], timeout=10)
+        check(f'{kind}: the extension says hello, naming its browser', bool(hello) and hello[0].get('browser') == ('edge' if kind == 'edge' else kind) and bool(hello[0].get('version')), hello)
         driver.get(site_base + '/')
         time.sleep(1.5)
 

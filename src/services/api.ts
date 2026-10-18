@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  BrowserIntegration,
+  BrowserSetupOutcome,
   BrowserRequest,
   StreamProbe,
   DownloadQueue,
@@ -270,6 +272,7 @@ let mockSettings: AppSettings = {
   torrent_dht: true,
   torrent_upnp: false,
   browser_prompt: true,
+  browser_setup_done: false,
 };
 
 export const api = {
@@ -544,6 +547,31 @@ export const api = {
       ],
       unsupported: null,
     };
+  },
+
+  /** Browsers on this computer and whether Nexdrop's extension is working in each. */
+  async getBrowsers(): Promise<BrowserIntegration> {
+    if (isTauri()) {
+      return await invoke<BrowserIntegration>('get_browsers_cmd');
+    }
+    return {
+      browsers: [
+        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.3.0' },
+        { id: 'firefox', name: 'Mozilla Firefox', family: 'firefox', installed: true, connected: false, ever_connected: false },
+      ],
+      signed_firefox: false,
+      extension_dir: 'C:\\Program Files\\Nexdrop\\extension',
+    };
+  },
+
+  /** Opens what's needed in a browser to finish installing the extension. */
+  async setupBrowser(id: string): Promise<BrowserSetupOutcome> {
+    if (isTauri()) {
+      return await invoke<BrowserSetupOutcome>('setup_browser_cmd', { id });
+    }
+    return id === 'firefox'
+      ? { mode: 'temporary', folder: 'C:\\Program Files\\Nexdrop\\extension' }
+      : { mode: 'unpacked', folder: 'C:\\Program Files\\Nexdrop\\extension' };
   },
 
   async getQueues(): Promise<QueueInfo[]> {

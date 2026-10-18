@@ -566,3 +566,47 @@ pub async fn probe_stream_cmd(
 ) -> Result<crate::engine::stream::StreamProbe, String> {
     state.probe_stream(url.trim(), referer, user_agent).await
 }
+
+// ───────────────────────────── browser setup ─────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct BrowserIntegration {
+    pub browsers: Vec<crate::browsers::BrowserInfo>,
+    /// A Mozilla-signed Firefox add-on is bundled, so Firefox can install it with one click.
+    pub signed_firefox: bool,
+    pub extension_dir: Option<String>,
+}
+
+fn signed_xpi(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let mut candidates = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        candidates.push(res.join("extension-signed").join("nexdrop-firefox.xpi"));
+    }
+    candidates.push(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("extensions")
+            .join("signed")
+            .join("nexdrop-firefox.xpi"),
+    );
+    candidates.into_iter().find(|p| p.exists()).map(|p| p.canonicalize().unwrap_or(p))
+}
+
+/// Browsers on this computer and whether Nexdrop's extension is working in each.
+#[tauri::command]
+pub async fn get_browsers_cmd(app: tauri::AppHandle) -> Result<BrowserIntegration, String> {
+    Ok(BrowserIntegration {
+        browsers: crate::browsers::status(),
+        signed_firefox: signed_xpi(&app).is_some(),
+        extension_dir: extension_dir(&app).map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string()),
+    })
+}
+
+/// Opens what's needed in the browser to finish installing the extension.
+#[tauri::command]
+pub async fn setup_browser_cmd(app: tauri::AppHandle, id: String) -> Result<crate::browsers::SetupOutcome, String> {
+    let dir = extension_dir(&app).ok_or_else(|| "The browser extension folder was not found".to_string())?;
+    let xpi = signed_xpi(&app);
+    crate::browsers::setup(&id, &dir, xpi.as_deref())
+}

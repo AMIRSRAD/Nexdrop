@@ -150,6 +150,8 @@ export interface AppSettings {
   torrent_upnp: boolean;
   /** Links sent by the browser open the download window first. */
   browser_prompt: boolean;
+  /** The first-run "connect your browsers" window has been shown. */
+  browser_setup_done: boolean;
 }
 
 export interface UrlProbeResult {
@@ -270,4 +272,32 @@ export interface BrowserRequest {
   /** Private request headers (the browser's cookies for the link). */
   headers?: Record<string, string>;
   checksum?: string;
+}
+
+export interface BrowserInfo {
+  id: string;
+  name: string;
+  family: 'chromium' | 'firefox';
+  /** Found on this computer. */
+  installed: boolean;
+  /** The extension has checked in recently. */
+  connected: boolean;
+  /** The extension has checked in at some point. */
+  ever_connected: boolean;
+  last_seen_secs_ago?: number | null;
+  version?: string | null;
+}
+
+export interface BrowserIntegration {
+  browsers: BrowserInfo[];
+  /** A Mozilla-signed Firefox add-on is bundled (one-click install). */
+  signed_firefox: boolean;
+  extension_dir?: string | null;
+}
+
+export interface BrowserSetupOutcome {
+  /** unpacked: Chrome/Edge/Brave; xpi: signed Firefox add-on; temporary: unsigned Firefox add-on. */
+  mode: 'unpacked' | 'xpi' | 'temporary';
+  folder?: string | null;
+  file?: string | null;
 }

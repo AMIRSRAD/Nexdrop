@@ -161,6 +161,27 @@ async fn route(req: &Request, from_extension: bool, app: &AppHandle, mgr: &Arc<D
             }),
         ),
 
+        // The extension announcing itself (which browser, which version), so the app can tell
+        // the user whether their browser is connected.
+        ("POST", "/hello") => {
+            if !from_extension {
+                return Reply::error("403 Forbidden", "Only the Nexdrop browser extension may call this endpoint");
+            }
+            #[derive(Deserialize)]
+            struct Hello {
+                browser: String,
+                #[serde(default)]
+                version: String,
+            }
+            match serde_json::from_slice::<Hello>(&req.body) {
+                Ok(h) => {
+                    crate::browsers::note_hello(&h.browser, &h.version);
+                    Reply::json("200 OK", serde_json::json!({ "success": true }))
+                }
+                Err(e) => Reply::error("400 Bad Request", &format!("Invalid JSON: {e}")),
+            }
+        }
+
         ("POST", "/download") | ("POST", "/parse-page") => {
             if !from_extension {
                 return Reply::error("403 Forbidden", "Only the Nexdrop browser extension may call this endpoint");

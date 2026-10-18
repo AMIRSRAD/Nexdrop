@@ -52,7 +52,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../extensions/nexdrop-browser-extension": "extension"
+      "../extensions/nexdrop-browser-extension": "extension",
+      "../extensions/signed": "extension-signed"
     },
     "windows": {
       "webviewInstallMode": {
