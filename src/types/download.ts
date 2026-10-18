@@ -60,6 +60,8 @@ export interface DownloadTask {
   proxy_mode?: 'system' | 'direct' | 'custom';
   custom_proxy_url?: string;
   antivirus_status?: 'clean' | 'threat_detected' | 'scanning' | 'skipped';
+  /** Hash the user expects; checked automatically when the download finishes. */
+  expected_checksum?: string;
 }
 
 export interface SiteCredential {
@@ -122,6 +124,8 @@ export interface AddDownloadRequest {
   min_chunk_size?: number;
   proxy_mode?: 'system' | 'direct' | 'custom';
   custom_proxy_url?: string;
+  /** Extra request headers (e.g. Cookie / Authorization imported from cURL). */
+  custom_headers?: Record<string, string>;
 }
 
 export interface DownloadProgressEvent {

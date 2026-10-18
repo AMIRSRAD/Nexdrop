@@ -2,7 +2,10 @@ pub mod commands;
 pub mod db;
 pub mod engine;
 pub mod grabber_server;
+pub mod notify;
+pub mod power;
 pub mod process;
+pub mod secrets;
 pub mod tray;
 
 use std::sync::Arc;
@@ -41,14 +44,10 @@ pub fn run() {
             grabber_server::GrabberServer::start(app.handle().clone(), manager.clone());
 
             // Startup check: auto resume queued/unfinished downloads if enabled
-            manager.apply_runtime_settings();
-            manager.recover_interrupted();
+            manager.protect_stored_secrets();
             let mgr_clone = manager.clone();
             tauri::async_runtime::spawn(async move {
-                let settings = mgr_clone.get_settings();
-                if settings.auto_resume_on_launch {
-                    mgr_clone.process_queue().await;
-                }
+                mgr_clone.startup_resume().await;
             });
 
             // Start IDM-grade background scheduler loop
@@ -89,6 +88,7 @@ pub fn run() {
             export_checksum_file_cmd,
             parse_curl_command_cmd,
             grab_page_links_cmd,
+            cancel_completion_action_cmd,
         ])
         .run(tauri::generate_context!()) {
         let msg = format!("error while running tauri application: {e}");

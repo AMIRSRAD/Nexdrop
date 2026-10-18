@@ -164,6 +164,14 @@ pub struct DownloadTask {
     pub proxy_mode: Option<String>,
     pub custom_proxy_url: Option<String>,
     pub antivirus_status: Option<String>,
+    /// Hash the user expects the finished file to have (MD5 or SHA-256, hex).
+    /// Verified automatically when the download completes.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
+    /// Extra request headers (e.g. `Cookie`, `Authorization` from an imported
+    /// cURL command). Stored encrypted; sent only to the original host.
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

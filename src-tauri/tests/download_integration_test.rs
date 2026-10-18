@@ -40,9 +40,14 @@ struct TestServer {
     base: String,
     requests: Arc<AtomicUsize>,
     range_starts: Arc<Mutex<Vec<usize>>>,
+    /// The raw text of every request received (lower-cased), to inspect headers.
+    raw_requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestServer {
+    fn requests_text(&self) -> Vec<String> {
+        self.raw_requests.lock().unwrap().clone()
+    }
     fn url(&self, name: &str) -> String {
         format!("{}/{name}", self.base)
     }
@@ -60,7 +65,8 @@ async fn start_server(payload: Vec<u8>, mode: Mode) -> TestServer {
     let payload = Arc::new(payload);
     let requests = Arc::new(AtomicUsize::new(0));
     let range_starts = Arc::new(Mutex::new(Vec::new()));
-    let (req_counter, starts_log) = (requests.clone(), range_starts.clone());
+    let raw_requests = Arc::new(Mutex::new(Vec::new()));
+    let (req_counter, starts_log, raw_log) = (requests.clone(), range_starts.clone(), raw_requests.clone());
 
     tokio::spawn(async move {
         loop {
@@ -68,12 +74,14 @@ async fn start_server(payload: Vec<u8>, mode: Mode) -> TestServer {
             let payload = payload.clone();
             let n = req_counter.fetch_add(1, Ordering::SeqCst);
             let starts_log = starts_log.clone();
+            let raw_log = raw_log.clone();
 
             tokio::spawn(async move {
                 let mut buffer = [0u8; 4096];
                 let read = socket.read(&mut buffer).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let total = payload.len();
+                raw_log.lock().unwrap().push(request.to_lowercase());
 
                 let range = request
                     .lines()
@@ -138,7 +146,7 @@ async fn start_server(payload: Vec<u8>, mode: Mode) -> TestServer {
         }
     });
 
-    TestServer { base: format!("http://{addr}"), requests, range_starts }
+    TestServer { base: format!("http://{addr}"), requests, range_starts, raw_requests }
 }
 
 async fn trickle(socket: &mut tokio::net::TcpStream, body: &[u8], chunk: usize, delay_ms: u64) {
@@ -206,6 +214,8 @@ fn make_task(url: &str, dir: &Path, len: usize, name: &str, connections: usize) 
         proxy_mode: None,
         custom_proxy_url: None,
         antivirus_status: None,
+        expected_checksum: None,
+        custom_headers: Default::default(),
     }
 }
 
@@ -512,5 +522,100 @@ async fn non_resumable_download_streams_the_whole_file() {
     task.resumable = false;
     let done = run(&fast_engine(), task).await.unwrap();
     assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────── Phase 3: headers & safety ───────────────────────────
+
+/// Cookies/tokens go to the original host only. Mirrors are different servers and must never see them.
+#[tokio::test]
+async fn custom_headers_reach_the_original_host_but_never_mirrors() {
+    let payload = patterned(1_000_000);
+    let primary = start_server(payload.clone(), Mode::Normal).await;
+    let mirror = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("headers");
+
+    let mut task = make_task(&primary.url("h.bin"), &dir, payload.len(), "h.bin", 4);
+    task.mirrors = vec![mirror.url("h.bin")];
+    task.custom_headers.insert("Cookie".into(), "sid=abc123".into());
+    task.custom_headers.insert("X-Token".into(), "secret-token".into());
+    // The engine owns these; a user-supplied value must be ignored, not allowed to corrupt the transfer.
+    task.custom_headers.insert("Range".into(), "bytes=0-1".into());
+    task.custom_headers.insert("Accept-Encoding".into(), "gzip".into());
+
+    let (_tx, rx) = watch::channel(false);
+    let done = fast_engine()
+        .run_download_with(task, rx, vec![("Authorization".into(), "Bearer vault-token".into())], |_| {})
+        .await
+        .unwrap();
+    assert_file_equals(&dir, &done, &payload);
+
+    let primary_reqs = primary.requests_text();
+    assert!(!primary_reqs.is_empty());
+    for r in &primary_reqs {
+        assert!(r.contains("cookie: sid=abc123"), "primary request missing cookie:\n{r}");
+        assert!(r.contains("x-token: secret-token"));
+        assert!(r.contains("authorization: bearer vault-token"));
+    }
+
+    let mirror_reqs = mirror.requests_text();
+    assert!(!mirror_reqs.is_empty(), "the mirror should have served some ranges");
+    for r in &mirror_reqs {
+        assert!(!r.contains("sid=abc123") && !r.contains("secret-token") && !r.contains("vault-token"), "leaked to mirror:\n{r}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A task's own header wins over one from a saved login.
+#[tokio::test]
+async fn task_headers_override_saved_login_headers() {
+    let payload = patterned(200_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("prec");
+
+    let mut task = make_task(&server.url("p.bin"), &dir, payload.len(), "p.bin", 1);
+    task.custom_headers.insert("Authorization".into(), "Bearer mine".into());
+    let (_tx, rx) = watch::channel(false);
+    fast_engine()
+        .run_download_with(task, rx, vec![("Authorization".into(), "Bearer vault".into())], |_| {})
+        .await
+        .unwrap();
+
+    let reqs = server.requests_text();
+    assert!(reqs.iter().all(|r| r.contains("bearer mine") && !r.contains("bearer vault")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finishing a download never replaces a file that's already there.
+#[tokio::test]
+async fn finished_file_never_overwrites_an_existing_one() {
+    let payload = patterned(400_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("keep");
+    std::fs::write(dir.join("e.bin"), b"keep me").unwrap();
+
+    let task = make_task(&server.url("e.bin"), &dir, payload.len(), "e.bin", 2);
+    let done = run(&fast_engine(), task).await.unwrap();
+
+    assert_eq!(done.filename, "e (1).bin");
+    assert_eq!(std::fs::read(dir.join("e.bin")).unwrap(), b"keep me", "the existing file was clobbered");
+    assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same guarantee for servers without range support.
+#[tokio::test]
+async fn single_stream_download_never_overwrites_an_existing_file_either() {
+    let payload = patterned(150_000);
+    let server = start_server(payload.clone(), Mode::IgnoreRange).await;
+    let dir = temp_dir("keep1");
+    std::fs::write(dir.join("s.bin"), b"keep me").unwrap();
+
+    let mut task = make_task(&server.url("s.bin"), &dir, payload.len(), "s.bin", 1);
+    task.resumable = false;
+    let done = run(&fast_engine(), task).await.unwrap();
+
+    assert_eq!(done.filename, "s (1).bin");
+    assert_eq!(std::fs::read(dir.join("s.bin")).unwrap(), b"keep me");
     let _ = std::fs::remove_dir_all(&dir);
 }

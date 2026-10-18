@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod checksum;
 pub mod client;
 pub mod downloader;
@@ -6,6 +7,7 @@ pub mod manager;
 pub mod probe;
 pub mod ranges;
 pub mod scheduler;
+pub mod security;
 pub mod segment;
 pub mod speed;
 

@@ -228,9 +228,25 @@ const Integrity: React.FC<{ task: DownloadTask }> = ({ task }) => {
     );
   }
 
+  const wanted = task.expected_checksum?.toLowerCase();
+  const expectedMatches = wanted
+    ? wanted === task.checksum_sha256?.toLowerCase() || wanted === task.checksum_md5?.toLowerCase()
+    : undefined;
+
   return (
     <div className="grid grid-cols-2 gap-6">
       <div className="space-y-3">
+        {wanted && (
+          <div
+            className={cn(
+              'flex items-start gap-2 rounded-lg px-3 py-2 text-[12.5px]',
+              expectedMatches ? 'bg-success/12 text-success' : 'bg-danger/12 text-danger',
+            )}
+          >
+            {expectedMatches ? <ShieldCheck size={15} className="mt-px shrink-0" /> : <ShieldAlert size={15} className="mt-px shrink-0" />}
+            <span>{expectedMatches ? 'Verified: matches the hash you provided.' : 'Does not match the hash you provided.'}</span>
+          </div>
+        )}
         <HashRow label="SHA-256" value={task.checksum_sha256} />
         <HashRow label="MD5" value={task.checksum_md5} />
         {task.checksum_sha256 && (

@@ -36,6 +36,9 @@ pub struct GrabRequest {
     #[serde(default)]
     pub destination_path: Option<String>,
     pub connections: Option<usize>,
+    /// Optional hash the page published for the file (MD5 or SHA-256).
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -199,7 +202,7 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         user_agent: grab.user_agent,
         referer: grab.referer,
         custom_headers: None,
-        expected_checksum: None,
+        expected_checksum: grab.expected_checksum,
         mirrors: None,
         min_chunk_size: None,
         proxy_mode: None,
