@@ -146,6 +146,8 @@ def main():
         check('install: silent install succeeds', r.returncode == 0 and os.path.exists(EXE), r.returncode)
         ext_manifest = glob.glob(os.path.join(INSTALL_DIR, '**', 'manifest.json'), recursive=True)
         check('install: browser extension is bundled', any('extension' in p for p in ext_manifest), ext_manifest)
+        signed = glob.glob(os.path.join(INSTALL_DIR, '**', 'nexdrop-firefox.xpi'), recursive=True)
+        check('install: Mozilla-signed Firefox add-on is bundled', bool(signed), signed)
         entry = uninstall_entry()
         check('install: listed in Apps & features with an uninstaller', bool(entry) and os.path.exists(os.path.join(INSTALL_DIR, 'uninstall.exe')), entry)
         start_menu = glob.glob(os.path.join(os.environ['APPDATA'], 'Microsoft', 'Windows', 'Start Menu', 'Programs', '**', 'Nexdrop*.lnk'), recursive=True)
