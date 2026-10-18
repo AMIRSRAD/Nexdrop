@@ -1,297 +1,20 @@
-use std::sync::Arc;
+//! Integration tests for the download engine, run against a local mock server
+//! whose behaviour (failures, resets, slow connections...) is configurable.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use nexdrop_lib::db::models::{DownloadSegment, DownloadStatus, DownloadTask, FileCategory};
 use nexdrop_lib::engine::downloader::DownloadEngine;
+use nexdrop_lib::engine::ranges::{save_map, DoneMap};
 
-/// Helper function to start a local mock HTTP server that supports Range requests
-async fn start_mock_range_server(payload: Vec<u8>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let payload = Arc::new(payload);
-
-    tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(_) => break,
-            };
-
-            let payload_clone = payload.clone();
-            tokio::spawn(async move {
-                let mut buffer = [0u8; 2048];
-                let n = socket.read(&mut buffer).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..n]);
-
-                let total_len = payload_clone.len();
-
-                // Check for Range header
-                if let Some(range_line) = request.lines().find(|l| l.to_lowercase().starts_with("range:")) {
-                    // Range: bytes=START-END
-                    if let Some(range_val) = range_line.split('=').nth(1) {
-                        let parts: Vec<&str> = range_val.split('-').collect();
-                        let start: usize = parts[0].trim().parse().unwrap_or(0);
-                        let end: usize = if parts.len() > 1 && !parts[1].trim().is_empty() {
-                            parts[1].trim().parse().unwrap_or(total_len - 1)
-                        } else {
-                            total_len - 1
-                        };
-
-                        let end = end.min(total_len - 1);
-                        let chunk = &payload_clone[start..=end];
-                        let chunk_len = chunk.len();
-
-                        let response_headers = format!(
-                            "HTTP/1.1 206 Partial Content\r\n\
-                             Content-Range: bytes {}-{}/{}\r\n\
-                             Content-Length: {}\r\n\
-                             Accept-Ranges: bytes\r\n\
-                             Content-Type: application/octet-stream\r\n\
-                             Connection: close\r\n\r\n",
-                            start, end, total_len, chunk_len
-                        );
-
-                        let _ = socket.write_all(response_headers.as_bytes()).await;
-                        let _ = socket.write_all(chunk).await;
-                        let _ = socket.flush().await;
-                        return;
-                    }
-                }
-
-                // Standard 200 response
-                let response_headers = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Length: {}\r\n\
-                     Accept-Ranges: bytes\r\n\
-                     Content-Type: application/octet-stream\r\n\
-                     Connection: close\r\n\r\n",
-                    total_len
-                );
-                let _ = socket.write_all(response_headers.as_bytes()).await;
-                let _ = socket.write_all(&payload_clone).await;
-                let _ = socket.flush().await;
-            });
-        }
-    });
-
-    format!("http://{}", addr)
-}
-
-#[tokio::test]
-async fn test_concurrent_segmented_download_and_merge() {
-    // 1. Create a 1MB payload of distinct pseudo-random bytes
-    let mut payload = vec![0u8; 1024 * 1024];
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b = ((i * 31 + 17) % 256) as u8;
-    }
-
-    let server_url = start_mock_range_server(payload.clone()).await;
-
-    // 2. Temp directory for test
-    let temp_dir = std::env::temp_dir().join(format!("nexdrop_test_{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-
-    let task = DownloadTask {
-        id: "test-integration-1".to_string(),
-        url: format!("{}/testfile.dat", server_url),
-        final_url: Some(format!("{}/testfile.dat", server_url)),
-        filename: "testfile.dat".to_string(),
-        destination_path: temp_dir.to_string_lossy().to_string(),
-        temp_path: temp_dir.join("testfile.dat.nexpart").to_string_lossy().to_string(),
-        total_bytes: payload.len() as i64,
-        downloaded_bytes: 0,
-        status: DownloadStatus::Downloading,
-        resumable: true,
-        etag: None,
-        last_modified: None,
-        mime_type: Some("application/octet-stream".to_string()),
-        category: FileCategory::Other,
-        connections: 4,
-        speed_limit: 0,
-        priority: 0,
-        speed_bps: 0,
-        eta_seconds: None,
-        segments: vec![
-            DownloadSegment {
-                segment_index: 0,
-                start_byte: 0,
-                end_byte: 262143,
-                downloaded_bytes: 0,
-                total_bytes: 262144,
-                status: "pending".to_string(),
-            },
-            DownloadSegment {
-                segment_index: 1,
-                start_byte: 262144,
-                end_byte: 524287,
-                downloaded_bytes: 0,
-                total_bytes: 262144,
-                status: "pending".to_string(),
-            },
-            DownloadSegment {
-                segment_index: 2,
-                start_byte: 524288,
-                end_byte: 786431,
-                downloaded_bytes: 0,
-                total_bytes: 262144,
-                status: "pending".to_string(),
-            },
-            DownloadSegment {
-                segment_index: 3,
-                start_byte: 786432,
-                end_byte: 1048575,
-                downloaded_bytes: 0,
-                total_bytes: 262144,
-                status: "pending".to_string(),
-            },
-        ],
-        created_at: 0,
-        updated_at: 0,
-        completed_at: None,
-        error_message: None,
-        scheduled_time: None,
-        checksum_sha256: None,
-        checksum_md5: None,
-        user_agent: None,
-        referer: None,
-        mirrors: vec![],
-        min_chunk_size: 1024 * 1024,
-        proxy_mode: None,
-        custom_proxy_url: None,
-        antivirus_status: None,
-    };
-
-    let engine = DownloadEngine::new();
-    let (_pause_tx, pause_rx) = watch::channel(false);
-
-    let result = engine
-        .run_download(task, pause_rx, |_| {})
-        .await
-        .expect("Segmented download should succeed");
-
-    assert_eq!(result.status, DownloadStatus::Completed);
-    assert_eq!(result.downloaded_bytes, payload.len() as i64);
-
-    // 3. Verify downloaded file on disk
-    let downloaded_file_path = temp_dir.join(&result.filename);
-    assert!(downloaded_file_path.exists(), "Downloaded file must exist on disk");
-
-    let downloaded_content = tokio::fs::read(&downloaded_file_path).await.unwrap();
-    assert_eq!(
-        downloaded_content.len(),
-        payload.len(),
-        "Merged file length must match payload length"
-    );
-
-    // Verify byte-for-byte fidelity across all 4 merged segments
-    assert_eq!(
-        downloaded_content, payload,
-        "Downloaded file bytes must exactly match server payload"
-    );
-
-    // Clean up
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-}
-
-#[tokio::test]
-async fn test_pause_and_resume_segmented_download() {
-    let mut payload = vec![0u8; 1024 * 1024];
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b = ((i * 13 + 5) % 256) as u8;
-    }
-
-    let server_url = start_mock_range_server(payload.clone()).await;
-    let temp_dir = std::env::temp_dir().join(format!("nexdrop_test_pause_{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-
-    let task = DownloadTask {
-        id: "test-pause-resume".to_string(),
-        url: format!("{}/pause_test.dat", server_url),
-        final_url: Some(format!("{}/pause_test.dat", server_url)),
-        filename: "pause_test.dat".to_string(),
-        destination_path: temp_dir.to_string_lossy().to_string(),
-        temp_path: temp_dir.join("pause_test.dat.nexpart").to_string_lossy().to_string(),
-        total_bytes: payload.len() as i64,
-        downloaded_bytes: 0,
-        status: DownloadStatus::Downloading,
-        resumable: true,
-        etag: None,
-        last_modified: None,
-        mime_type: Some("application/octet-stream".to_string()),
-        category: FileCategory::Other,
-        connections: 2,
-        speed_limit: 0,
-        priority: 0,
-        speed_bps: 0,
-        eta_seconds: None,
-        segments: vec![
-            DownloadSegment {
-                segment_index: 0,
-                start_byte: 0,
-                end_byte: 524287,
-                downloaded_bytes: 0,
-                total_bytes: 524288,
-                status: "pending".to_string(),
-            },
-            DownloadSegment {
-                segment_index: 1,
-                start_byte: 524288,
-                end_byte: 1048575,
-                downloaded_bytes: 0,
-                total_bytes: 524288,
-                status: "pending".to_string(),
-            },
-        ],
-        created_at: 0,
-        updated_at: 0,
-        completed_at: None,
-        error_message: None,
-        scheduled_time: None,
-        checksum_sha256: None,
-        checksum_md5: None,
-        user_agent: None,
-        referer: None,
-        mirrors: vec![],
-        min_chunk_size: 1024 * 1024,
-        proxy_mode: None,
-        custom_proxy_url: None,
-        antivirus_status: None,
-    };
-
-    let engine = DownloadEngine::new();
-    let (pause_tx, pause_rx) = watch::channel(false);
-
-    // Trigger pause after 20ms
-    let p_tx = pause_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        let _ = p_tx.send(true);
-    });
-
-    let paused_result = engine.run_download(task, pause_rx, |_| {}).await;
-
-    // Paused result should be returned
-    if let Ok(paused_task) = paused_result {
-        if paused_task.status == DownloadStatus::Paused {
-            // Resume with a fresh unpaused channel
-            let (_new_tx, new_rx) = watch::channel(false);
-            let resume_result = engine.run_download(paused_task, new_rx, |_| {}).await.unwrap();
-
-            assert_eq!(resume_result.status, DownloadStatus::Completed);
-            let downloaded_file = temp_dir.join(&resume_result.filename);
-            assert!(downloaded_file.exists());
-            let content = tokio::fs::read(&downloaded_file).await.unwrap();
-            assert_eq!(content, payload);
-        }
-    }
-
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-}
-
-
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Phase 1 regression tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ───────────────────────────── mock server ─────────────────────────────
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -299,83 +22,147 @@ enum Mode {
     Normal,
     /// Ignores Range and always answers 200 with the whole file.
     IgnoreRange,
-    /// Answers correctly but closes the connection after half of each body.
-    CutShort,
-    /// Answers correctly but trickles the body out slowly.
+    /// The first `n` requests get this HTTP status; later ones are normal.
+    FailFirst(usize, u16),
+    /// The first `n` responses are cut off halfway; later ones are normal.
+    CutFirst(usize),
+    /// Promises a body, sends none, and hangs up: a connection that never makes progress.
+    CutAlways,
+    /// Requests for a range that starts at 0 trickle slowly; all others are fast.
+    SlowFirstRange,
+    /// Every response trickles out slowly.
     Slow { chunk: usize, delay_ms: u64 },
+    /// Always 404.
+    NotFound,
 }
 
-async fn start_server(payload: Vec<u8>, mode: Mode) -> String {
+struct TestServer {
+    base: String,
+    requests: Arc<AtomicUsize>,
+    range_starts: Arc<Mutex<Vec<usize>>>,
+}
+
+impl TestServer {
+    fn url(&self, name: &str) -> String {
+        format!("{}/{name}", self.base)
+    }
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+    fn min_range_start(&self) -> usize {
+        self.range_starts.lock().unwrap().iter().copied().min().unwrap_or(usize::MAX)
+    }
+}
+
+async fn start_server(payload: Vec<u8>, mode: Mode) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let payload = Arc::new(payload);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let range_starts = Arc::new(Mutex::new(Vec::new()));
+    let (req_counter, starts_log) = (requests.clone(), range_starts.clone());
 
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else { break };
             let payload = payload.clone();
+            let n = req_counter.fetch_add(1, Ordering::SeqCst);
+            let starts_log = starts_log.clone();
+
             tokio::spawn(async move {
                 let mut buffer = [0u8; 4096];
-                let n = socket.read(&mut buffer).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let total = payload.len();
 
                 let range = request
                     .lines()
                     .find(|l| l.to_lowercase().starts_with("range:"))
                     .and_then(|l| l.split('=').nth(1).map(|v| v.to_string()));
-
-                if let (Some(range), false) = (range, matches!(mode, Mode::IgnoreRange)) {
-                    let mut it = range.trim().split('-');
-                    let start: usize = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-                    let end: usize = it
-                        .next()
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(total - 1)
-                        .min(total - 1);
-                    let body = &payload[start..=end];
-                    let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    match mode {
-                        Mode::CutShort => {
-                            let _ = socket.write_all(&body[..body.len() / 2]).await;
-                        }
-                        Mode::Slow { chunk, delay_ms } => {
-                            for piece in body.chunks(chunk) {
-                                if socket.write_all(piece).await.is_err() {
-                                    return;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            }
-                        }
-                        _ => {
-                            let _ = socket.write_all(body).await;
-                        }
+                let (start, end) = match &range {
+                    Some(r) => {
+                        let mut it = r.trim().split('-');
+                        let s: usize = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                        let e: usize = it
+                            .next()
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(total - 1)
+                            .min(total - 1);
+                        (s, e)
                     }
-                } else {
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
-                    );
+                    None => (0, total - 1),
+                };
+                if range.is_some() {
+                    starts_log.lock().unwrap().push(start);
+                }
+
+                // Error responses
+                let status_only = match mode {
+                    Mode::NotFound => Some(404u16),
+                    Mode::FailFirst(k, status) if n < k => Some(status),
+                    _ => None,
+                };
+                if let Some(status) = status_only {
+                    let head = format!("HTTP/1.1 {status} X\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    return;
+                }
+
+                if matches!(mode, Mode::IgnoreRange) || range.is_none() {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n");
                     let _ = socket.write_all(head.as_bytes()).await;
                     let _ = socket.write_all(&payload).await;
+                    return;
+                }
+
+                let body = &payload[start..=end];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+
+                match mode {
+                    Mode::CutAlways => {}
+                    Mode::CutFirst(k) if n < k => {
+                        let _ = socket.write_all(&body[..body.len() / 2]).await;
+                    }
+                    Mode::Slow { chunk, delay_ms } => trickle(&mut socket, body, chunk, delay_ms).await,
+                    Mode::SlowFirstRange if start == 0 => trickle(&mut socket, body, 16 * 1024, 20).await,
+                    _ => {
+                        let _ = socket.write_all(body).await;
+                    }
                 }
                 let _ = socket.flush().await;
             });
         }
     });
 
-    format!("http://{addr}")
+    TestServer { base: format!("http://{addr}"), requests, range_starts }
 }
+
+async fn trickle(socket: &mut tokio::net::TcpStream, body: &[u8], chunk: usize, delay_ms: u64) {
+    for piece in body.chunks(chunk) {
+        if socket.write_all(piece).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+// ───────────────────────────── test helpers ─────────────────────────────
 
 fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
 }
 
-fn two_segment_task(url: &str, dir: &std::path::Path, len: usize, name: &str) -> DownloadTask {
-    let half = len / 2;
+fn temp_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("nexdrop_{tag}_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn make_task(url: &str, dir: &Path, len: usize, name: &str, connections: usize) -> DownloadTask {
     DownloadTask {
         id: format!("t-{name}"),
         url: url.to_string(),
@@ -391,15 +178,19 @@ fn two_segment_task(url: &str, dir: &std::path::Path, len: usize, name: &str) ->
         last_modified: None,
         mime_type: None,
         category: FileCategory::Other,
-        connections: 2,
+        connections,
         speed_limit: 0,
         priority: 0,
         speed_bps: 0,
         eta_seconds: None,
-        segments: vec![
-            DownloadSegment { segment_index: 0, start_byte: 0, end_byte: (half - 1) as u64, downloaded_bytes: 0, total_bytes: half as u64, status: "pending".into() },
-            DownloadSegment { segment_index: 1, start_byte: half as u64, end_byte: (len - 1) as u64, downloaded_bytes: 0, total_bytes: (len - half) as u64, status: "pending".into() },
-        ],
+        segments: vec![DownloadSegment {
+            segment_index: 0,
+            start_byte: 0,
+            end_byte: (len - 1) as u64,
+            downloaded_bytes: 0,
+            total_bytes: len as u64,
+            status: "pending".into(),
+        }],
         created_at: 0,
         updated_at: 0,
         completed_at: None,
@@ -410,139 +201,316 @@ fn two_segment_task(url: &str, dir: &std::path::Path, len: usize, name: &str) ->
         user_agent: None,
         referer: None,
         mirrors: vec![],
-        min_chunk_size: 1024 * 1024,
+        // Small so that modest test files still split into several ranges.
+        min_chunk_size: 64 * 1024,
         proxy_mode: None,
         custom_proxy_url: None,
         antivirus_status: None,
     }
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("nexdrop_{tag}_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn fast_engine() -> DownloadEngine {
+    DownloadEngine::new().with_retry_base(Duration::from_millis(5))
 }
 
-/// The database may be stale (it used to store segment progress only at the very
-/// end), but the bytes on disk are what count. Resuming must continue from the
-/// real file length instead of appending duplicate data.
-#[tokio::test]
-async fn resume_trusts_disk_not_stale_progress() {
-    let payload = patterned(1_000_000);
-    let url = format!("{}/stale.bin", start_server(payload.clone(), Mode::Normal).await);
-    let dir = temp_dir("stale");
-
-    // Segment 0 already has its first 123_457 bytes on disk, but the task says 0.
-    std::fs::write(dir.join("stale.bin.nexpart_seg_0"), &payload[..123_457]).unwrap();
-    // Segment 1 has garbage beyond its length (e.g. from a previous bad run).
-    let mut over = payload[500_000..].to_vec();
-    over.extend_from_slice(&[0xAA; 4096]);
-    std::fs::write(dir.join("stale.bin.nexpart_seg_1"), &over).unwrap();
-
-    let task = two_segment_task(&url, &dir, payload.len(), "stale.bin");
+async fn run(engine: &DownloadEngine, task: DownloadTask) -> Result<DownloadTask, String> {
     let (_tx, rx) = watch::channel(false);
-    let done = DownloadEngine::new().run_download(task, rx, |_| {}).await.unwrap();
+    engine.run_download(task, rx, |_| {}).await
+}
+
+fn assert_file_equals(dir: &Path, task: &DownloadTask, payload: &[u8]) {
+    let out = std::fs::read(dir.join(&task.filename)).expect("final file must exist");
+    assert_eq!(out.len(), payload.len(), "final size differs");
+    assert!(out == payload, "final contents differ from the original");
+}
+
+fn leftovers(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".nexpart") || n.contains(".nexmerge"))
+        .collect()
+}
+
+// ───────────────────────────────── tests ─────────────────────────────────
+
+#[tokio::test]
+async fn segmented_download_is_byte_exact_and_leaves_no_temp_files() {
+    let payload = patterned(3 * 1024 * 1024 + 123);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("exact");
+
+    let task = make_task(&server.url("exact.bin"), &dir, payload.len(), "exact.bin", 8);
+    let done = run(&fast_engine(), task).await.unwrap();
 
     assert_eq!(done.status, DownloadStatus::Completed);
-    let out = std::fs::read(dir.join(&done.filename)).unwrap();
-    assert_eq!(out.len(), payload.len());
-    assert!(out == payload, "resumed file differs from the original");
-    assert!(!dir.join("stale.bin.nexpart_seg_0").exists(), "segment files should be cleaned up");
+    assert_eq!(done.downloaded_bytes, payload.len() as i64);
+    assert_file_equals(&dir, &done, &payload);
+    assert!(leftovers(&dir).is_empty(), "temp files left behind: {:?}", leftovers(&dir));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A server that ignores `Range` and returns 200 must not get its whole body
-/// written into every segment.
+#[tokio::test]
+async fn single_connection_ranged_download_works() {
+    let payload = patterned(500_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("one");
+
+    let task = make_task(&server.url("one.bin"), &dir, payload.len(), "one.bin", 1);
+    let done = run(&fast_engine(), task).await.unwrap();
+    assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Resume skips what the progress map says is already on disk.
+#[tokio::test]
+async fn resume_continues_from_the_saved_progress_map() {
+    let payload = patterned(1_000_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("resume");
+
+    // A previous run got the first 400_000 bytes down before stopping.
+    let mut partial = vec![0u8; payload.len()];
+    partial[..400_000].copy_from_slice(&payload[..400_000]);
+    std::fs::write(dir.join("resume.bin.nexpart"), &partial).unwrap();
+    save_map(&dir.join("resume.bin.nexpart.map"), payload.len() as u64, &DoneMap::from_ranges(vec![(0, 400_000)])).unwrap();
+
+    let task = make_task(&server.url("resume.bin"), &dir, payload.len(), "resume.bin", 4);
+    let done = run(&fast_engine(), task).await.unwrap();
+
+    assert_file_equals(&dir, &done, &payload);
+    assert!(
+        server.min_range_start() >= 400_000,
+        "re-downloaded data that was already on disk (first requested byte: {})",
+        server.min_range_start()
+    );
+    assert!(leftovers(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A progress map written for a different-sized file must not be trusted.
+#[tokio::test]
+async fn progress_map_for_a_different_file_is_ignored() {
+    let payload = patterned(600_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("badmap");
+
+    std::fs::write(dir.join("m.bin.nexpart"), vec![0xEEu8; 700_000]).unwrap();
+    save_map(&dir.join("m.bin.nexpart.map"), 700_000, &DoneMap::from_ranges(vec![(0, 700_000)])).unwrap();
+
+    let task = make_task(&server.url("m.bin"), &dir, payload.len(), "m.bin", 3);
+    let done = run(&fast_engine(), task).await.unwrap();
+    assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that ignores `Range` must not get its whole body written into every part.
 #[tokio::test]
 async fn server_ignoring_range_is_rejected_not_corrupted() {
     let payload = patterned(600_000);
-    let url = format!("{}/norange.bin", start_server(payload, Mode::IgnoreRange).await);
+    let server = start_server(payload, Mode::IgnoreRange).await;
     let dir = temp_dir("norange");
 
-    let task = two_segment_task(&url, &dir, 600_000, "norange.bin");
-    let (_tx, rx) = watch::channel(false);
-    let res = DownloadEngine::new().run_download(task, rx, |_| {}).await;
-
-    let err = res.expect_err("must fail rather than assemble a bad file");
+    let task = make_task(&server.url("norange.bin"), &dir, 600_000, "norange.bin", 4);
+    let err = run(&fast_engine(), task).await.expect_err("must fail, not assemble a bad file");
     assert!(err.to_lowercase().contains("range"), "unexpected error: {err}");
-    assert!(!dir.join("norange.bin").exists(), "no final file may be produced");
+    assert!(!dir.join("norange.bin").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A connection that closes early must be a failure, never a "completed" file.
+/// Transient server errors (503) are retried instead of failing the download.
 #[tokio::test]
-async fn truncated_response_is_a_failure() {
-    let payload = patterned(600_000);
-    let url = format!("{}/short.bin", start_server(payload, Mode::CutShort).await);
-    let dir = temp_dir("short");
+async fn transient_server_errors_are_retried() {
+    let payload = patterned(800_000);
+    let server = start_server(payload.clone(), Mode::FailFirst(3, 503)).await;
+    let dir = temp_dir("flaky");
 
-    let task = two_segment_task(&url, &dir, 600_000, "short.bin");
-    let (_tx, rx) = watch::channel(false);
-    let res = DownloadEngine::new().run_download(task, rx, |_| {}).await;
-
-    assert!(res.is_err(), "a short body must not complete");
-    assert!(!dir.join("short.bin").exists());
+    let task = make_task(&server.url("flaky.bin"), &dir, payload.len(), "flaky.bin", 4);
+    let done = run(&fast_engine(), task).await.unwrap();
+    assert_file_equals(&dir, &done, &payload);
+    assert!(server.request_count() > 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Deterministic pause/resume: the server trickles data so the pause really
-/// lands mid-transfer, then the resumed run must produce a byte-exact file.
+/// Connections that drop mid-body resume from where they stopped.
+#[tokio::test]
+async fn dropped_connections_resume_mid_range() {
+    let payload = patterned(1_200_000);
+    let server = start_server(payload.clone(), Mode::CutFirst(5)).await;
+    let dir = temp_dir("reset");
+
+    let task = make_task(&server.url("reset.bin"), &dir, payload.len(), "reset.bin", 4);
+    let done = run(&fast_engine(), task).await.unwrap();
+    assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A connection that never delivers anything eventually fails with a clear reason.
+#[tokio::test]
+async fn hopeless_connection_gives_up_with_a_clear_error() {
+    let payload = patterned(300_000);
+    let server = start_server(payload, Mode::CutAlways).await;
+    let dir = temp_dir("giveup");
+
+    let task = make_task(&server.url("g.bin"), &dir, 300_000, "g.bin", 1);
+    let err = run(&fast_engine(), task).await.expect_err("should give up");
+    assert!(err.contains("gave up"), "unexpected error: {err}");
+    assert!(!dir.join("g.bin").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Permanent errors (404) fail immediately instead of burning through retries.
+#[tokio::test]
+async fn not_found_fails_fast_without_retrying() {
+    let server = start_server(patterned(100_000), Mode::NotFound).await;
+    let dir = temp_dir("404");
+
+    let task = make_task(&server.url("x.bin"), &dir, 100_000, "x.bin", 2);
+    let started = Instant::now();
+    let err = run(&DownloadEngine::new(), task).await.expect_err("404 must fail");
+    assert!(err.contains("404"), "unexpected error: {err}");
+    assert!(started.elapsed() < Duration::from_secs(2), "should not have backed off and retried");
+    assert!(server.request_count() <= 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// When one range is slow, idle connections take over the tail of it.
+#[tokio::test]
+async fn idle_connections_steal_work_from_a_slow_range() {
+    let payload = patterned(3 * 1024 * 1024);
+    let server = start_server(payload.clone(), Mode::SlowFirstRange).await;
+    let dir = temp_dir("steal");
+
+    let task = make_task(&server.url("steal.bin"), &dir, payload.len(), "steal.bin", 4);
+    let done = run(&fast_engine(), task).await.unwrap();
+
+    assert_file_equals(&dir, &done, &payload);
+    assert!(
+        server.request_count() > 4,
+        "expected extra requests from work stealing, saw {}",
+        server.request_count()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pausing lands mid-transfer, keeps what arrived, and a later run finishes byte-exact.
 #[tokio::test]
 async fn pause_mid_transfer_then_resume_is_byte_exact() {
     let payload = patterned(1_000_000);
-    let url = format!(
-        "{}/slow.bin",
-        start_server(payload.clone(), Mode::Slow { chunk: 16 * 1024, delay_ms: 15 }).await
-    );
-    let dir = temp_dir("slow");
+    let server = start_server(payload.clone(), Mode::Slow { chunk: 16 * 1024, delay_ms: 15 }).await;
+    let dir = temp_dir("pause");
 
-    let task = two_segment_task(&url, &dir, payload.len(), "slow.bin");
-    let engine = DownloadEngine::new();
+    let task = make_task(&server.url("p.bin"), &dir, payload.len(), "p.bin", 2);
+    let engine = fast_engine();
     let (pause_tx, pause_rx) = watch::channel(false);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let _ = pause_tx.send(true);
     });
 
     let paused = engine.run_download(task, pause_rx, |_| {}).await.unwrap();
-    assert_eq!(paused.status, DownloadStatus::Paused, "the transfer finished before the pause landed");
+    assert_eq!(paused.status, DownloadStatus::Paused, "finished before the pause landed");
     assert!(paused.downloaded_bytes > 0 && paused.downloaded_bytes < payload.len() as i64);
-    assert!(!dir.join("slow.bin").exists(), "a paused download must not produce a final file");
+    assert!(!dir.join("p.bin").exists(), "a paused download must not produce a final file");
+    assert!(dir.join("p.bin.nexpart.map").exists(), "progress must be saved for resume");
 
-    // Resume from what's on disk (progress numbers deliberately reset to zero).
     let mut resumed = paused;
     resumed.status = DownloadStatus::Downloading;
     resumed.downloaded_bytes = 0;
-    for seg in &mut resumed.segments {
-        seg.downloaded_bytes = 0;
-    }
-    let (_tx, rx) = watch::channel(false);
-    let done = engine.run_download(resumed, rx, |_| {}).await.unwrap();
-
+    let done = run(&engine, resumed).await.unwrap();
     assert_eq!(done.status, DownloadStatus::Completed);
-    let out = std::fs::read(dir.join(&done.filename)).unwrap();
-    assert!(out == payload, "file differs after pause + resume");
+    assert_file_equals(&dir, &done, &payload);
+    assert!(leftovers(&dir).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Single-connection downloads must restart cleanly (not append a second copy)
-/// when the server cannot honour the resume request.
+/// Pause must react immediately even while a speed limit is making connections wait.
 #[tokio::test]
-async fn single_stream_restarts_when_resume_is_refused() {
-    let payload = patterned(300_000);
-    let url = format!("{}/single.bin", start_server(payload.clone(), Mode::IgnoreRange).await);
-    let dir = temp_dir("single");
-    std::fs::write(dir.join("single.bin.nexpart"), &payload[..100_000]).unwrap();
+async fn pause_is_immediate_under_a_speed_limit() {
+    let payload = patterned(2_000_000);
+    let server = start_server(payload, Mode::Normal).await;
+    let dir = temp_dir("limitpause");
 
-    let mut task = two_segment_task(&url, &dir, payload.len(), "single.bin");
-    task.connections = 1;
-    task.segments.truncate(1);
-    let (_tx, rx) = watch::channel(false);
-    let done = DownloadEngine::new().run_download(task, rx, |_| {}).await.unwrap();
+    let mut task = make_task(&server.url("l.bin"), &dir, 2_000_000, "l.bin", 2);
+    task.speed_limit = 20_000; // 20 KB/s: the file would take minutes
+    let (pause_tx, pause_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = pause_tx.send(true);
+    });
 
-    let out = std::fs::read(dir.join(&done.filename)).unwrap();
-    assert_eq!(out.len(), payload.len(), "partial data must not be kept in front of a full body");
-    assert!(out == payload);
+    let started = Instant::now();
+    let paused = fast_engine().run_download(task, pause_rx, |_| {}).await.unwrap();
+    assert_eq!(paused.status, DownloadStatus::Paused);
+    assert!(started.elapsed() < Duration::from_secs(3), "pause took {:?}", started.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn per_download_speed_limit_is_enforced() {
+    let payload = patterned(300_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("limit");
+
+    let mut task = make_task(&server.url("lim.bin"), &dir, payload.len(), "lim.bin", 2);
+    task.speed_limit = 100_000; // 100 KB/s => ~2.7s for 300 KB (minus a small burst)
+    let started = Instant::now();
+    let done = run(&fast_engine(), task).await.unwrap();
+    let took = started.elapsed();
+
+    assert_file_equals(&dir, &done, &payload);
+    assert!(took > Duration::from_millis(1800), "finished too fast for the limit: {took:?}");
+    assert!(took < Duration::from_secs(10), "limit slowed things down far too much: {took:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn global_speed_limit_applies_to_every_download() {
+    let payload = patterned(300_000);
+    let server = start_server(payload.clone(), Mode::Normal).await;
+    let dir = temp_dir("global");
+
+    let engine = fast_engine();
+    engine.set_global_speed_limit(100_000);
+    let task = make_task(&server.url("g.bin"), &dir, payload.len(), "g.bin", 3);
+    let started = Instant::now();
+    let done = run(&engine, task).await.unwrap();
+
+    assert_file_equals(&dir, &done, &payload);
+    assert!(started.elapsed() > Duration::from_millis(1800));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mirror that 404s must not sink the download: its ranges fall back to the original.
+#[tokio::test]
+async fn broken_mirror_falls_back_to_the_original_url() {
+    let payload = patterned(1_000_000);
+    let primary = start_server(payload.clone(), Mode::Normal).await;
+    let bad_mirror = start_server(payload.clone(), Mode::NotFound).await;
+    let dir = temp_dir("mirror");
+
+    let mut task = make_task(&primary.url("m.bin"), &dir, payload.len(), "m.bin", 4);
+    task.mirrors = vec![bad_mirror.url("m.bin")];
+    let done = run(&fast_engine(), task).await.unwrap();
+
+    assert_file_equals(&dir, &done, &payload);
+    assert!(bad_mirror.request_count() > 0, "the mirror should have been tried");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Servers without range support get a plain single-stream download, even if
+/// a stale partial file is lying around.
+#[tokio::test]
+async fn non_resumable_download_streams_the_whole_file() {
+    let payload = patterned(300_000);
+    let server = start_server(payload.clone(), Mode::IgnoreRange).await;
+    let dir = temp_dir("single");
+    std::fs::write(dir.join("s.bin.nexpart"), &payload[..100_000]).unwrap();
+
+    let mut task = make_task(&server.url("s.bin"), &dir, payload.len(), "s.bin", 1);
+    task.resumable = false;
+    let done = run(&fast_engine(), task).await.unwrap();
+    assert_file_equals(&dir, &done, &payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}

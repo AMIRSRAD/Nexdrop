@@ -3,15 +3,12 @@ use tauri::State;
 
 use crate::db::models::{AddDownloadRequest, AppSettings, DownloadTask, SiteCredential, UrlProbeResult};
 use crate::engine::manager::DownloadManager;
-use crate::engine::probe::probe_url;
 
 pub type AppState = Arc<DownloadManager>;
 
 #[tauri::command]
 pub async fn probe_url_cmd(state: State<'_, AppState>, url: String) -> Result<UrlProbeResult, String> {
-    let client = crate::engine::create_http_client(std::time::Duration::from_secs(15));
-
-    let probe = probe_url(&client, &url).await?;
+    let probe = state.probe_with_settings(&url).await?;
     let settings = state.get_settings();
 
     Ok(UrlProbeResult {
@@ -69,7 +66,7 @@ pub async fn cancel_download_cmd(
     id: String,
     delete_file: bool,
 ) -> Result<(), String> {
-    state.cancel_download(&id, delete_file)
+    state.cancel_download(&id, delete_file).await
 }
 
 #[tauri::command]
@@ -78,7 +75,7 @@ pub async fn delete_download_cmd(
     id: String,
     delete_file: bool,
 ) -> Result<(), String> {
-    state.delete_download(&id, delete_file)
+    state.delete_download(&id, delete_file).await
 }
 
 #[tauri::command]

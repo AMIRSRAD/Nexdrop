@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{watch, Mutex as AsyncMutex};
@@ -14,7 +14,7 @@ use crate::db::models::{
 };
 use crate::db::Repository;
 use crate::engine::downloader::DownloadEngine;
-use crate::engine::probe::{probe_url, sanitize_filename};
+use crate::engine::probe::{probe_url, sanitize_filename, ProbeResult};
 use crate::engine::segment::{calculate_segments, calculate_segments_with_chunk_size};
 
 pub struct DownloadManager {
@@ -26,6 +26,8 @@ pub struct DownloadManager {
     active_controllers: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     /// Serialises queue scheduling so concurrent callers can't start a task twice.
     queue_lock: AsyncMutex<()>,
+    /// Recent probe results, so adding a link the dialog just probed costs no second round trip.
+    probe_cache: Mutex<HashMap<String, (Instant, ProbeResult)>>,
     app_handle: AppHandle,
 }
 
@@ -36,6 +38,7 @@ impl DownloadManager {
             engine: DownloadEngine::new(),
             active_controllers: Arc::new(Mutex::new(HashMap::new())),
             queue_lock: AsyncMutex::new(()),
+            probe_cache: Mutex::new(HashMap::new()),
             app_handle,
         }
     }
@@ -55,6 +58,7 @@ impl DownloadManager {
     pub fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         Repository::save_settings(&conn, settings).map_err(|e| e.to_string())?;
+        self.engine.set_global_speed_limit(settings.global_speed_limit);
         Ok(())
     }
 
@@ -73,17 +77,46 @@ impl DownloadManager {
         Repository::delete_site_credential(&conn, id).map_err(|e| e.to_string())
     }
 
+    /// Applies settings that take effect while the app runs (call once at startup).
+    pub fn apply_runtime_settings(&self) {
+        self.engine.set_global_speed_limit(self.get_settings().global_speed_limit);
+    }
+
+    /// Probes a link with the right proxy, reusing a result from the last minute if we have one.
+    pub async fn probe(
+        &self,
+        url: &str,
+        proxy_mode: Option<&str>,
+        custom_proxy: Option<&str>,
+    ) -> Result<ProbeResult, String> {
+        const TTL: Duration = Duration::from_secs(60);
+        let key = format!("{url}|{}|{}", proxy_mode.unwrap_or(""), custom_proxy.unwrap_or(""));
+        {
+            let mut cache = self.probe_cache.lock();
+            cache.retain(|_, (at, _)| at.elapsed() < TTL);
+            if let Some((_, hit)) = cache.get(&key) {
+                return Ok(hit.clone());
+            }
+        }
+        let client = self.engine.clients().probe(proxy_mode, custom_proxy);
+        let result = probe_url(&client, url).await?;
+        self.probe_cache.lock().insert(key, (Instant::now(), result.clone()));
+        Ok(result)
+    }
+
+    /// Probe for the "new download" dialog, using the proxy from settings.
+    pub async fn probe_with_settings(&self, url: &str) -> Result<ProbeResult, String> {
+        let settings = self.get_settings();
+        self.probe(url, Some(&settings.proxy_mode), settings.custom_proxy_url.as_deref()).await
+    }
+
     pub async fn add_download(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
         let settings = self.get_settings();
         let proxy_mode_to_use = req.proxy_mode.as_deref().unwrap_or(&settings.proxy_mode);
         let custom_proxy_to_use = req.custom_proxy_url.as_deref().or(settings.custom_proxy_url.as_deref());
-        let client = crate::engine::create_http_client_with_proxy(
-            std::time::Duration::from_secs(15),
-            Some(proxy_mode_to_use),
-            custom_proxy_to_use,
-        );
-
-        let probe = probe_url(&client, &req.url).await?;
+        let probe = self
+            .probe(&req.url, Some(proxy_mode_to_use), custom_proxy_to_use)
+            .await?;
 
         let filename = req
             .filename
@@ -157,8 +190,8 @@ impl DownloadManager {
             referer: req.referer,
             mirrors: req.mirrors.unwrap_or_default(),
             min_chunk_size,
-            proxy_mode: req.proxy_mode,
-            custom_proxy_url: req.custom_proxy_url,
+            proxy_mode: Some(proxy_mode_to_use.to_string()),
+            custom_proxy_url: custom_proxy_to_use.map(str::to_string),
             antivirus_status: None,
         };
 
@@ -281,7 +314,7 @@ impl DownloadManager {
                                 event.eta_seconds,
                                 now,
                             );
-                            let _ = Repository::save_segments(&conn, &event.id, &event.segments);
+                            let _ = Repository::replace_segments(&conn, &event.id, &event.segments);
                         }
                     });
                 })
@@ -294,7 +327,7 @@ impl DownloadManager {
                 Ok(task) if task.status == DownloadStatus::Paused => {
                     if let Ok(conn) = Repository::open_or_create(&db_path) {
                         let _ = Repository::update_downloaded_bytes(&conn, &task_id, task.downloaded_bytes);
-                        let _ = Repository::save_segments(&conn, &task_id, &task.segments);
+                        let _ = Repository::replace_segments(&conn, &task_id, &task.segments);
                     }
                 }
                 Ok(mut final_task) => {
@@ -402,20 +435,24 @@ impl DownloadManager {
         }
     }
 
-    pub fn cancel_download(&self, id: &str, delete_file: bool) -> Result<(), String> {
+    /// Waits (briefly) for a stopping run to release its files.
+    async fn wait_until_idle(&self, id: &str) {
+        for _ in 0..50 {
+            if !self.active_controllers.lock().contains_key(id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn cancel_download(&self, id: &str, delete_file: bool) -> Result<(), String> {
         let _ = self.pause_download(id);
+        self.wait_until_idle(id).await;
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         if let Ok(Some(task)) = Repository::get_download(&conn, id) {
             if delete_file {
-                let dest_dir = Path::new(&task.destination_path);
-                let part_file = dest_dir.join(format!("{}.nexpart", task.filename));
-                let _ = std::fs::remove_file(part_file);
-
-                for i in 0..task.connections {
-                    let seg_file = dest_dir.join(format!("{}.nexpart_seg_{}", task.filename, i));
-                    let _ = std::fs::remove_file(seg_file);
-                }
+                remove_partial_files(&task);
             }
 
             let now = chrono::Utc::now().timestamp();
@@ -430,22 +467,15 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub fn delete_download(&self, id: &str, delete_file: bool) -> Result<(), String> {
+    pub async fn delete_download(&self, id: &str, delete_file: bool) -> Result<(), String> {
         let _ = self.pause_download(id);
+        self.wait_until_idle(id).await;
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         if let Ok(Some(task)) = Repository::get_download(&conn, id) {
             if delete_file {
-                let final_path = Path::new(&task.destination_path).join(&task.filename);
-                let _ = std::fs::remove_file(final_path);
-
-                let part_file = Path::new(&task.destination_path).join(format!("{}.nexpart", task.filename));
-                let _ = std::fs::remove_file(part_file);
-
-                for i in 0..task.connections {
-                    let seg_file = Path::new(&task.destination_path).join(format!("{}.nexpart_seg_{}", task.filename, i));
-                    let _ = std::fs::remove_file(seg_file);
-                }
+                let _ = std::fs::remove_file(Path::new(&task.destination_path).join(&task.filename));
+                remove_partial_files(&task);
             }
         }
 
@@ -523,6 +553,18 @@ impl DownloadManager {
     pub fn get_active_task_ids(&self) -> Vec<String> {
         let active = self.active_controllers.lock();
         active.keys().cloned().collect()
+    }
+}
+
+/// Removes everything a partial download leaves behind: the preallocated file,
+/// its progress map, and the per-segment files older versions used.
+fn remove_partial_files(task: &DownloadTask) {
+    let dir = Path::new(&task.destination_path);
+    for suffix in ["nexpart", "nexpart.map", "nexpart.map.tmp", "nexmerge"] {
+        let _ = std::fs::remove_file(dir.join(format!("{}.{}", task.filename, suffix)));
+    }
+    for i in 0..32 {
+        let _ = std::fs::remove_file(dir.join(format!("{}.nexpart_seg_{}", task.filename, i)));
     }
 }
 

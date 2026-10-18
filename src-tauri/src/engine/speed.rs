@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 use tokio::time::sleep;
 
 pub struct SpeedCalculator {
@@ -63,36 +66,88 @@ impl SpeedCalculator {
     }
 }
 
-pub struct SpeedLimiter {
-    limit_bps: u64,
-    last_check: Instant,
-    bytes_in_period: u64,
+/// A token-bucket rate limiter that many tasks can share (one per download
+/// plus one global). `0` means unlimited.
+pub struct RateLimiter {
+    rate_bps: AtomicU64,
+    state: Mutex<BucketState>,
 }
 
-impl SpeedLimiter {
-    pub fn new(limit_bps: u64) -> Self {
+struct BucketState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(rate_bps: u64) -> Self {
         Self {
-            limit_bps,
-            last_check: Instant::now(),
-            bytes_in_period: 0,
+            rate_bps: AtomicU64::new(rate_bps),
+            state: Mutex::new(BucketState { tokens: 0.0, last: Instant::now() }),
         }
     }
 
-    pub async fn throttle(&mut self, bytes: usize) {
-        if self.limit_bps == 0 {
-            return;
-        }
+    pub fn set_rate(&self, rate_bps: u64) {
+        self.rate_bps.store(rate_bps, Ordering::Relaxed);
+    }
 
-        self.bytes_in_period += bytes as u64;
-        let elapsed = self.last_check.elapsed();
+    pub fn rate(&self) -> u64 {
+        self.rate_bps.load(Ordering::Relaxed)
+    }
 
-        if elapsed >= Duration::from_millis(500) {
-            let expected_time = Duration::from_secs_f64(self.bytes_in_period as f64 / self.limit_bps as f64);
-            if expected_time > elapsed {
-                sleep(expected_time - elapsed).await;
-            }
-            self.last_check = Instant::now();
-            self.bytes_in_period = 0;
+    /// How long the caller must wait before it may use `bytes` more bandwidth.
+    /// Spending ahead of the allowance is allowed (it becomes a wait), so a
+    /// chunk larger than one second's worth of tokens still gets through.
+    fn reserve(&self, bytes: u64) -> Duration {
+        let rate = self.rate() as f64;
+        if rate <= 0.0 {
+            return Duration::ZERO;
         }
+        let mut st = self.state.lock();
+        let now = Instant::now();
+        let elapsed = now.duration_since(st.last).as_secs_f64();
+        st.last = now;
+        // Allow at most a quarter second of burst.
+        st.tokens = (st.tokens + elapsed * rate).min(rate * 0.25);
+        st.tokens -= bytes as f64;
+        if st.tokens < 0.0 {
+            Duration::from_secs_f64(-st.tokens / rate)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    pub async fn acquire(&self, bytes: u64) {
+        let wait = self.reserve(bytes);
+        if !wait.is_zero() {
+            sleep(wait).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_never_waits() {
+        let l = RateLimiter::new(0);
+        assert_eq!(l.reserve(10_000_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn limited_rate_produces_proportional_waits() {
+        let l = RateLimiter::new(1_000_000); // 1 MB/s
+        // The first request is mostly "free" (burst), a big second one must wait ~1s.
+        let _ = l.reserve(100_000);
+        let wait = l.reserve(1_000_000);
+        assert!(wait > Duration::from_millis(800) && wait < Duration::from_millis(1200), "{wait:?}");
+    }
+
+    #[test]
+    fn rate_can_change_live() {
+        let l = RateLimiter::new(1000);
+        assert_eq!(l.rate(), 1000);
+        l.set_rate(0);
+        assert_eq!(l.reserve(1 << 30), Duration::ZERO);
     }
 }
