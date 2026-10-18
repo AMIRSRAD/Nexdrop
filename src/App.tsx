@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { CheckSquare, ClipboardPaste, Copy, Download, Link2, ListPlus, Magnet, Settings as SettingsIcon } from 'lucide-react';
 import { api, isTauri } from './services/api';
-import type { BrowserRequest } from './types/download';
+import type { BrowserRequest, GrabbedLink } from './types/download';
 import { QueuesContext, useQueues } from './hooks/useQueues';
 import { useBrowsers } from './hooks/useBrowsers';
 import { BrowserSetupDialog } from './components/dialogs/BrowserSetupDialog';
@@ -69,7 +69,14 @@ export default function App() {
 
   /* ── dialogs & views ─────────────────────────────── */
   const [addState, setAddState] = useState<{ open: boolean; text: string; request?: BrowserRequest }>({ open: false, text: '' });
-  const [multiState, setMultiState] = useState<{ open: boolean; tab: AddMultipleTab; text: string }>({ open: false, tab: 'paste', text: '' });
+  const [multiState, setMultiState] = useState<{
+    open: boolean;
+    tab: AddMultipleTab;
+    text: string;
+    links?: GrabbedLink[];
+    preselect?: 'all' | 'files';
+    request?: BrowserRequest;
+  }>({ open: false, tab: 'paste', text: '' });
   const [removeIds, setRemoveIds] = useState<string[]>([]);
   const [statsOpen, setStatsOpen] = useState(false);
   const [settingsView, setSettingsView] = useState<{ open: boolean; section: SettingsSection }>({ open: false, section: 'general' });
@@ -375,9 +382,27 @@ export default function App() {
         checksum: e.payload.expected_checksum ?? undefined,
       }),
     );
+    // Several links from the browser (a selection, or a whole page): list them to choose from.
+    const un3 = listen<{
+      links: GrabbedLink[];
+      referer?: string | null;
+      user_agent?: string | null;
+      headers?: Record<string, string> | null;
+      preselect?: 'all' | 'files';
+    }>('links-requested', (e) =>
+      setMultiState({
+        open: true,
+        tab: 'page',
+        text: '',
+        links: e.payload.links,
+        preselect: e.payload.preselect,
+        request: { referer: e.payload.referer ?? undefined, userAgent: e.payload.user_agent ?? undefined, headers: e.payload.headers ?? undefined },
+      }),
+    );
     return () => {
       un.then((f) => f()).catch(() => {});
       un2.then((f) => f()).catch(() => {});
+      un3.then((f) => f()).catch(() => {});
     };
   }, [openAdd]);
 
@@ -717,6 +742,9 @@ export default function App() {
         open={multiState.open}
         initialTab={multiState.tab}
         initialText={multiState.text}
+        initialLinks={multiState.links}
+        preselect={multiState.preselect}
+        initialRequest={multiState.request}
         settings={settings}
         onClose={() => setMultiState((s) => ({ ...s, open: false }))}
         onSubmit={addMany}

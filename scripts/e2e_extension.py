@@ -103,6 +103,13 @@ class Site(http.server.BaseHTTPRequestHandler):
             self.send(200, 'text/html', page, {'Set-Cookie': 'sid=abc123; Path=/'})
         elif path == '/other.html':
             self.send(200, 'text/html', b'<!doctype html><title>Other</title><p>hello')
+        elif path == '/links.html':
+            page = b"""<!doctype html><title>Link Page</title><body>
+              <a href="#top">top</a> <a href="/other.html">ordinary page</a> <a href="mailto:a@b.c">mail</a>
+              <div id=picked>Pick these: <a href="/files/song-one.mp3">song one</a> and <a href="/files/song-two.mp3">song two</a>
+                 plus plain text https://example.com/files/doc.pdf here</div>
+              <p>Not these: <a href="/files/outside.zip">outside</a></p>"""
+            self.send(200, 'text/html', page)
         elif path == '/video.html':
             page = b"""<!doctype html><title>My Holiday Video</title><body style="margin:0">
               <video id=v src="/files/clip.mp4" width=640 height=360 muted loop style="display:block"></video>
@@ -110,7 +117,7 @@ class Site(http.server.BaseHTTPRequestHandler):
             self.send(200, 'text/html', page)
         elif path == '/plainvideo.html':
             page = b"""<!doctype html><title>Plain Clip Page</title><body style="margin:0">
-              <video id=v src="/files/clip.mp4" width=640 height=360 muted loop style="display:block"></video>"""
+              <video id=v src="/files/clip.mp4" width=640 height=360 muted loop style="display:block"></video><div id=away style="height:300px">nothing here</div>"""
             self.send(200, 'text/html', page)
         elif path == '/dl/movie':
             # A slow attachment, like a real download: still arriving when the browser announces it.
@@ -219,6 +226,22 @@ def browser_download(driver, kind, url, filename=None):
     driver.switch_to.window(page)
 
 
+def extension_call(driver, kind, script, *args):
+    """Runs JS in an extension page (to talk to the background script like the menus do)."""
+    page = driver.current_window_handle
+    driver.switch_to.new_window('tab')
+    driver.get(extension_origin(driver, kind) + '/options.html')
+    try:
+        return driver.execute_async_script(script, *args)
+    finally:
+        driver.close()
+        driver.switch_to.window(page)
+
+
+def many_posts(n):
+    return [p for p in POSTS[n:] if p.get('path') == '/download-many']
+
+
 def wait_for(cond, timeout=12, step=0.25):
     end = time.time() + timeout
     while time.time() < end:
@@ -311,6 +334,40 @@ def run_browser(kind, site_base, download_dir):
         ActionChains(driver).move_to_element(video).pause(0.4).move_to_element_with_offset(video, size['width'] // 2 - 56, -size['height'] // 2 + 24).pause(0.3).click().perform()
         got = wait_for(lambda: posts_since(n), timeout=8)
         check(f'{kind}: the video button sends a plain video file', bool(got) and got[0].get('url', '').endswith('/files/clip.mp4'), got)
+
+        # ---- several links: the ones in a selection, and everything on a page
+        driver.get(site_base + '/links.html')
+        time.sleep(1.5)
+        driver.execute_script("window.getSelection().selectAllChildren(document.getElementById('picked'))")
+        find_tab = "const cb = arguments[arguments.length - 1]; chrome.tabs.query({}, tabs => { const t = tabs.find(x => (x.url || '').includes('/links.html')); chrome.runtime.sendMessage({ type: 'SEND_LINKS', tabId: t.id, mode: arguments[0] }, r => cb(r)); });"
+        n = len(POSTS)
+        extension_call(driver, kind, find_tab, 'selection')
+        got = wait_for(lambda: many_posts(n), timeout=8)
+        names = sorted(u.rsplit('/', 1)[-1] for u in (got[0].get('urls', []) if got else []))
+        check(f'{kind}: links in a selection are sent together', names == ['doc.pdf', 'song-one.mp3', 'song-two.mp3'], names)
+        check(f'{kind}: with the page and the login it was on', bool(got) and got[0].get('referer', '').endswith('/links.html') and 'sid=abc123' in (got[0].get('cookies') or ''), got and (got[0].get('referer'), got[0].get('cookies')))
+        driver.execute_script("window.getSelection().removeAllRanges()")
+        n = len(POSTS)
+        extension_call(driver, kind, find_tab, 'page')
+        got = wait_for(lambda: many_posts(n), timeout=8)
+        names = sorted(u.rsplit('/', 1)[-1] for u in (got[0].get('urls', []) if got else []))
+        check(f'{kind}: grab-all sends every link on the page, without in-page anchors or mail links', names == ['other.html', 'outside.zip', 'song-one.mp3', 'song-two.mp3'], names)
+
+        # ---- the video button stays out of the way: it hides when the pointer rests or leaves
+        driver.get(site_base + '/plainvideo.html')
+        time.sleep(2)
+        video = driver.find_element(By.ID, 'v')
+        state = lambda: driver.execute_script("var h = document.querySelector('[data-nexdrop]'); return h && h.getAttribute('data-nexdrop')")
+        ActionChains(driver).move_to_element(video).perform()
+        time.sleep(0.2)
+        ActionChains(driver).move_by_offset(30, 20).perform()
+        check(f'{kind}: the video button appears when you move over a video', wait_for(lambda: state() == 'visible', timeout=3) is True, state())
+        time.sleep(4.5)  # the pointer rests
+        check(f'{kind}: and goes away by itself when the pointer rests', state() == 'hidden', state())
+        ActionChains(driver).move_by_offset(-20, 10).perform()
+        check(f'{kind}: and comes back when the pointer moves again', wait_for(lambda: state() == 'visible', timeout=3) is True, state())
+        ActionChains(driver).move_to_element(driver.find_element(By.ID, 'away')).perform()
+        check(f'{kind}: and goes away when the pointer leaves the video', wait_for(lambda: state() == 'hidden', timeout=4) is True, state())
 
         # ---- app not running: the browser keeps its download
         global BRIDGE_UP

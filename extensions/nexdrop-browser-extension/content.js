@@ -78,6 +78,62 @@
     true,
   );
 
+  // ── links for "download links in selection" and "grab all links" ───────────
+  const MAX_LINKS = 2000;
+  const httpOnly = (href) => {
+    try {
+      const u = new URL(href, location.href);
+      return /^https?:$/.test(u.protocol) ? u.href : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  /** Links inside the current selection: anchors it touches, plus plain-text addresses in it. */
+  function selectedLinks() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return [];
+    const found = new Set();
+    document.querySelectorAll('a[href]').forEach((a) => {
+      try {
+        if (sel.containsNode(a, true)) {
+          const u = httpOnly(a.href);
+          if (u) found.add(u);
+        }
+      } catch (_) { /* detached node */ }
+    });
+    (sel.toString().match(/https?:\/\/[^\s<>"')\]]+/gi) || []).forEach((u) => found.add(u));
+    return [...found].slice(0, MAX_LINKS);
+  }
+
+  /** Every link and media source on the page (not in-page anchors). */
+  function pageLinks() {
+    const found = new Set();
+    const add = (href) => {
+      const u = httpOnly(href);
+      if (u && u.split('#')[0] !== location.href.split('#')[0]) found.add(u);
+    };
+    document.querySelectorAll('a[href]').forEach((a) => add(a.href));
+    document.querySelectorAll('video[src], audio[src], source[src], embed[src]').forEach((m) => add(m.src));
+    return [...found].slice(0, MAX_LINKS);
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, reply) => {
+    if (message && message.type === 'GET_LINKS') {
+      reply({ links: message.mode === 'selection' ? selectedLinks() : pageLinks() });
+    }
+  });
+
+  // Tell the menu how many links the selection holds, just before it opens.
+  document.addEventListener(
+    'contextmenu',
+    () => {
+      const n = selectedLinks().length;
+      chrome.runtime.sendMessage({ type: 'SELECTION_LINKS', count: n }, () => void chrome.runtime.lastError);
+    },
+    true,
+  );
+
   // ── the video button ──────────────────────────────────────────────────────
   const host = document.createElement('div');
   host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
@@ -103,6 +159,7 @@
   const btn = root.querySelector('.btn');
   const menu = root.querySelector('.menu');
   const label = btn.querySelector('span');
+  host.setAttribute('data-nexdrop', 'hidden');
   const attach = () => {
     const fs = document.fullscreenElement;
     const parent = fs && fs.tagName !== 'VIDEO' && fs.tagName !== 'AUDIO' ? fs : document.documentElement || document.body;
@@ -142,20 +199,34 @@
   };
 
   const hide = () => {
+    clearTimeout(hideTimer);
     btn.style.display = 'none';
     menu.style.display = 'none';
     current = null;
+    host.setAttribute('data-nexdrop', 'hidden');
+  };
+
+  // Like a player's own controls: the button goes away when the pointer rests or leaves,
+  // and comes back as soon as it moves over the video again. Never while a menu is open.
+  const armHide = (ms) => {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (overOverlay || menu.style.display === 'block') return armHide(1500);
+      hide();
+    }, ms);
   };
 
   const show = (el) => {
-    clearTimeout(hideTimer);
     if (!settings.videoButton || !settings.autoIntercept) return;
     current = el;
     place();
+    if (btn.style.display === 'flex') host.setAttribute('data-nexdrop', 'visible');
+    armHide(2500);
   };
 
   const sendEntry = (entry) => {
     menu.style.display = 'none';
+    armHide(2500);
     chrome.runtime.sendMessage({ type: 'SEND_MEDIA', url: entry.url, page: location.href }, (reply) => {
       flash(reply && reply.success ? 'Sent to Nexdrop' : 'Nexdrop isn’t running');
     });
@@ -207,11 +278,18 @@
   new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true });
 
   let lastMove = 0;
+  let lastX = -1;
+  let lastY = -1;
   document.addEventListener(
     'pointermove',
     (e) => {
       const now = performance.now();
       if (now - lastMove < 90) return;
+      // Browsers sometimes repeat pointer events while the pointer rests (a repaint, a scroll).
+      // Only real movement counts, otherwise the button would never go away.
+      if (Math.abs(e.clientX - lastX) < 3 && Math.abs(e.clientY - lastY) < 3) return;
+      lastX = e.clientX;
+      lastY = e.clientY;
       lastMove = now;
       for (const el of media) {
         if (!el.isConnected) {
@@ -223,10 +301,7 @@
           return show(el);
         }
       }
-      if (!overOverlay && current) {
-        clearTimeout(hideTimer);
-        hideTimer = setTimeout(() => !overOverlay && hide(), 900);
-      }
+      if (!overOverlay && current) armHide(900);
     },
     { passive: true },
   );
@@ -237,12 +312,12 @@
       if (e.target instanceof HTMLMediaElement) {
         media.add(e.target);
         show(e.target);
-        hideTimer = setTimeout(() => !overOverlay && hide(), 3500);
+        armHide(3500);
       }
     },
     true,
   );
-  addEventListener('scroll', () => current && place(), { passive: true, capture: true });
+  addEventListener('scroll', () => current && btn.style.display === 'flex' && place(), { passive: true, capture: true });
   addEventListener('resize', () => current && place());
   document.addEventListener('click', (e) => {
     if (!e.composedPath().includes(host)) menu.style.display = 'none';
