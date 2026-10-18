@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+/// Client for short control requests (probing, page scans). `timeout` bounds
+/// the *whole* request, which is exactly what we want for small responses.
 pub fn create_http_client(timeout: Duration) -> reqwest::Client {
     create_http_client_with_proxy(timeout, None, None)
 }
@@ -9,9 +11,39 @@ pub fn create_http_client_with_proxy(
     proxy_mode: Option<&str>,
     custom_proxy_url: Option<&str>,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
-        .pool_max_idle_per_host(10);
+    build_client(
+        reqwest::Client::builder().timeout(timeout),
+        proxy_mode,
+        custom_proxy_url,
+    )
+}
+
+/// Client for bulk transfers. There is deliberately **no total-request
+/// timeout** (it would also cap how long the body may stream and kill every
+/// download slower than `size / timeout`). Instead: a connect timeout, and an
+/// idle timeout that resets on every successful read, so only a stalled
+/// connection is cut off.
+pub fn create_download_client_with_proxy(
+    idle_timeout: Duration,
+    proxy_mode: Option<&str>,
+    custom_proxy_url: Option<&str>,
+) -> reqwest::Client {
+    build_client(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(idle_timeout)
+            .tcp_keepalive(Duration::from_secs(30)),
+        proxy_mode,
+        custom_proxy_url,
+    )
+}
+
+fn build_client(
+    builder: reqwest::ClientBuilder,
+    proxy_mode: Option<&str>,
+    custom_proxy_url: Option<&str>,
+) -> reqwest::Client {
+    let mut builder = builder.pool_max_idle_per_host(32);
 
     let mode = proxy_mode.unwrap_or("system");
 

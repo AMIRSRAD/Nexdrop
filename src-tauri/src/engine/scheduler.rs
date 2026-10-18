@@ -95,7 +95,7 @@ impl DownloadScheduler {
             "sleep" => {
                 #[cfg(target_os = "windows")]
                 {
-                    let _ = std::process::Command::new("rundll32.exe")
+                    let _ = crate::process::command("rundll32.exe")
                         .args(["powrprof.dll,SetSuspendState", "0,1,0"])
                         .spawn();
                 }
@@ -103,7 +103,7 @@ impl DownloadScheduler {
             "shutdown" => {
                 #[cfg(target_os = "windows")]
                 {
-                    let _ = std::process::Command::new("shutdown")
+                    let _ = crate::process::command("shutdown")
                         .args(["/s", "/t", "60"]) // 60 seconds grace period
                         .spawn();
                 }

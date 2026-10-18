@@ -2,6 +2,7 @@ pub mod commands;
 pub mod db;
 pub mod engine;
 pub mod grabber_server;
+pub mod process;
 pub mod tray;
 
 use std::sync::Arc;
@@ -40,6 +41,7 @@ pub fn run() {
             grabber_server::GrabberServer::start(app.handle().clone(), manager.clone());
 
             // Startup check: auto resume queued/unfinished downloads if enabled
+            manager.recover_interrupted();
             let mgr_clone = manager.clone();
             tauri::async_runtime::spawn(async move {
                 let settings = mgr_clone.get_settings();

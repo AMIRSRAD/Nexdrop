@@ -170,9 +170,14 @@ pub struct DownloadTask {
 pub struct SiteCredential {
     pub id: String,
     pub domain: String,
-    pub username: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
     pub password: Option<String>,
-    pub token: Option<String>,
+    /// Bearer token or cookie. (`token` is accepted for older callers.)
+    #[serde(default, alias = "token")]
+    pub token_or_cookie: Option<String>,
+    #[serde(default)]
     pub notes: Option<String>,
 }
 
