@@ -90,3 +90,25 @@ the engine reaches the cap of every connection it opens.
   10 minutes offline. The user retries manually.
 - No duplicate-request "endgame" for the last slow range. Work stealing plus
   the stall rule cover the measured cases.
+
+## Streaming video (HLS and DASH)
+
+Links ending in `.m3u8` or `.mpd` (or served with an HLS/DASH content type)
+are downloaded as streams: `src-tauri/src/engine/stream/`.
+
+- **Qualities:** the playlist is read first; the Add dialog shows a Quality
+  picker (best first). Choosing nothing downloads the best one.
+- **Download:** segments are fetched 16 at a time, retried like any request,
+  decrypted if AES-128 protected, and appended in order. Progress is saved
+  every two seconds, so pausing, quitting or crashing resumes from the last
+  whole segment, and the playlist is read fresh on each start so signed links
+  stay valid.
+- **One playable file:** transport streams become one `.ts`. When video and
+  audio are separate fragmented-MP4 tracks (the usual case) they are joined
+  into one `.mp4` by interleaving the fragments, with no re-encoding.
+- **Verified against real streams** (Apple's HLS fMP4 sample with separate
+  audio, Akamai's Big Buck Bunny over DASH): the joined files decode
+  completely in ffmpeg (`scripts/verify_streams.py`).
+- **Refused with a reason:** live streams, DRM, and SAMPLE-AES.
+- **Tests:** `tests/stream_test.rs` (10 scenarios), `scripts/e2e_streams.py`
+  (the real app, 15 checks), `tests/stream_real.rs` (real internet streams).

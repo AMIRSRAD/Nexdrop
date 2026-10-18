@@ -58,10 +58,35 @@
       btn.style.transform = 'translateY(0) scale(1)';
     });
 
+    const sentLabel = () => {
+      btn.innerHTML = `<span>Sent to Nexdrop!</span>`;
+      setTimeout(() => {
+        btn.innerHTML = `
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+            <span>Download with Nexdrop</span>
+          `;
+      }, 2000);
+    };
+
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
 
+      // Streaming players (HLS / DASH) play from blob: addresses; the real source is the playlist they loaded.
+      chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (reply) => {
+        if (chrome.runtime.lastError) reply = null;
+        if (reply && reply.best) {
+          chrome.runtime.sendMessage({ type: 'SEND_STREAM', url: reply.best.url, page: location.href });
+          sentLabel();
+          return;
+        }
+        sendPlainVideo();
+      });
+    });
+
+    function sendPlainVideo() {
       let src = mediaEl.currentSrc || mediaEl.src;
       if (!src) {
         const source = mediaEl.querySelector('source');
@@ -75,17 +100,9 @@
           filename: document.title ? `${document.title.replace(/[\\/:*?"<>|]/g, '_')}.mp4` : undefined,
         });
 
-        btn.innerHTML = `<span>Sent to Nexdrop!</span>`;
-        setTimeout(() => {
-          btn.innerHTML = `
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-            </svg>
-            <span>Download with Nexdrop</span>
-          `;
-        }, 2000);
+        sentLabel();
       }
-    });
+    }
 
     // Positioning
     function positionButton() {

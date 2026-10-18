@@ -117,6 +117,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_url_cmd,
+            probe_stream_cmd,
             get_queues_cmd,
             save_queue_cmd,
             delete_queue_cmd,

@@ -21,6 +21,7 @@ use crate::engine::auth::{build_header_list, headers_for_credential, is_forbidde
 use crate::engine::checksum::{check_expected, normalize_expected_checksum};
 use crate::engine::probe::{probe_url_with, sanitize_filename, ProbeOptions, ProbeResult};
 use crate::engine::security;
+use crate::engine::stream::{self, Fetch};
 use crate::engine::torrent::{TorrentEngine, TorrentLive, TorrentSettings, TorrentSource};
 use crate::engine::segment::{calculate_segments, calculate_segments_with_chunk_size};
 
@@ -231,6 +232,10 @@ impl DownloadManager {
     }
 
     pub async fn add_download(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
+        // HLS / DASH links are downloaded segment by segment, not as one file.
+        if req.stream_variant.is_some() || stream::is_stream_url(&req.url) {
+            return self.add_stream(req).await;
+        }
         let settings = self.get_settings();
 
         let parsed = url::Url::parse(req.url.trim()).map_err(|e| format!("Invalid link: {e}"))?;
@@ -260,6 +265,10 @@ impl DownloadManager {
         let probe = self
             .probe(&req.url, Some(proxy_mode_to_use), custom_proxy_to_use, &probe_opts)
             .await?;
+        // A link without a telltale extension can still turn out to be a playlist.
+        if probe.mime_type.as_deref().map(stream::is_stream_mime).unwrap_or(false) {
+            return self.add_stream(req).await;
+        }
 
         let filename = req
             .filename
@@ -356,6 +365,127 @@ impl DownloadManager {
             self.process_queue().await;
         }
 
+        Ok(task)
+    }
+
+    // ───────────────────────────── streaming video ─────────────────────────────
+
+    fn stream_fetch(&self, url: &str, referer: Option<String>, user_agent: Option<String>) -> Fetch {
+        let settings = self.get_settings();
+        let client = self.engine.clients().download(Some(&settings.proxy_mode), settings.custom_proxy_url.as_deref());
+        let headers = build_header_list(&HashMap::new(), &self.vault_headers(url));
+        Fetch::new(client, headers, url, referer, user_agent, Duration::from_millis(500))
+    }
+
+    /// Looks inside an HLS / DASH link without downloading anything.
+    pub async fn probe_stream(&self, url: &str, referer: Option<String>, user_agent: Option<String>) -> Result<stream::StreamProbe, String> {
+        let parsed = url::Url::parse(url).map_err(|e| format!("Invalid link: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("Only http and https links can be downloaded".to_string());
+        }
+        stream::probe(&self.stream_fetch(url, referer, user_agent), url).await
+    }
+
+    /// Adds an HLS / DASH stream: reads its playlist now (so problems show up
+    /// at once), then queues it like any other download.
+    async fn add_stream(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
+        let settings = self.get_settings();
+        let url = req.url.trim().to_string();
+        let parsed = url::Url::parse(&url).map_err(|e| format!("Invalid link: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("Only http and https links can be downloaded".to_string());
+        }
+        let custom_headers: HashMap<String, String> = req
+            .custom_headers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty() && !is_forbidden_header(k))
+            .collect();
+
+        let proxy_mode = req.proxy_mode.clone().unwrap_or_else(|| settings.proxy_mode.clone());
+        let custom_proxy = req.custom_proxy_url.clone().or_else(|| settings.custom_proxy_url.clone());
+        let client = self.engine.clients().download(Some(&proxy_mode), custom_proxy.as_deref());
+        let headers = build_header_list(&custom_headers, &self.vault_headers(&url));
+        let fetch = Fetch::new(client, headers, &url, req.referer.clone(), req.user_agent.clone(), Duration::from_millis(500));
+
+        let resolved = stream::resolve(&fetch, &url, req.stream_variant.as_deref()).await?;
+        let extension = resolved.extension();
+        let stem = req
+            .filename
+            .as_deref()
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| f.to_string()))
+            .unwrap_or_else(|| resolved.title.clone());
+        let filename = sanitize_filename(&format!("{stem}.{extension}"));
+
+        let mut dest_dir = PathBuf::from(
+            req.destination_path.clone().filter(|d| !d.trim().is_empty()).unwrap_or_else(|| settings.default_destination.clone()),
+        );
+        if settings.auto_categorize {
+            let sub = FileCategory::Videos.subfolder_name();
+            if !sub.is_empty() {
+                dest_dir = dest_dir.join(sub);
+            }
+        }
+        let _ = std::fs::create_dir_all(&dest_dir);
+
+        let now = chrono::Utc::now().timestamp();
+        let id = Uuid::new_v4().to_string();
+        // The chosen quality travels in `etag` (unused by streams otherwise): when the
+        // download starts again later, the playlist is read afresh and this picks the same quality.
+        let variant = resolved.variant.clone();
+        let task = DownloadTask {
+            id,
+            url: url.clone(),
+            final_url: None,
+            filename: filename.clone(),
+            destination_path: dest_dir.to_string_lossy().to_string(),
+            temp_path: String::new(),
+            total_bytes: resolved.estimated_bytes() as i64,
+            downloaded_bytes: 0,
+            status: if req.scheduled_time.is_some() { DownloadStatus::Scheduled } else { DownloadStatus::Queued },
+            resumable: true,
+            etag: variant,
+            last_modified: None,
+            mime_type: Some(if extension == "ts" { "video/mp2t" } else { "video/mp4" }.to_string()),
+            category: FileCategory::Videos,
+            // Segments are small, so speed is limited by round trips, not bandwidth: many at once.
+            connections: 16,
+            speed_limit: req.speed_limit.unwrap_or(0),
+            priority: req.priority.unwrap_or(0),
+            speed_bps: 0,
+            eta_seconds: None,
+            segments: vec![],
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            error_message: None,
+            scheduled_time: req.scheduled_time,
+            checksum_sha256: None,
+            checksum_md5: None,
+            user_agent: req.user_agent,
+            referer: req.referer,
+            mirrors: vec![],
+            min_chunk_size: 1024 * 1024,
+            proxy_mode: Some(proxy_mode),
+            custom_proxy_url: custom_proxy,
+            antivirus_status: None,
+            expected_checksum: None,
+            custom_headers,
+            kind: "stream".to_string(),
+            info_hash: None,
+            uploaded_bytes: 0,
+            peers: 0,
+            seeding: false,
+            torrent_files: vec![],
+            queue_id: self.valid_queue_id(req.queue_id.as_deref()),
+        };
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::save_download(&conn, &task).map_err(|e| e.to_string())?;
+        if task.status == DownloadStatus::Queued {
+            self.process_queue().await;
+        }
         Ok(task)
     }
 
@@ -1201,6 +1331,7 @@ impl DownloadManager {
         let task_id = task.id.clone();
         let engine = self.engine.clone();
         let is_torrent = task.kind == "torrent";
+        let is_stream = task.kind == "stream";
         let queue_id = task.queue_id.clone();
         let task_queue = self.queue_by_id(&queue_id);
         let engine = match &task_queue {
@@ -1249,6 +1380,8 @@ impl DownloadManager {
             };
             let res = if is_torrent {
                 manager.run_torrent_task(task, pause_rx, on_progress).await
+            } else if is_stream {
+                engine.run_stream(task, pause_rx, vault_headers, on_progress).await
             } else {
                 engine.run_download_with(task, pause_rx, vault_headers, on_progress).await
             };
@@ -1595,6 +1728,7 @@ impl DownloadManager {
 /// its progress map, and the per-segment files older versions used.
 fn remove_partial_files(task: &DownloadTask) {
     let dir = Path::new(&task.destination_path);
+    stream::remove_partials(dir, &task.filename);
     for suffix in ["nexpart", "nexpart.map", "nexpart.map.tmp", "nexmerge"] {
         let _ = std::fs::remove_file(dir.join(format!("{}.{}", task.filename, suffix)));
     }

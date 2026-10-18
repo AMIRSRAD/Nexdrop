@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ChevronRight, ClipboardPaste, Download, Folder, Link2, TriangleAlert, Terminal, Zap } from 'lucide-react';
+import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
-import type { AddDownloadRequest, AppSettings, QueueInfo, UrlProbeResult } from '../../types/download';
-import { formatBytes } from '../../utils/format';
+import type { AddDownloadRequest, AppSettings, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
+import { formatBytes, formatDuration } from '../../utils/format';
 import { CHUNK_SIZES, PRIORITIES, USER_AGENTS, categoryMeta, isHttpUrl, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 import { Dialog } from '../ui/Dialog';
@@ -21,7 +21,12 @@ interface AddDownloadDialogProps {
   queues?: QueueInfo[];
   /** Queue preselected in the picker. */
   defaultQueue?: string;
+  /** The page a link was found on (many video servers insist on it). */
+  initialReferer?: string;
 }
+
+const STREAM_URL_RE = /\.(m3u8?|mpd)(\?|#|$)/i;
+const STREAM_MIME_RE = /mpegurl|dash\+xml/i;
 
 type ProbeState =
   | { kind: 'idle' }
@@ -29,15 +34,26 @@ type ProbeState =
   | { kind: 'ok'; result: UrlProbeResult }
   | { kind: 'error'; message: string };
 
-export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue }) => (
+export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue, initialReferer }) => (
   <Dialog open={open} onClose={onClose} title="New download" width={560} bare>
     {open && (
-      <AddDownloadForm initialText={initialText} settings={settings} onClose={onClose} onSubmit={onSubmit} queues={queues} defaultQueue={defaultQueue} />
+      <AddDownloadForm
+        initialText={initialText}
+        settings={settings}
+        onClose={onClose}
+        onSubmit={onSubmit}
+        queues={queues}
+        defaultQueue={defaultQueue}
+        initialReferer={initialReferer}
+      />
     )}
   </Dialog>
 );
 
-const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue }) => {
+const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue, initialReferer }) => {
+  // A streaming-video link (HLS / DASH): shows a quality picker instead of file details.
+  const [stream, setStream] = useState<StreamProbe | null>(null);
+  const [variantId, setVariantId] = useState('');
   const [queueId, setQueueId] = useState(defaultQueue && queues.some((q) => q.id === defaultQueue) ? defaultQueue : 'main');
   const [url, setUrl] = useState('');
   const [filename, setFilename] = useState('');
@@ -58,7 +74,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   const [proxyUrl, setProxyUrl] = useState(settings.custom_proxy_url ?? '');
   const [mirrors, setMirrors] = useState('');
   const [checksum, setChecksum] = useState('');
-  const [referer, setReferer] = useState('');
+  const [referer, setReferer] = useState(initialReferer ?? '');
   const [userAgent, setUserAgent] = useState('');
 
   const [submitting, setSubmitting] = useState(false);
@@ -73,10 +89,28 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
     }
     setProbe({ kind: 'loading' });
     try {
-      const result = await api.probeUrl(target);
+      let result: UrlProbeResult | null = null;
+      let isStream = STREAM_URL_RE.test(target);
+      if (!isStream) {
+        result = await api.probeUrl(target);
+        isStream = STREAM_MIME_RE.test(result.mime_type ?? '');
+      }
+      if (isStream) {
+        const info = await api.probeStream(target, referer.trim() || undefined);
+        if (seq !== probeSeq.current) return;
+        setStream(info);
+        setVariantId(info.variants[0]?.id ?? '');
+        setProbe({
+          kind: 'ok',
+          result: { url: target, filename: info.filename, total_bytes: 0, resumable: true, category: 'videos', default_destination: '' },
+        });
+        if (!filenameTouched.current) setFilename(info.filename);
+        return;
+      }
       if (seq !== probeSeq.current) return;
-      setProbe({ kind: 'ok', result });
-      if (!filenameTouched.current) setFilename(result.filename);
+      setStream(null);
+      setProbe({ kind: 'ok', result: result! });
+      if (!filenameTouched.current) setFilename(result!.filename);
     } catch (err) {
       if (seq !== probeSeq.current) return;
       setProbe({ kind: 'error', message: errText(err) });
@@ -150,7 +184,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   const result = probe.kind === 'ok' ? probe.result : null;
   const resumable = result?.resumable ?? true;
   const validUrl = isHttpUrl(url);
-  const canSubmit = validUrl && !submitting && (when === 'now' || !!scheduledAt);
+  const canSubmit = validUrl && !submitting && (when === 'now' || !!scheduledAt) && !(stream && (stream.unsupported || !variantId));
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -179,6 +213,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         custom_proxy_url: proxyMode === 'custom' && proxyUrl.trim() ? proxyUrl.trim() : undefined,
         custom_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
         queue_id: queues.length > 1 ? queueId : undefined,
+        stream_variant: stream ? variantId : undefined,
       });
       onClose();
     } catch (err) {
@@ -247,7 +282,19 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
                   </span>
                 </span>
               )}
-              {result && (
+              {result && stream && (
+                <>
+                  <Film size={12} className="shrink-0" />
+                  <span>{stream.kind === 'dash' ? 'DASH video stream' : 'HLS video stream'}</span>
+                  {stream.duration_secs > 0 && (
+                    <>
+                      <span>·</span>
+                      <span className="tabular">{formatDuration(Math.round(stream.duration_secs))}</span>
+                    </>
+                  )}
+                </>
+              )}
+              {result && !stream && (
                 <>
                   <span className="tabular">{result.total_bytes > 0 ? formatBytes(result.total_bytes) : 'Unknown size'}</span>
                   <span>·</span>
@@ -265,6 +312,31 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
             </div>
           </div>
         </div>
+
+        {/* Quality (streaming video only) */}
+        {stream && (
+          <div>
+            <div className="flex items-center gap-3">
+              <Label className="mb-0 w-24 shrink-0">Quality</Label>
+              <Select
+                value={variantId}
+                onValueChange={setVariantId}
+                options={stream.variants.map((v) => ({ value: v.id, label: v.label }))}
+                className="w-64"
+                disabled={!!stream.unsupported}
+              />
+              {stream.variants.find((v) => v.id === variantId)?.separate_audio && !stream.unsupported && (
+                <span className="text-[12px] text-fg-3">Video and audio get joined into one file</span>
+              )}
+            </div>
+            {stream.unsupported && (
+              <div className="mt-2 flex items-center gap-1.5 text-[12.5px] text-danger">
+                <TriangleAlert size={13} className="shrink-0" />
+                {stream.unsupported}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Destination */}
         <div>

@@ -63,7 +63,7 @@ export interface DownloadTask {
   /** Hash the user expects; checked automatically when the download finishes. */
   expected_checksum?: string;
   /** 'http' for a normal download, 'torrent' for BitTorrent. */
-  kind?: 'http' | 'torrent';
+  kind?: 'http' | 'torrent' | 'stream';
   /** The queue this download belongs to. */
   queue_id?: string;
   info_hash?: string;
@@ -178,6 +178,8 @@ export interface AddDownloadRequest {
   /** Extra request headers (e.g. Cookie / Authorization imported from cURL). */
   custom_headers?: Record<string, string>;
   queue_id?: string;
+  /** HLS / DASH: the quality to download (an id from `probeStream`). */
+  stream_variant?: string;
 }
 
 export interface DownloadProgressEvent {
@@ -233,4 +235,27 @@ export interface QueueInfo extends DownloadQueue {
   queued: number;
   /** Unix seconds when the schedule next opens (while closed). */
   next_start?: number | null;
+}
+
+export interface StreamVariant {
+  id: string;
+  label: string;
+  bandwidth: number;
+  width: number;
+  height: number;
+  /** Video and audio are separate tracks that get joined into one file. */
+  separate_audio: boolean;
+  codecs?: string | null;
+}
+
+/** What a streaming-video link (HLS / DASH) turned out to be. */
+export interface StreamProbe {
+  url: string;
+  kind: 'hls' | 'dash';
+  title: string;
+  filename: string;
+  duration_secs: number;
+  variants: StreamVariant[];
+  /** Why it can't be downloaded (live stream, DRM...). */
+  unsupported?: string | null;
 }

@@ -203,6 +203,20 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         return Reply::json("200 OK", serde_json::json!({ "success": true, "torrent": true }));
     }
 
+    // Streaming video (HLS / DASH) has qualities to choose from, so it also goes through the app.
+    if is_http_url(&grab.url) && crate::engine::stream::is_stream_url(&grab.url) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            let _ = window.emit(
+                "stream-requested",
+                serde_json::json!({ "url": grab.url.trim(), "referer": grab.referer, "user_agent": grab.user_agent }),
+            );
+        }
+        return Reply::json("200 OK", serde_json::json!({ "success": true, "stream": true }));
+    }
+
     if !is_http_url(&grab.url) {
         return Reply::error("400 Bad Request", "Only http and https links can be downloaded");
     }
@@ -224,6 +238,7 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         proxy_mode: None,
         custom_proxy_url: None,
         queue_id: None,
+        stream_variant: None,
     };
 
     match mgr.add_download(req).await {

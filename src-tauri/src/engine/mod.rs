@@ -12,6 +12,7 @@ pub mod security;
 pub mod segment;
 pub mod torrent;
 pub mod speed;
+pub mod stream;
 
 pub use checksum::{compute_checksums, verify_file_checksum};
 pub use client::{create_download_client_with_proxy, create_http_client, create_http_client_with_proxy, ClientPool};
