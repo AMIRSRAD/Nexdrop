@@ -24,7 +24,9 @@
         "fullscreen": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-bypass-list=\"<-loopback>;<local>;localhost;127.0.0.1;*.localhost;tauri.localhost\"",
         "decorations": false,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "visible": false,
+        "backgroundColor": "#0d0e11"
       }
     ],
     "security": {
@@ -33,13 +35,40 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "Nexdrop",
+    "copyright": "Copyright © 2026 Nexdrop",
+    "category": "Utility",
+    "shortDescription": "A fast, safe download manager with torrent support.",
+    "longDescription": "Nexdrop accelerates downloads with multiple connections, resumes interrupted transfers, verifies file integrity, schedules downloads, and downloads torrents and magnet links. It integrates with your browser through an optional extension.",
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../extensions/nexdrop-browser-extension": "extension"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "languages": [
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "Nexdrop",
+        "compression": "lzma",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }

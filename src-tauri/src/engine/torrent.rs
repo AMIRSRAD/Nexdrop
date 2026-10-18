@@ -169,6 +169,15 @@ impl TorrentEngine {
         }
     }
 
+    /// Stops the BitTorrent session (on exit). Torrents are resumed from the database next start.
+    pub async fn shutdown(&self) {
+        let session = self.session.lock().take();
+        if let Some(session) = session {
+            session.stop().await;
+        }
+        self.handles.lock().clear();
+    }
+
     pub fn has_session(&self) -> bool {
         self.session.lock().is_some()
     }

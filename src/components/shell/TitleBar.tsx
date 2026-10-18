@@ -4,6 +4,7 @@ import { isTauri } from '../../services/api';
 import { Button, IconButton, Kbd } from '../ui/Button';
 import { isMagnet, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
+import appIcon from '../../assets/app-icon.png';
 
 interface TitleBarProps {
   omniboxRef: React.RefObject<HTMLInputElement | null>;
@@ -129,18 +130,9 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   );
 };
 
+/** The real app icon, so the title bar matches the taskbar, tray and installer. */
 export const LogoMark: React.FC<{ size?: number }> = ({ size = 22 }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden className="shrink-0" data-tauri-drag-region>
-    <defs>
-      <linearGradient id="nx-logo" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stopColor="#7aa2ff" />
-        <stop offset="1" stopColor="#3d6bff" />
-      </linearGradient>
-    </defs>
-    <rect width="24" height="24" rx="6.5" fill="url(#nx-logo)" />
-    <path d="M12 5.5v8.2m0 0-3.4-3.4M12 13.7l3.4-3.4" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-    <path d="M7 17.6h10" stroke="#fff" strokeOpacity=".85" strokeWidth="2" strokeLinecap="round" />
-  </svg>
+  <img src={appIcon} width={size} height={size} alt="" draggable={false} className="shrink-0 select-none" data-tauri-drag-region />
 );
 
 /** Native-feeling caption buttons for the frameless window (Windows layout). */

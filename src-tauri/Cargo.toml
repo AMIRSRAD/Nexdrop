@@ -16,6 +16,8 @@ tauri-build = { version = "2.7.2", features = [] }
 [dependencies]
 tauri = { version = "2.12.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -46,3 +48,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Ioctl",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.release]
+lto = "thin"
+strip = true
+opt-level = 3

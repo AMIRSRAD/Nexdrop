@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Download } from 'lucide-react';
-import { api } from './services/api';
+import { api, isTauri } from './services/api';
+import { listen } from '@tauri-apps/api/event';
 import type { AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadTask, FileCategory } from './types/download';
 import { useDownloads, errText } from './hooks/useDownloads';
 import { useSpeedHistory } from './hooks/useSpeedHistory';
@@ -308,6 +309,15 @@ export default function App() {
     [actions, toast],
   );
 
+  // The tray's "Settings" entry
+  useEffect(() => {
+    if (!isTauri()) return;
+    const un = listen('open-settings', () => setSettingsView((v) => ({ ...v, open: true })));
+    return () => {
+      un.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
   /* ── global keyboard, paste, clipboard, drag & drop ─ */
   const omniboxRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -321,6 +331,9 @@ export default function App() {
       if (mod && k === 'n') {
         e.preventDefault();
         openAdd();
+      } else if (mod && k === 'q') {
+        e.preventDefault();
+        api.quitApp();
       } else if (mod && k === 't') {
         e.preventDefault();
         openTorrent();
