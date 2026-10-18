@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use crate::db::models::{AppSettings, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, SiteCredential};
+use crate::db::models::{AppSettings, DownloadQueue, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, SiteCredential};
 
 pub struct Repository;
 
@@ -16,7 +16,7 @@ const TASK_COLUMNS: &str = "id, url, final_url, filename, destination_path, temp
     checksum_md5, user_agent, referer, mirrors, min_chunk_size,
     proxy_mode, custom_proxy_url, antivirus_status,
     expected_checksum, custom_headers,
-    kind, info_hash, uploaded_bytes, seeding, torrent_files";
+    kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id";
 
 /// Header maps hold cookies and tokens, so they are encrypted before they hit the disk.
 fn encode_headers(headers: &std::collections::HashMap<String, String>) -> Option<String> {
@@ -150,7 +150,15 @@ impl Repository {
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_files TEXT", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_bytes BLOB", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_started INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN queue_id TEXT NOT NULL DEFAULT 'main'", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_info_hash ON downloads(info_hash)", []);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS queues (
+                id TEXT PRIMARY KEY,
+                position INTEGER NOT NULL DEFAULT 0,
+                data TEXT NOT NULL
+            );",
+        )?;
 
         Ok(())
     }
@@ -166,7 +174,7 @@ impl Repository {
                 checksum_md5, user_agent, referer, mirrors, min_chunk_size,
                 proxy_mode, custom_proxy_url, antivirus_status,
                 expected_checksum, custom_headers,
-                kind, info_hash, uploaded_bytes, seeding, torrent_files
+                kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
@@ -175,7 +183,7 @@ impl Repository {
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32, ?33,
                 ?34, ?35,
-                ?36, ?37, ?38, ?39, ?40
+                ?36, ?37, ?38, ?39, ?40, ?41
             )
             ON CONFLICT(id) DO UPDATE SET
                 final_url = excluded.final_url,
@@ -256,6 +264,7 @@ impl Repository {
                 task.uploaded_bytes,
                 if task.seeding { 1 } else { 0 },
                 if task.torrent_files.is_empty() { None } else { serde_json::to_string(&task.torrent_files).ok() },
+                task.queue_id,
             ],
         )?;
 
@@ -492,7 +501,52 @@ let status_str: String = row.get(8)?;
                 .unwrap_or(None)
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default(),
+            queue_id: row
+                .get::<_, Option<String>>(40)
+                .unwrap_or(None)
+                .filter(|q| !q.is_empty())
+                .unwrap_or_else(|| crate::db::models::MAIN_QUEUE_ID.to_string()),
         })
+    }
+
+    // ───────────────────────────── queues ─────────────────────────────
+
+    pub fn list_queues(conn: &Connection) -> Result<Vec<DownloadQueue>> {
+        let mut stmt = conn.prepare("SELECT id, data FROM queues ORDER BY position ASC, id ASC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, data) = row?;
+            if let Ok(mut q) = serde_json::from_str::<DownloadQueue>(&data) {
+                q.id = id;
+                out.push(q);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn save_queue(conn: &Connection, queue: &DownloadQueue) -> Result<()> {
+        let data = serde_json::to_string(queue).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "INSERT INTO queues (id, position, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET position = excluded.position, data = excluded.data",
+            params![queue.id, queue.position, data],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a queue; its downloads move to `fallback`.
+    pub fn delete_queue(conn: &Connection, id: &str, fallback: &str) -> Result<()> {
+        conn.execute("UPDATE downloads SET queue_id = ?1 WHERE queue_id = ?2", params![fallback, id])?;
+        conn.execute("DELETE FROM queues WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_download_queue(conn: &Connection, ids: &[String], queue_id: &str) -> Result<()> {
+        for id in ids {
+            conn.execute("UPDATE downloads SET queue_id = ?1 WHERE id = ?2", params![queue_id, id])?;
+        }
+        Ok(())
     }
 
     pub fn get_all_downloads(conn: &Connection) -> Result<Vec<DownloadTask>> {
@@ -782,6 +836,7 @@ mod tests {
             peers: 0,
             seeding: false,
             torrent_files: vec![],
+            queue_id: "main".to_string(),
         };
 
         // 1. Save
@@ -838,6 +893,41 @@ mod tests {
         assert_eq!(reloaded.max_active_downloads, 5);
         assert_eq!(reloaded.default_connections, 16);
         assert_eq!(reloaded.theme, "light");
+    }
+
+    #[test]
+    fn queues_round_trip_and_deleting_one_moves_its_downloads_to_the_main_queue() {
+        let conn = setup_test_db();
+        let night = DownloadQueue {
+            id: "night".into(),
+            name: "Night".into(),
+            schedule_enabled: true,
+            start_time: "01:30".into(),
+            stop_time: Some("06:00".into()),
+            speed_limit: 2_000_000,
+            after_done: "shutdown".into(),
+            position: 1,
+            ..Default::default()
+        };
+        Repository::save_queue(&conn, &night).unwrap();
+        let mut main = DownloadQueue { id: "main".into(), name: "Main queue".into(), ..Default::default() };
+        Repository::save_queue(&conn, &main).unwrap();
+        main.name = "Renamed".into();
+        Repository::save_queue(&conn, &main).unwrap();
+
+        let list = Repository::list_queues(&conn).unwrap();
+        assert_eq!(list.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), vec!["main", "night"]);
+        assert_eq!(list[0].name, "Renamed");
+        assert_eq!((list[1].start_time.as_str(), list[1].after_done.as_str(), list[1].speed_limit), ("01:30", "shutdown", 2_000_000));
+
+        let task = sample_task("t1");
+        Repository::save_download(&conn, &task).unwrap();
+        Repository::set_download_queue(&conn, &["t1".to_string()], "night").unwrap();
+        assert_eq!(Repository::get_download(&conn, "t1").unwrap().unwrap().queue_id, "night");
+
+        Repository::delete_queue(&conn, "night", "main").unwrap();
+        assert_eq!(Repository::get_download(&conn, "t1").unwrap().unwrap().queue_id, "main");
+        assert_eq!(Repository::list_queues(&conn).unwrap().len(), 1);
     }
 
     #[test]
@@ -968,6 +1058,7 @@ mod tests {
             peers: 0,
             seeding: false,
             torrent_files: vec![],
+            queue_id: "main".to_string(),
         }
     }
 }

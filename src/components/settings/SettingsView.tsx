@@ -12,16 +12,18 @@ import {
   Monitor,
   Moon,
   Network,
+  Play,
   Plus,
   Puzzle,
   ShieldCheck,
   SlidersHorizontal,
+  Square,
   Sun,
   Trash,
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import type { AppSettings, SiteCredential } from '../../types/download';
+import type { AppSettings, DownloadQueue, QueueInfo, SiteCredential } from '../../types/download';
 import { api } from '../../services/api';
 import { CHUNK_SIZES, GRABBER_PORT } from '../../lib/meta';
 import { cn } from '../../lib/cn';
@@ -29,6 +31,7 @@ import { Button, IconButton } from '../ui/Button';
 import { Input, Label, NumberInput, Segmented, Select, Switch } from '../ui/Field';
 import { useToast } from '../ui/Toast';
 import { errText } from '../../hooks/useDownloads';
+import { whenText } from '../../hooks/useQueues';
 
 export type SettingsSection =
   | 'general'
@@ -45,7 +48,7 @@ const SECTIONS: { id: SettingsSection; label: string; icon: LucideIcon }[] = [
   { id: 'general', label: 'General', icon: SlidersHorizontal },
   { id: 'connections', label: 'Connections', icon: Zap },
   { id: 'network', label: 'Proxy', icon: Network },
-  { id: 'scheduler', label: 'Scheduler', icon: CalendarClock },
+  { id: 'scheduler', label: 'Queues & schedule', icon: CalendarClock },
   { id: 'notifications', label: 'When finished', icon: Bell },
   { id: 'security', label: 'Security', icon: ShieldCheck },
   { id: 'torrents', label: 'Torrents', icon: Magnet },
@@ -60,9 +63,11 @@ interface SettingsViewProps {
   section: SettingsSection;
   onSection: (s: SettingsSection) => void;
   saveState: 'idle' | 'saving' | 'saved';
+  queues: QueueInfo[];
+  onQueuesChanged: () => void;
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, onClose, section, onSection, saveState }) => {
+export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, onClose, section, onSection, saveState, queues, onQueuesChanged }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
@@ -122,7 +127,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'general' && <General s={settings} set={onChange} />}
           {section === 'connections' && <Connections s={settings} set={onChange} />}
           {section === 'network' && <Proxy s={settings} set={onChange} />}
-          {section === 'scheduler' && <Scheduler s={settings} set={onChange} />}
+          {section === 'scheduler' && <Queues queues={queues} refresh={onQueuesChanged} />}
           {section === 'notifications' && <Notifications s={settings} set={onChange} />}
           {section === 'security' && <Security s={settings} set={onChange} />}
           {section === 'torrents' && <Torrents s={settings} set={onChange} />}
@@ -323,69 +328,279 @@ const DAYS = [
   { id: 'sun', label: 'Sun' },
 ];
 
-const Scheduler: React.FC<SectionProps> = ({ s, set }) => {
-  const days = s.scheduler_days || [];
+const AFTER_OPTIONS = [
+  { value: 'none', label: 'Do nothing' },
+  { value: 'notify', label: 'Notify me' },
+  { value: 'exit', label: 'Quit Nexdrop' },
+  { value: 'sleep', label: 'Sleep computer' },
+  { value: 'hibernate', label: 'Hibernate' },
+  { value: 'shutdown', label: 'Shut down computer' },
+  { value: 'lock', label: 'Lock computer' },
+  { value: 'program', label: 'Run a program…' },
+];
+
+const NEW_QUEUE: DownloadQueue = {
+  id: '',
+  name: 'New queue',
+  schedule_enabled: false,
+  days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+  start_time: '02:00',
+  stop_time: null,
+  max_active: 0,
+  speed_limit: 0,
+  after_done: 'none',
+  after_done_program: null,
+  retry_count: 0,
+  retry_delay_secs: 60,
+  position: 0,
+};
+
+const asQueue = (q: QueueInfo): DownloadQueue => {
+  const { open: _o, active: _a, queued: _q, next_start: _n, ...queue } = q;
+  return queue;
+};
+
+/** What stops a queue from being saved yet (shown to the user instead of an error popup). */
+function problemWith(q: DownloadQueue): string | null {
+  if (!q.name.trim()) return 'Give the queue a name.';
+  if (q.schedule_enabled && q.days.length === 0) return 'Pick at least one day for the schedule.';
+  if (q.after_done === 'program' && !q.after_done_program?.trim()) return 'Choose the program to run when the queue finishes.';
+  return null;
+}
+
+const Queues: React.FC<{ queues: QueueInfo[]; refresh: () => void }> = ({ queues, refresh }) => {
+  const toast = useToast();
+  const [selectedId, setSelectedId] = useState('main');
+  const info = queues.find((q) => q.id === selectedId) ?? queues[0];
+  const [draft, setDraft] = useState<DownloadQueue | null>(null);
+  const saveTimer = useRef<number | undefined>(undefined);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Start editing whichever queue is selected (the draft, not the live list, is what the fields show).
+  useEffect(() => {
+    if (info && draft?.id !== info.id) {
+      setDraft(asQueue(info));
+      setConfirmDelete(false);
+    }
+  }, [info, draft?.id]);
+  useEffect(() => () => window.clearTimeout(saveTimer.current), []);
+
+  const persist = (next: DownloadQueue) => {
+    window.clearTimeout(saveTimer.current);
+    if (problemWith(next)) return;
+    saveTimer.current = window.setTimeout(() => {
+      api
+        .saveQueue(next)
+        .then(() => refresh())
+        .catch((err) => toast.show({ tone: 'error', title: "Couldn't save the queue", description: errText(err) }));
+    }, 400);
+  };
+
+  const update = (patch: Partial<DownloadQueue>) => {
+    setDraft((d) => {
+      if (!d) return d;
+      const next = { ...d, ...patch };
+      persist(next);
+      return next;
+    });
+  };
+
+  const create = async () => {
+    try {
+      const saved = await api.saveQueue({ ...NEW_QUEUE, name: `Queue ${queues.length}` });
+      refresh();
+      setDraft(saved);
+      setSelectedId(saved.id);
+    } catch (err) {
+      toast.show({ tone: 'error', title: "Couldn't create the queue", description: errText(err) });
+    }
+  };
+
+  const remove = async () => {
+    if (!draft) return;
+    if (!confirmDelete) {
+      setConfirmDelete(true);
+      window.setTimeout(() => setConfirmDelete(false), 3500);
+      return;
+    }
+    try {
+      await api.deleteQueue(draft.id);
+      setSelectedId('main');
+      setDraft(null);
+      refresh();
+      toast.show({ tone: 'success', title: 'Queue deleted', description: 'Its downloads moved to the Main queue.' });
+    } catch (err) {
+      toast.show({ tone: 'error', title: "Couldn't delete the queue", description: errText(err) });
+    }
+  };
+
+  if (!info || !draft || draft.id !== info.id) return null;
+  const problem = problemWith(draft);
+  const days = draft.days;
+  const statusTitle = info.open ? (info.active > 0 ? 'Running' : 'Ready') : 'Waiting for its schedule';
+  const statusText = info.open
+    ? `${info.active} downloading · ${info.queued} waiting`
+    : info.next_start
+      ? `Opens ${whenText(info.next_start)} · ${info.queued} waiting`
+      : `${info.queued} waiting`;
+
   return (
     <>
+      <div className="mb-5 flex flex-wrap items-center gap-1.5">
+        {queues.map((q) => (
+          <button
+            key={q.id}
+            type="button"
+            onClick={() => setSelectedId(q.id)}
+            className={cn(
+              'flex h-8 items-center gap-2 rounded-lg px-3 text-[13px] font-medium transition-colors',
+              q.id === info.id ? 'bg-accent-soft text-accent' : 'bg-surface-2 text-fg-2 shadow-[inset_0_0_0_1px_var(--line)] hover:text-fg',
+            )}
+          >
+            <span className={cn('h-1.5 w-1.5 rounded-full', q.open ? 'bg-success' : 'bg-fg-3')} />
+            {q.name}
+          </button>
+        ))}
+        <Button size="sm" variant="ghost" icon={Plus} onClick={create}>
+          New queue
+        </Button>
+      </div>
+
       <Group>
-        <SettingRow title="Run the queue on a schedule" description="Start queued downloads at a set time and stop them later — handy for off-peak hours.">
-          <Switch checked={s.scheduler_enabled} onChange={(v) => set({ scheduler_enabled: v })} label="Enable scheduler" />
+        <SettingRow title={statusTitle} description={statusText}>
+          <div className="flex gap-1.5">
+            <Button size="sm" variant="secondary" icon={Play} onClick={() => api.startQueue(info.id).then(refresh).catch(() => {})}>
+              Start now
+            </Button>
+            <Button size="sm" variant="secondary" icon={Square} onClick={() => api.stopQueue(info.id).then(refresh).catch(() => {})}>
+              Stop
+            </Button>
+          </div>
         </SettingRow>
       </Group>
-      <div className={cn('transition-opacity', !s.scheduler_enabled && 'pointer-events-none opacity-45')}>
-        <Group title="Window">
-          <SettingRow title="Days" stacked>
-            <div className="flex gap-1.5">
-              {DAYS.map((d) => {
-                const on = days.includes(d.id);
-                return (
-                  <button
-                    key={d.id}
-                    type="button"
-                    onClick={() => set({ scheduler_days: on ? days.filter((x) => x !== d.id) : [...days, d.id] })}
-                    className={cn(
-                      'h-8 flex-1 rounded-lg text-[12.5px] font-medium transition-colors',
-                      on ? 'bg-accent text-accent-fg' : 'bg-surface-2 text-fg-2 shadow-[inset_0_0_0_1px_var(--line)] hover:text-fg',
-                    )}
-                  >
-                    {d.label}
-                  </button>
-                );
-              })}
-            </div>
-          </SettingRow>
-          <SettingRow title="Start at">
-            <TimeInput value={s.scheduler_start_time || '02:00'} onChange={(v) => set({ scheduler_start_time: v })} />
-          </SettingRow>
-          <SettingRow title="Stop at">
-            <TimeInput value={s.scheduler_stop_time || '07:00'} onChange={(v) => set({ scheduler_stop_time: v })} />
-          </SettingRow>
-        </Group>
-        <Group title="While scheduled">
-          <SettingRow title="Speed limit" description="Applies only inside the window.">
-            <NumberInput
-              value={kb(s.scheduler_speed_limit)}
-              unit="KB/s"
-              placeholder="Unlimited"
-              onChange={(v) => set({ scheduler_speed_limit: v * 1024 })}
-              className="w-36"
+
+      <Group title="Queue">
+        <SettingRow title="Name">
+          <Input value={draft.name} onChange={(e) => update({ name: e.target.value })} maxLength={40} className="w-56" />
+        </SettingRow>
+      </Group>
+
+      <Group title="Schedule">
+        <SettingRow
+          title="Run on a schedule"
+          description={draft.schedule_enabled ? 'Downloads in this queue only run at the times below.' : 'Off: downloads in this queue run whenever there is room.'}
+        >
+          <Switch checked={draft.schedule_enabled} onChange={(v) => update({ schedule_enabled: v })} label="Run on a schedule" />
+        </SettingRow>
+        {draft.schedule_enabled && (
+          <>
+            <SettingRow title="Days" stacked>
+              <div className="flex gap-1.5">
+                {DAYS.map((d) => {
+                  const on = days.includes(d.id);
+                  return (
+                    <button
+                      key={d.id}
+                      type="button"
+                      onClick={() => update({ days: on ? days.filter((x) => x !== d.id) : [...days, d.id] })}
+                      className={cn(
+                        'h-8 flex-1 rounded-lg text-[12.5px] font-medium transition-colors',
+                        on ? 'bg-accent text-accent-fg' : 'bg-surface-2 text-fg-2 shadow-[inset_0_0_0_1px_var(--line)] hover:text-fg',
+                      )}
+                    >
+                      {d.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </SettingRow>
+            <SettingRow title="Start at">
+              <TimeInput value={draft.start_time} onChange={(v) => update({ start_time: v })} />
+            </SettingRow>
+            <SettingRow
+              title="Stop at a set time"
+              description={draft.stop_time ? 'Running downloads are paused when the time comes and continue at the next start.' : 'Off: after starting, the queue runs until it is empty.'}
+            >
+              <div className="flex items-center gap-3">
+                {draft.stop_time && <TimeInput value={draft.stop_time} onChange={(v) => update({ stop_time: v })} />}
+                <Switch checked={!!draft.stop_time} onChange={(v) => update({ stop_time: v ? '07:00' : null })} label="Stop at a set time" />
+              </div>
+            </SettingRow>
+          </>
+        )}
+      </Group>
+
+      <Group title="Limits">
+        <SettingRow title="Downloads at the same time" description="How many from this queue run together.">
+          <Select
+            value={String(draft.max_active)}
+            onValueChange={(v) => update({ max_active: Number(v) })}
+            options={[{ value: '0', label: 'Default' }, ...[1, 2, 3, 4, 5, 6, 8].map((n) => ({ value: String(n), label: String(n) }))]}
+            className="w-32"
+          />
+        </SettingRow>
+        <SettingRow title="Speed limit" description="Shared by everything in this queue.">
+          <NumberInput
+            value={kb(draft.speed_limit)}
+            unit="KB/s"
+            placeholder="Unlimited"
+            onChange={(v) => update({ speed_limit: v * 1024 })}
+            className="w-36"
+          />
+        </SettingRow>
+      </Group>
+
+      <Group title="When it finishes">
+        <SettingRow title="Then" description="Runs once the last download in this queue is done.">
+          <Select
+            value={draft.after_done}
+            onValueChange={(v) => update({ after_done: v as DownloadQueue['after_done'] })}
+            options={AFTER_OPTIONS}
+            className="w-52"
+          />
+        </SettingRow>
+        {draft.after_done === 'program' && (
+          <SettingRow title="Program" stacked>
+            <Input
+              mono
+              value={draft.after_done_program ?? ''}
+              onChange={(e) => update({ after_done_program: e.target.value })}
+              placeholder="C:\Tools\backup.exe"
             />
           </SettingRow>
-          <SettingRow title="When the window ends">
+        )}
+        <SettingRow title="Retry failed downloads" description={draft.retry_count > 0 ? 'Put back in the queue automatically.' : undefined}>
+          <div className="flex items-center gap-2">
+            {draft.retry_count > 0 && (
+              <Select
+                value={String(draft.retry_delay_secs)}
+                onValueChange={(v) => update({ retry_delay_secs: Number(v) })}
+                options={[
+                  { value: '30', label: 'after 30 s' },
+                  { value: '60', label: 'after 1 min' },
+                  { value: '300', label: 'after 5 min' },
+                  { value: '900', label: 'after 15 min' },
+                ]}
+                className="w-32"
+              />
+            )}
             <Select
-              value={s.scheduler_action || 'none'}
-              onValueChange={(v) => set({ scheduler_action: v as AppSettings['scheduler_action'] })}
-              options={[
-                { value: 'none', label: 'Pause the queue' },
-                { value: 'sleep', label: 'Sleep computer' },
-                { value: 'shutdown', label: 'Shut down computer' },
-                { value: 'exit', label: 'Quit Nexdrop' },
-              ]}
-              className="w-48"
+              value={String(draft.retry_count)}
+              onValueChange={(v) => update({ retry_count: Number(v) })}
+              options={[0, 1, 2, 3, 5, 10].map((n) => ({ value: String(n), label: n === 0 ? 'Off' : `${n} time${n === 1 ? '' : 's'}` }))}
+              className="w-28"
             />
-          </SettingRow>
-        </Group>
-      </div>
+          </div>
+        </SettingRow>
+      </Group>
+
+      {problem && <p className="-mt-2 mb-5 px-0.5 text-[12.5px] text-warning">{problem} Changes are saved once this is fixed.</p>}
+
+      {info.id !== 'main' && (
+        <Button size="sm" variant="ghost" icon={Trash} onClick={remove} className={cn(confirmDelete ? 'text-danger' : 'hover:text-danger')}>
+          {confirmDelete ? 'Click again to delete' : 'Delete queue'}
+        </Button>
+      )}
     </>
   );
 };

@@ -18,3 +18,17 @@ pub fn shutdown_computer() {
         let _ = crate::process::command("shutdown").args(["/s", "/t", "0"]).spawn();
     }
 }
+
+pub fn hibernate_computer() {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = crate::process::command("shutdown").args(["/h"]).spawn();
+    }
+}
+
+pub fn lock_computer() {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = crate::process::command("rundll32.exe").args(["user32.dll,LockWorkStation"]).spawn();
+    }
+}

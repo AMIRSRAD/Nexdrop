@@ -10,9 +10,11 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::db::models::{
-    AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadProgressEvent, DownloadStatus, DownloadTask, FileCategory,
-    SiteCredential,
+    AddDownloadRequest, AddTorrentRequest, AppSettings, DownloadProgressEvent, DownloadQueue, DownloadStatus, DownloadTask,
+    FileCategory, QueueInfo, SiteCredential, MAIN_QUEUE_ID,
 };
+use crate::engine::queues;
+use crate::engine::speed::RateLimiter;
 use crate::db::Repository;
 use crate::engine::downloader::DownloadEngine;
 use crate::engine::auth::{build_header_list, headers_for_credential, is_forbidden_header};
@@ -31,6 +33,15 @@ pub struct StatusSummary {
     pub speed_bps: u64,
 }
 
+/// Live state of one queue (never saved).
+#[derive(Default)]
+struct QueueRuntime {
+    /// "Start now" (or a start-time trigger) opened the queue until it empties.
+    forced_open: bool,
+    was_open: Option<bool>,
+    last_checked: Option<chrono::DateTime<chrono::Local>>,
+}
+
 pub struct DownloadManager {
     db_path: PathBuf,
     engine: DownloadEngine,
@@ -44,12 +55,18 @@ pub struct DownloadManager {
     probe_cache: Mutex<HashMap<String, (Instant, ProbeResult)>>,
     /// Downloads that finished since the queue was last idle ("when all finish" actions).
     completed_in_batch: AtomicUsize,
-    /// True while the scheduler's time window is open (selects the scheduler speed cap).
-    scheduler_window_open: AtomicBool,
     /// Downloads the scheduler paused when its window closed; resumed when it reopens.
     scheduler_paused: Mutex<HashSet<String>>,
     /// Cancel flag of a pending sleep/shutdown countdown, if one is running.
     pending_power: Mutex<Option<Arc<AtomicBool>>>,
+    /// What each queue is doing right now (forced open, last evaluation).
+    queue_runtime: Mutex<HashMap<String, QueueRuntime>>,
+    /// Speed cap shared by every download of a queue.
+    queue_limiters: Mutex<HashMap<String, Arc<RateLimiter>>>,
+    /// Downloads finished per queue since it was last empty ("when finished" actions).
+    queue_batches: Mutex<HashMap<String, usize>>,
+    /// Automatic retries used so far per download.
+    retries_used: Mutex<HashMap<String, u32>>,
     /// BitTorrent session (created on first use).
     torrents: TorrentEngine,
     app_handle: AppHandle,
@@ -64,9 +81,12 @@ impl DownloadManager {
             queue_lock: AsyncMutex::new(()),
             probe_cache: Mutex::new(HashMap::new()),
             completed_in_batch: AtomicUsize::new(0),
-            scheduler_window_open: AtomicBool::new(false),
             scheduler_paused: Mutex::new(HashSet::new()),
             pending_power: Mutex::new(None),
+            queue_runtime: Mutex::new(HashMap::new()),
+            queue_limiters: Mutex::new(HashMap::new()),
+            queue_batches: Mutex::new(HashMap::new()),
+            retries_used: Mutex::new(HashMap::new()),
             torrents: TorrentEngine::new(),
             app_handle,
         }
@@ -144,23 +164,14 @@ impl DownloadManager {
     /// after settings change, and when the scheduler window opens or closes.
     pub fn apply_runtime_settings(&self) {
         let settings = self.get_settings();
-        let mut limit = settings.global_speed_limit;
-        if settings.scheduler_enabled
-            && self.scheduler_window_open.load(Ordering::Relaxed)
-            && settings.scheduler_speed_limit > 0
-        {
-            limit = if limit == 0 { settings.scheduler_speed_limit } else { limit.min(settings.scheduler_speed_limit) };
-        }
+        let limit = settings.global_speed_limit;
         self.engine.set_global_speed_limit(limit);
         self.torrents.apply_limits(settings.torrent_upload_limit, limit);
     }
 
     fn torrent_settings(&self) -> TorrentSettings {
         let settings = self.get_settings();
-        let mut limit = settings.global_speed_limit;
-        if settings.scheduler_enabled && self.scheduler_window_open.load(Ordering::Relaxed) && settings.scheduler_speed_limit > 0 {
-            limit = if limit == 0 { settings.scheduler_speed_limit } else { limit.min(settings.scheduler_speed_limit) };
-        }
+        let limit = settings.global_speed_limit;
         TorrentSettings {
             upload_limit: settings.torrent_upload_limit,
             download_limit: limit,
@@ -171,8 +182,9 @@ impl DownloadManager {
         }
     }
 
-    pub fn set_scheduler_window(&self, open: bool) {
-        self.scheduler_window_open.store(open, Ordering::Relaxed);
+    /// Re-applies settings that depend on the schedule. (The queues own the
+    /// schedule now; this stays for callers that only need the global cap refreshed.)
+    pub fn set_scheduler_window(&self, _open: bool) {
         self.apply_runtime_settings();
     }
 
@@ -270,6 +282,7 @@ impl DownloadManager {
         let _ = std::fs::create_dir_all(&dest_dir);
         let dest_dir_str = dest_dir.to_string_lossy().to_string();
 
+        let queue_id = self.valid_queue_id(req.queue_id.as_deref());
         let connections = req
             .connections
             .unwrap_or(settings.default_connections)
@@ -332,6 +345,7 @@ impl DownloadManager {
             peers: 0,
             seeding: false,
             torrent_files: vec![],
+            queue_id,
         };
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -360,34 +374,19 @@ impl DownloadManager {
         }
     }
 
-    /// Startup: recover interrupted downloads and resume them, unless the
-    /// scheduler says it isn't time yet (then they wait for its window to open).
+    /// Startup: recover interrupted downloads and resume them. Queues that are
+    /// outside their schedule keep their downloads waiting.
     pub async fn startup_resume(self: &Arc<Self>) {
-        let settings = self.get_settings();
-        let waiting_for_window = settings.scheduler_enabled && !crate::engine::scheduler::window_is_open_now(&settings);
-        self.scheduler_window_open
-            .store(settings.scheduler_enabled && !waiting_for_window, Ordering::Relaxed);
+        self.ensure_queues();
         self.apply_runtime_settings();
 
         self.recover_interrupted();
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move { manager.resume_seeding_after_start().await });
-        if !settings.auto_resume_on_launch {
+        if !self.get_settings().auto_resume_on_launch {
             return;
         }
-        if waiting_for_window {
-            if let Ok(conn) = self.get_db_conn() {
-                let now = chrono::Utc::now().timestamp();
-                for task in Repository::get_all_downloads(&conn).unwrap_or_default() {
-                    if task.status == DownloadStatus::Queued {
-                        let _ = Repository::update_status(&conn, &task.id, DownloadStatus::Paused, None, None, now);
-                        self.scheduler_paused.lock().insert(task.id);
-                    }
-                }
-            }
-        } else {
-            self.process_queue().await;
-        }
+        self.process_queue().await;
     }
 
     // ───────────────────────────── torrents ─────────────────────────────
@@ -467,6 +466,7 @@ impl DownloadManager {
 
         let now = chrono::Utc::now().timestamp();
         let id = Uuid::new_v4().to_string();
+        let queue_id = self.valid_queue_id(req.queue_id.as_deref());
         let task = DownloadTask {
             id: id.clone(),
             url: req.source.clone().unwrap_or_else(|| format!("magnet:?xt=urn:btih:{}", probe.info_hash)),
@@ -510,6 +510,7 @@ impl DownloadManager {
             peers: 0,
             seeding: false,
             torrent_files: files,
+            queue_id,
         };
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -682,10 +683,243 @@ impl DownloadManager {
         }
     }
 
-    /// The scheduler window closed: pause everything that is running and remember
-    /// it, so it can pick up again when the window reopens. Returns how many were paused.
-    pub async fn scheduler_pause_active(&self) -> usize {
-        let ids = self.get_active_task_ids();
+    // ───────────────────────────── queues ─────────────────────────────
+
+    /// The queues, oldest first. The Main queue always exists: it is created
+    /// from the old single-scheduler settings the first time.
+    pub fn ensure_queues(&self) -> Vec<DownloadQueue> {
+        let Ok(conn) = self.get_db_conn() else { return vec![queues::main_queue_from_settings(&self.get_settings())] };
+        let mut list = Repository::list_queues(&conn).unwrap_or_default();
+        if !list.iter().any(|q| q.id == MAIN_QUEUE_ID) {
+            let main = queues::main_queue_from_settings(&self.get_settings());
+            let _ = Repository::save_queue(&conn, &main);
+            list.insert(0, main);
+        }
+        list
+    }
+
+    pub fn queue_by_id(&self, id: &str) -> Option<DownloadQueue> {
+        self.ensure_queues().into_iter().find(|q| q.id == id)
+    }
+
+    /// `requested` if such a queue exists, otherwise the Main queue.
+    fn valid_queue_id(&self, requested: Option<&str>) -> String {
+        match requested {
+            Some(id) if !id.is_empty() && self.queue_by_id(id).is_some() => id.to_string(),
+            _ => MAIN_QUEUE_ID.to_string(),
+        }
+    }
+
+    fn queue_limiter(&self, q: &DownloadQueue) -> Arc<RateLimiter> {
+        let mut map = self.queue_limiters.lock();
+        let limiter = map.entry(q.id.clone()).or_insert_with(|| Arc::new(RateLimiter::new(0)));
+        limiter.set_rate(q.speed_limit);
+        limiter.clone()
+    }
+
+    fn queue_forced_open(&self, id: &str) -> bool {
+        self.queue_runtime.lock().get(id).map(|r| r.forced_open).unwrap_or(false)
+    }
+
+    pub fn queue_is_open(&self, q: &DownloadQueue) -> bool {
+        queues::is_open(q, self.queue_forced_open(&q.id), chrono::Local::now())
+    }
+
+    /// Queues with live numbers for the interface.
+    pub fn queue_infos(&self) -> Vec<QueueInfo> {
+        let all = self
+            .get_db_conn()
+            .and_then(|conn| Repository::get_all_downloads(&conn))
+            .unwrap_or_default();
+        let active = self.get_active_task_ids();
+        let now = chrono::Local::now();
+        self.ensure_queues()
+            .into_iter()
+            .map(|queue| {
+                let open = self.queue_is_open(&queue);
+                let in_queue = |t: &&DownloadTask| t.queue_id == queue.id;
+                let active_n = all.iter().filter(in_queue).filter(|t| active.contains(&t.id)).count();
+                let queued = all.iter().filter(in_queue).filter(|t| t.status == DownloadStatus::Queued && !active.contains(&t.id)).count();
+                let next_start = if open { None } else { queues::next_start(&queue, now).map(|t| t.timestamp()) };
+                QueueInfo { queue, open, active: active_n, queued, next_start }
+            })
+            .collect()
+    }
+
+    pub fn save_queue(&self, queue: DownloadQueue) -> Result<DownloadQueue, String> {
+        let existing = self.ensure_queues();
+        let mut queue = queues::sanitize(queue)?;
+        if queue.id.is_empty() {
+            queue.id = Uuid::new_v4().to_string();
+            queue.position = existing.iter().map(|q| q.position).max().unwrap_or(0) + 1;
+        } else if let Some(old) = existing.iter().find(|q| q.id == queue.id) {
+            queue.position = old.position;
+        }
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::save_queue(&conn, &queue).map_err(|e| e.to_string())?;
+        // A changed schedule is picked up on the next tick (which also pauses or
+        // resumes the queue if the new schedule says it should be closed or open).
+        if let Some(rt) = self.queue_runtime.lock().get_mut(&queue.id) {
+            rt.last_checked = None;
+        }
+        if let Some(limiter) = self.queue_limiters.lock().get(&queue.id) {
+            limiter.set_rate(queue.speed_limit);
+        }
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        Ok(queue)
+    }
+
+    /// Deletes a queue; its downloads move to the Main queue.
+    pub fn delete_queue(&self, id: &str) -> Result<(), String> {
+        if id == MAIN_QUEUE_ID {
+            return Err("The Main queue can't be deleted".to_string());
+        }
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::delete_queue(&conn, id, MAIN_QUEUE_ID).map_err(|e| e.to_string())?;
+        self.queue_runtime.lock().remove(id);
+        self.queue_limiters.lock().remove(id);
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
+        Ok(())
+    }
+
+    pub async fn move_to_queue(self: &Arc<Self>, ids: Vec<String>, queue_id: &str) -> Result<(), String> {
+        let queue_id = self.valid_queue_id(Some(queue_id));
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::set_download_queue(&conn, &ids, &queue_id).map_err(|e| e.to_string())?;
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        self.process_queue().await;
+        Ok(())
+    }
+
+    /// Ids of the downloads in `queue_id` that are not finished.
+    fn unfinished_in_queue(&self, queue_id: &str) -> Vec<DownloadTask> {
+        self.get_db_conn()
+            .and_then(|conn| Repository::get_all_downloads(&conn))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.queue_id == queue_id && matches!(t.status, DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Paused))
+            .collect()
+    }
+
+    /// "Start now": opens the queue regardless of its schedule, resumes what
+    /// was paused in it and starts working through it.
+    pub async fn start_queue(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.queue_by_id(id).is_none() {
+            return Err("Queue not found".to_string());
+        }
+        self.queue_runtime.lock().entry(id.to_string()).or_default().forced_open = true;
+        if let Ok(conn) = self.get_db_conn() {
+            let now = chrono::Utc::now().timestamp();
+            for task in self.unfinished_in_queue(id) {
+                if task.status == DownloadStatus::Paused {
+                    let _ = Repository::update_status(&conn, &task.id, DownloadStatus::Queued, None, None, now);
+                }
+            }
+        }
+        self.scheduler_paused.lock().retain(|tid| {
+            // Forgotten: everything paused in this queue was just re-queued.
+            self.get_db_conn().ok().and_then(|c| Repository::get_download(&c, tid).ok().flatten()).map(|t| t.queue_id != id).unwrap_or(false)
+        });
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        self.process_queue().await;
+        Ok(())
+    }
+
+    /// "Stop": pauses everything running or waiting in the queue and takes back
+    /// any "Start now".
+    pub async fn stop_queue(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.queue_by_id(id).is_none() {
+            return Err("Queue not found".to_string());
+        }
+        self.queue_runtime.lock().entry(id.to_string()).or_default().forced_open = false;
+        for task in self.unfinished_in_queue(id) {
+            if task.status != DownloadStatus::Paused {
+                let _ = self.pause_download(&task.id);
+            }
+        }
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        Ok(())
+    }
+
+    /// Called every few seconds: opens and closes queues as their schedules say.
+    pub async fn queue_tick(self: &Arc<Self>) {
+        let now = chrono::Local::now();
+        let mut opened_any = false;
+        let mut changed = false;
+        for queue in self.ensure_queues() {
+            // Start-time triggers: did the start time pass since we last looked?
+            let (forced, was_open, since) = {
+                let mut map = self.queue_runtime.lock();
+                let rt = map.entry(queue.id.clone()).or_default();
+                // On the first look, catch a start time that passed in the last few minutes.
+                let since = rt.last_checked.unwrap_or(now - chrono::Duration::minutes(5));
+                if queues::start_crossed(&queue, since, now) {
+                    rt.forced_open = true;
+                }
+                rt.last_checked = Some(now);
+                (rt.forced_open, rt.was_open, since)
+            };
+            let _ = (forced, since);
+            let open = self.queue_is_open(&queue);
+
+            if was_open != Some(open) {
+                self.queue_runtime.lock().entry(queue.id.clone()).or_default().was_open = Some(open);
+                changed = true;
+                match was_open {
+                    // First evaluation. A closed queue must not have anything running
+                    // (e.g. its schedule was edited before we ever saw it open).
+                    None if open => opened_any = true,
+                    None => {
+                        let paused = self.pause_queue_for_schedule(&queue.id).await;
+                        if paused > 0 {
+                            let _ = self.app_handle.emit(
+                                "scheduler-event",
+                                serde_json::json!({ "event": "stopped", "queue": queue.name, "paused": paused }),
+                            );
+                        }
+                    }
+                    Some(false) if open => {
+                        opened_any = true;
+                        self.resume_scheduler_paused(&queue.id);
+                        let _ = self.app_handle.emit(
+                            "scheduler-event",
+                            serde_json::json!({ "event": "started", "queue": queue.name }),
+                        );
+                    }
+                    Some(true) if !open => {
+                        let paused = self.pause_queue_for_schedule(&queue.id).await;
+                        let _ = self.app_handle.emit(
+                            "scheduler-event",
+                            serde_json::json!({ "event": "stopped", "queue": queue.name, "paused": paused }),
+                        );
+                        if paused > 0 {
+                            self.run_queue_action(&queue);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if changed {
+            let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        }
+        if opened_any {
+            let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
+            self.process_queue().await;
+        }
+    }
+
+    /// A queue's window closed: pause what it was running and remember it.
+    async fn pause_queue_for_schedule(&self, queue_id: &str) -> usize {
+        let all = self.get_db_conn().and_then(|c| Repository::get_all_downloads(&c)).unwrap_or_default();
+        let ids: Vec<String> = self
+            .get_active_task_ids()
+            .into_iter()
+            .filter(|id| all.iter().any(|t| &t.id == id && t.queue_id == queue_id))
+            .collect();
         for id in &ids {
             if self.pause_download(id).is_ok() {
                 self.scheduler_paused.lock().insert(id.clone());
@@ -693,7 +927,7 @@ impl DownloadManager {
         }
         // Give the runs a moment to stop and save their progress.
         for _ in 0..100 {
-            if self.active_controllers.lock().is_empty() {
+            if ids.iter().all(|id| !self.active_controllers.lock().contains_key(id)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -701,27 +935,118 @@ impl DownloadManager {
         ids.len()
     }
 
-    /// The scheduler window opened: bring back what it paused, then fill the queue.
-    pub async fn scheduler_resume(self: &Arc<Self>) {
-        let ids: Vec<String> = self.scheduler_paused.lock().drain().collect();
-        if let Ok(conn) = self.get_db_conn() {
-            let now = chrono::Utc::now().timestamp();
-            for id in ids {
-                // Only if it's still sitting where the scheduler left it.
-                if let Ok(Some(task)) = Repository::get_download(&conn, &id) {
-                    if task.status == DownloadStatus::Paused {
-                        let _ = Repository::update_status(&conn, &id, DownloadStatus::Queued, None, None, now);
-                    }
-                }
+    /// A queue's window opened: bring back what the schedule paused in it.
+    fn resume_scheduler_paused(&self, queue_id: &str) {
+        let Ok(conn) = self.get_db_conn() else { return };
+        let now = chrono::Utc::now().timestamp();
+        let ids: Vec<String> = self.scheduler_paused.lock().iter().cloned().collect();
+        for id in ids {
+            let Ok(Some(task)) = Repository::get_download(&conn, &id) else {
+                self.scheduler_paused.lock().remove(&id);
+                continue;
+            };
+            if task.queue_id != queue_id {
+                continue;
+            }
+            self.scheduler_paused.lock().remove(&id);
+            // Only if it's still sitting where the schedule left it.
+            if task.status == DownloadStatus::Paused {
+                let _ = Repository::update_status(&conn, &id, DownloadStatus::Queued, None, None, now);
             }
         }
-        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
-        self.process_queue().await;
+    }
+
+    /// Puts a failed download back in its queue after the queue's retry delay.
+    fn schedule_auto_retry(self: &Arc<Self>, task_id: &str, queue_id: &str) {
+        let Some(queue) = self.queue_by_id(queue_id) else { return };
+        if queue.retry_count == 0 {
+            return;
+        }
+        let used = {
+            let mut map = self.retries_used.lock();
+            let n = map.entry(task_id.to_string()).or_insert(0);
+            if *n >= queue.retry_count {
+                return;
+            }
+            *n += 1;
+            *n
+        };
+        let (manager, id) = (Arc::clone(self), task_id.to_string());
+        let delay = Duration::from_secs(queue.retry_delay_secs);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Ok(conn) = manager.get_db_conn() else { return };
+            // Still failed? (The user may have retried, paused or removed it meanwhile.)
+            if let Ok(Some(task)) = Repository::get_download(&conn, &id) {
+                if task.status == DownloadStatus::Failed {
+                    let _ = Repository::update_status(&conn, &id, DownloadStatus::Queued, None, None, chrono::Utc::now().timestamp());
+                    log::info!("Retrying {} automatically (attempt {used})", task.filename);
+                    let _ = manager.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
+                    manager.process_queue().await;
+                }
+            }
+        });
+    }
+
+    /// After a run ends: if its queue is now empty, finish the queue (clear
+    /// "Start now" and run its "when finished" action).
+    fn queue_finished_check(self: &Arc<Self>, queue_id: &str) {
+        let active = self.get_active_task_ids();
+        let busy = self
+            .get_db_conn()
+            .and_then(|conn| Repository::get_all_downloads(&conn))
+            .map(|all| {
+                all.iter().any(|t| {
+                    t.queue_id == queue_id
+                        && (active.contains(&t.id) || t.status == DownloadStatus::Queued)
+                })
+            })
+            .unwrap_or(true);
+        if busy {
+            return;
+        }
+        let finished = self.queue_batches.lock().remove(queue_id).unwrap_or(0);
+        let was_forced = self.queue_runtime.lock().get_mut(queue_id).map(|r| std::mem::take(&mut r.forced_open)).unwrap_or(false);
+        if was_forced {
+            let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        }
+        if finished == 0 {
+            return;
+        }
+        if let Some(queue) = self.queue_by_id(queue_id) {
+            self.run_queue_action(&queue);
+        }
+    }
+
+    /// The queue's "when finished" action. Sleep/hibernate/shut down get a cancelable countdown.
+    fn run_queue_action(self: &Arc<Self>, queue: &DownloadQueue) {
+        match queue.after_done.as_str() {
+            "sleep" => self.schedule_power_action("sleep", 30),
+            "hibernate" => self.schedule_power_action("hibernate", 30),
+            "shutdown" => self.schedule_power_action("shutdown", 60),
+            "lock" => crate::power::lock_computer(),
+            "exit" => crate::quit_app(&self.app_handle),
+            "program" => {
+                if let Some(program) = &queue.after_done_program {
+                    let _ = crate::process::command(program).spawn();
+                }
+            }
+            "notify" => {
+                let settings = self.get_settings();
+                crate::notify::toast(
+                    &self.app_handle,
+                    &format!("{} finished", queue.name),
+                    "All downloads in this queue are done.",
+                    settings.sound_enabled,
+                );
+            }
+            _ => {}
+        }
     }
 
     // ───────────────────────────── "when finished" actions ─────────────────────────────
 
-    /// Runs the user's "when all downloads finish" action once the queue has gone idle.
+    /// Runs the user's "when all downloads finish" action once everything has gone idle.
     fn run_completion_action_if_idle(self: &Arc<Self>) {
         if !self.active_controllers.lock().is_empty() {
             return;
@@ -783,6 +1108,7 @@ impl DownloadManager {
             manager.pending_power.lock().take();
             match action.as_str() {
                 "sleep" => crate::power::sleep_computer(),
+                "hibernate" => crate::power::hibernate_computer(),
                 "shutdown" => crate::power::shutdown_computer(),
                 _ => {}
             }
@@ -806,24 +1132,26 @@ impl DownloadManager {
         let _guard = self.queue_lock.lock().await;
 
         let settings = self.get_settings();
-        let active_count = self.active_controllers.lock().len();
-
-        if active_count >= settings.max_active_downloads {
+        let active_ids: Vec<String> = self.active_controllers.lock().keys().cloned().collect();
+        if active_ids.len() >= settings.max_active_downloads {
             return;
         }
 
-        let slots_available = settings.max_active_downloads - active_count;
+        let slots_available = settings.max_active_downloads - active_ids.len();
         let all = match self.get_db_conn().and_then(|conn| Repository::get_all_downloads(&conn)) {
             Ok(tasks) => tasks,
             Err(_) => return,
         };
 
-        // Filter queued tasks, sorted by priority DESC, created_at ASC
-        let mut queued: Vec<DownloadTask> = all
-            .into_iter()
-            .filter(|t| t.status == DownloadStatus::Queued)
-            .collect();
+        // Which queues may start something, and how many each is already running.
+        let queue_list = self.ensure_queues();
+        let mut running: HashMap<&str, usize> = HashMap::new();
+        for t in all.iter().filter(|t| active_ids.contains(&t.id)) {
+            *running.entry(t.queue_id.as_str()).or_insert(0) += 1;
+        }
 
+        // Filter queued tasks, sorted by priority DESC, created_at ASC
+        let mut queued: Vec<&DownloadTask> = all.iter().filter(|t| t.status == DownloadStatus::Queued).collect();
         queued.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.created_at.cmp(&b.created_at)));
 
         let mut started = 0;
@@ -831,8 +1159,21 @@ impl DownloadManager {
             if started >= slots_available {
                 break;
             }
-            if self.start_download(task) {
+            let queue = queue_list.iter().find(|q| q.id == task.queue_id).or_else(|| queue_list.iter().find(|q| q.id == MAIN_QUEUE_ID));
+            if let Some(queue) = queue {
+                if !self.queue_is_open(queue) {
+                    continue;
+                }
+                let n = running.get(queue.id.as_str()).copied().unwrap_or(0);
+                if queue.max_active > 0 && n >= queue.max_active {
+                    continue;
+                }
+            }
+            if self.start_download(task.clone()) {
                 started += 1;
+                if let Some(queue) = queue {
+                    *running.entry(queue.id.as_str()).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -860,6 +1201,12 @@ impl DownloadManager {
         let task_id = task.id.clone();
         let engine = self.engine.clone();
         let is_torrent = task.kind == "torrent";
+        let queue_id = task.queue_id.clone();
+        let task_queue = self.queue_by_id(&queue_id);
+        let engine = match &task_queue {
+            Some(q) => engine.with_group_limit(self.queue_limiter(q)),
+            None => engine,
+        };
         // Saved-login headers are looked up fresh on every start (the login may have changed).
         let vault_headers = self.vault_headers(&task.url);
 
@@ -985,6 +1332,8 @@ impl DownloadManager {
                         }
                         let _ = app_handle.emit("download-completed", &final_task);
                         manager.completed_in_batch.fetch_add(1, Ordering::SeqCst);
+                        *manager.queue_batches.lock().entry(queue_id.clone()).or_insert(0) += 1;
+                        manager.retries_used.lock().remove(&task_id);
                         let threat = final_task.antivirus_status.as_deref() == Some("threat_detected");
                         let (title, success) = if threat {
                             ("Threat detected in download", false)
@@ -1013,6 +1362,7 @@ impl DownloadManager {
                         .map(|t| t.filename)
                         .unwrap_or_default();
                     manager.notify_outcome(&settings, "Download failed", &name, false);
+                    manager.schedule_auto_retry(&task_id, &queue_id);
                 }
             }
 
@@ -1021,6 +1371,7 @@ impl DownloadManager {
             let _ = app_handle.emit("download-status-changed", serde_json::json!({ "id": task_id }));
             manager.process_queue().await;
             manager.run_completion_action_if_idle();
+            manager.queue_finished_check(&queue_id);
         });
 
         true
@@ -1075,6 +1426,7 @@ impl DownloadManager {
         let task_opt = Repository::get_download(&conn, id).map_err(|e| e.to_string())?;
 
         if let Some(mut task) = task_opt {
+            self.retries_used.lock().remove(id);
             task.status = DownloadStatus::Queued;
             task.error_message = None;
             let now = chrono::Utc::now().timestamp();

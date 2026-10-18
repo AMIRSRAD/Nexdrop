@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::db::models::AppSettings;
 use crate::engine::DownloadManager;
@@ -85,66 +85,15 @@ pub fn to_unix_seconds(t: i64) -> i64 {
 pub struct DownloadScheduler;
 
 impl DownloadScheduler {
-    pub fn start_loop(app_handle: AppHandle, manager: Arc<DownloadManager>) {
+    pub fn start_loop(_app_handle: AppHandle, manager: Arc<DownloadManager>) {
         tauri::async_runtime::spawn(async move {
-            // None until the first evaluation, so we never "close" a window we never saw open.
-            let mut was_open: Option<bool> = None;
-
             loop {
                 tokio::time::sleep(TICK).await;
-
                 manager.start_due_scheduled().await;
                 manager.seeding_tick().await;
-
-                let settings = manager.get_settings();
-                if !settings.scheduler_enabled {
-                    if was_open.take().is_some() {
-                        // Switched off: lift the speed cap and let paused downloads continue.
-                        manager.set_scheduler_window(false);
-                        manager.scheduler_resume().await;
-                    }
-                    continue;
-                }
-
-                let open = window_is_open_now(&settings);
-                match (was_open, open) {
-                    (Some(prev), now) if prev == now => {}
-                    (None, true) => {
-                        manager.set_scheduler_window(true);
-                        manager.scheduler_resume().await;
-                    }
-                    (None, false) => manager.set_scheduler_window(false),
-                    (Some(false), true) => {
-                        manager.set_scheduler_window(true);
-                        let _ = app_handle.emit("scheduler-event", serde_json::json!({ "event": "started" }));
-                        manager.scheduler_resume().await;
-                    }
-                    (Some(true), false) => {
-                        manager.set_scheduler_window(false);
-                        let paused = manager.scheduler_pause_active().await;
-                        let _ = app_handle.emit(
-                            "scheduler-event",
-                            serde_json::json!({ "event": "stopped", "paused": paused, "action": settings.scheduler_action }),
-                        );
-                        // The action follows only if the window actually cut something short.
-                        if paused > 0 {
-                            Self::run_close_action(&app_handle, &manager, &settings.scheduler_action);
-                        }
-                    }
-                    _ => {}
-                }
-                was_open = Some(open);
+                manager.queue_tick().await;
             }
         });
-    }
-
-    fn run_close_action(app: &AppHandle, manager: &Arc<DownloadManager>, action: &str) {
-        match action {
-            "sleep" => manager.schedule_power_action("sleep", 30),
-            "shutdown" => manager.schedule_power_action("shutdown", 60),
-            "exit" => app.exit(0),
-            _ => {}
-        }
     }
 }
 

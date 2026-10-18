@@ -223,6 +223,7 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         min_chunk_size: None,
         proxy_mode: None,
         custom_proxy_url: None,
+        queue_id: None,
     };
 
     match mgr.add_download(req).await {

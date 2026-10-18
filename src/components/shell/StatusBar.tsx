@@ -1,6 +1,6 @@
 import React from 'react';
 import { ArrowDown, CalendarClock, Gauge, Power, Puzzle } from 'lucide-react';
-import type { AppSettings } from '../../types/download';
+import type { AppSettings, QueueInfo } from '../../types/download';
 import { formatSpeed } from '../../utils/format';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
 import { Tooltip } from '../ui/Tooltip';
@@ -15,6 +15,7 @@ interface StatusBarProps {
   settings: AppSettings;
   onChangeSettings: (patch: Partial<AppSettings>) => void;
   onOpenSettings: (section: string) => void;
+  queues: QueueInfo[];
 }
 
 const LIMITS = [0, 256, 512, 1024, 2048, 5120, 10240]; // KB/s
@@ -29,7 +30,10 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   settings,
   onChangeSettings,
   onOpenSettings,
+  queues,
 }) => {
+  const scheduled = queues.filter((q) => q.schedule_enabled);
+  const first = scheduled[0];
   const limitMenu = useDropdown('end');
   const doneMenu = useDropdown('end');
 
@@ -75,9 +79,15 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       </span>
 
       <div className="ml-auto flex items-center gap-1">
-        {settings.scheduler_enabled && (
-          <Chip icon={CalendarClock} onClick={() => onOpenSettings('scheduler')} tip="Scheduler is on">
-            {settings.scheduler_start_time ?? '—'}–{settings.scheduler_stop_time ?? '—'}
+        {first && (
+          <Chip
+            icon={CalendarClock}
+            onClick={() => onOpenSettings('scheduler')}
+            tip={scheduled.map((q) => `${q.name}: ${q.open ? 'open' : 'waiting'}`).join(' · ')}
+          >
+            {first.start_time}
+            {first.stop_time ? `–${first.stop_time}` : ''}
+            {scheduled.length > 1 && ` +${scheduled.length - 1}`}
           </Chip>
         )}
 

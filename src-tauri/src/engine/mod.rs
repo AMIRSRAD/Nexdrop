@@ -5,6 +5,7 @@ pub mod downloader;
 pub mod fileio;
 pub mod manager;
 pub mod probe;
+pub mod queues;
 pub mod ranges;
 pub mod scheduler;
 pub mod security;

@@ -334,6 +334,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
         min_chunk_size: None,
         proxy_mode,
         custom_proxy_url,
+        queue_id: None,
     })
 }
 
@@ -512,4 +513,36 @@ pub struct AppInfo {
 #[tauri::command]
 pub async fn get_app_info_cmd(app: tauri::AppHandle) -> Result<AppInfo, String> {
     Ok(AppInfo { name: app.package_info().name.clone(), version: app.package_info().version.to_string() })
+}
+
+// ───────────────────────────── queues ─────────────────────────────
+
+#[tauri::command]
+pub async fn get_queues_cmd(state: State<'_, AppState>) -> Result<Vec<crate::db::models::QueueInfo>, String> {
+    Ok(state.queue_infos())
+}
+
+#[tauri::command]
+pub async fn save_queue_cmd(state: State<'_, AppState>, queue: crate::db::models::DownloadQueue) -> Result<crate::db::models::DownloadQueue, String> {
+    state.save_queue(queue)
+}
+
+#[tauri::command]
+pub async fn delete_queue_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.delete_queue(&id)
+}
+
+#[tauri::command]
+pub async fn move_to_queue_cmd(state: State<'_, AppState>, ids: Vec<String>, queue_id: String) -> Result<(), String> {
+    state.move_to_queue(ids, &queue_id).await
+}
+
+#[tauri::command]
+pub async fn start_queue_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.start_queue(&id).await
+}
+
+#[tauri::command]
+pub async fn stop_queue_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.stop_queue(&id).await
 }

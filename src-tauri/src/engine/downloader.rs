@@ -81,6 +81,8 @@ const SINGLE_STREAM_ATTEMPTS: u32 = 5;
 pub struct DownloadEngine {
     pool: Arc<ClientPool>,
     global_limit: Arc<RateLimiter>,
+    /// Bandwidth shared by one group of downloads (a queue); set per run.
+    group_limit: Option<Arc<RateLimiter>>,
     retry_base: Duration,
 }
 
@@ -95,6 +97,7 @@ impl DownloadEngine {
         Self {
             pool: Arc::new(ClientPool::new()),
             global_limit: Arc::new(RateLimiter::new(0)),
+            group_limit: None,
             retry_base: Duration::from_secs(1),
         }
     }
@@ -107,6 +110,13 @@ impl DownloadEngine {
     /// Bandwidth cap shared by every running download, in bytes/s (0 = none).
     pub fn set_global_speed_limit(&self, bytes_per_sec: u64) {
         self.global_limit.set_rate(bytes_per_sec);
+    }
+
+    /// A copy of this engine whose runs also share `limit` (for example a queue's speed cap).
+    pub fn with_group_limit(&self, limit: Arc<RateLimiter>) -> Self {
+        let mut engine = self.clone();
+        engine.group_limit = Some(limit);
+        engine
     }
 
     /// Base delay for retry backoff (tests use a tiny one).
@@ -313,6 +323,9 @@ impl DownloadEngine {
 
             let limited = async {
                 task_limit.acquire(chunk_len as u64).await;
+                if let Some(group) = &self.group_limit {
+                    group.acquire(chunk_len as u64).await;
+                }
                 self.global_limit.acquire(chunk_len as u64).await;
             };
             tokio::select! {
@@ -481,6 +494,7 @@ impl DownloadEngine {
             writer_tx,
             task_limit: RateLimiter::new(task.speed_limit),
             global_limit: self.global_limit.clone(),
+            group_limit: self.group_limit.clone(),
             cancel: cancel_tx,
             fatal: Mutex::new(None),
             range_ok: AtomicBool::new(false),
@@ -747,6 +761,7 @@ struct Shared {
     writer_tx: mpsc::Sender<WriterMsg>,
     task_limit: RateLimiter,
     global_limit: Arc<RateLimiter>,
+    group_limit: Option<Arc<RateLimiter>>,
     cancel: watch::Sender<bool>,
     fatal: Mutex<Option<RoundFailure>>,
     /// Set once the server has answered a range request with 206.
@@ -1308,6 +1323,9 @@ async fn attempt(
         // Bandwidth limits (the wait is interruptible so Pause stays instant).
         let limited = async {
             shared.task_limit.acquire(take).await;
+            if let Some(group) = &shared.group_limit {
+                group.acquire(take).await;
+            }
             shared.global_limit.acquire(take).await;
         };
         tokio::select! {

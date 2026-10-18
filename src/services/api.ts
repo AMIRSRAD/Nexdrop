@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  DownloadQueue,
+  QueueInfo,
   AddDownloadRequest,
   AddTorrentRequest,
   AppSettings,
@@ -25,6 +27,26 @@ let mockSiteCredentials: SiteCredential[] = [
     username: 'octocat',
     token_or_cookie: 'ghp_exampleToken123',
     notes: 'GitHub personal access token',
+  },
+];
+
+let mockQueues: QueueInfo[] = [
+  {
+    id: 'main',
+    name: 'Main queue',
+    schedule_enabled: false,
+    days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+    start_time: '02:00',
+    stop_time: null,
+    max_active: 0,
+    speed_limit: 0,
+    after_done: 'none',
+    retry_count: 0,
+    retry_delay_secs: 60,
+    position: 0,
+    open: true,
+    active: 0,
+    queued: 0,
   },
 ];
 
@@ -493,6 +515,61 @@ export const api = {
         extension: 'iso',
       },
     ];
+  },
+
+  async getQueues(): Promise<QueueInfo[]> {
+    if (isTauri()) {
+      return await invoke<QueueInfo[]>('get_queues_cmd');
+    }
+    return mockQueues.map((q) => ({ ...q }));
+  },
+
+  async saveQueue(queue: DownloadQueue): Promise<DownloadQueue> {
+    if (isTauri()) {
+      return await invoke<DownloadQueue>('save_queue_cmd', { queue });
+    }
+    const saved: QueueInfo = {
+      ...(mockQueues.find((q) => q.id === queue.id) ?? { open: true, active: 0, queued: 0 }),
+      ...queue,
+      id: queue.id || `q-${Date.now()}`,
+    } as QueueInfo;
+    mockQueues = mockQueues.some((q) => q.id === saved.id) ? mockQueues.map((q) => (q.id === saved.id ? saved : q)) : [...mockQueues, saved];
+    return saved;
+  },
+
+  async deleteQueue(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('delete_queue_cmd', { id });
+    }
+    mockQueues = mockQueues.filter((q) => q.id !== id);
+  },
+
+  async moveToQueue(ids: string[], queueId: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('move_to_queue_cmd', { ids, queueId });
+    }
+    const set = new Set(ids);
+    mockDownloads = mockDownloads.map((t) => (set.has(t.id) ? { ...t, queue_id: queueId } : t));
+  },
+
+  async startQueue(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('start_queue_cmd', { id });
+    }
+    mockQueues = mockQueues.map((q) => (q.id === id ? { ...q, open: true } : q));
+  },
+
+  async stopQueue(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('stop_queue_cmd', { id });
+    }
+  },
+
+  onQueuesChanged(callback: () => void): Promise<UnlistenFn> {
+    if (isTauri()) {
+      return listen('queues-changed', () => callback());
+    }
+    return Promise.resolve(() => {});
   },
 
   /** Quits Nexdrop for real (closing the window only hides it to the tray). */
