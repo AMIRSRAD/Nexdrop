@@ -347,32 +347,64 @@ function bestMedia(list) {
 // ── menus ────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(async () => {
-  chrome.contextMenus.create({
-    id: 'nexdrop-download-item',
-    title: 'Download with Nexdrop',
-    contexts: ['link', 'image', 'video', 'audio'],
-  });
-  chrome.contextMenus.create({
-    id: 'nexdrop-grab-all-links',
-    title: 'Grab all links on this page with Nexdrop',
-    contexts: ['page'],
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'nexdrop-download-item',
+      title: 'Download with Nexdrop',
+      contexts: ['link', 'image', 'video', 'audio'],
+    });
+    chrome.contextMenus.create({
+      id: 'nexdrop-download-selection',
+      title: 'Download links in selection with Nexdrop',
+      contexts: ['selection'],
+    });
+    chrome.contextMenus.create({
+      id: 'nexdrop-grab-all-links',
+      title: 'Grab all links on this page with Nexdrop',
+      contexts: ['page'],
+    });
   });
   const stored = await chrome.storage.local.get('settings');
   if (!stored.settings) await chrome.storage.local.set({ settings: DEFAULTS });
 });
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+/** Collects links from the page (or the selection in `frameId`) and sends them to Nexdrop's list window. */
+async function sendLinks(tabId, frameId, mode) {
+  let reply = null;
+  try {
+    reply = await chrome.tabs.sendMessage(tabId, { type: 'GET_LINKS', mode }, { frameId: frameId || 0 });
+  } catch (_) { /* the page can't run our script (browser pages, the store) */ }
+  const urls = (reply && reply.links) || [];
+  if (urls.length === 0) {
+    chrome.action.setBadgeBackgroundColor({ tabId, color: '#8b8f9b' });
+    chrome.action.setBadgeText({ tabId, text: '0' });
+    setTimeout(() => chrome.action.setBadgeText({ tabId, text: '' }), 2500);
+    return { success: false, count: 0 };
+  }
+  let page = '';
+  try {
+    page = (await chrome.tabs.get(tabId)).url || '';
+  } catch (_) { /* gone */ }
+  try {
+    const res = await fetch(`${NEXDROP_SERVER}/download-many`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls, mode, referer: page || undefined, user_agent: navigator.userAgent, cookies: page ? await cookieHeaderFor(page) : undefined }),
+    });
+    return { success: res.ok, count: urls.length };
+  } catch (_) {
+    return { success: false, count: urls.length };
+  }
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'nexdrop-download-item') {
     const target = info.linkUrl || info.srcUrl;
     if (target) sendToNexdrop(target, tab && tab.url);
-  } else if (info.menuItemId === 'nexdrop-grab-all-links' && tab && tab.url) {
-    try {
-      await fetch(`${NEXDROP_SERVER}/parse-page`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: tab.url }),
-      });
-    } catch (_) { /* the app isn't running */ }
+  } else if (info.menuItemId === 'nexdrop-download-selection' && tab) {
+    sendLinks(tab.id, info.frameId, 'selection');
+  } else if (info.menuItemId === 'nexdrop-grab-all-links' && tab) {
+    sendLinks(tab.id, 0, 'page');
   }
 });
 
@@ -403,6 +435,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return reply(
         getMedia(message.tabId ?? (sender.tab && sender.tab.id)).then((media) => ({ media, best: media.length ? bestMedia(media) : null })),
       );
+
+    case 'SELECTION_LINKS': {
+      const n = Number(message.count) || 0;
+      chrome.contextMenus.update('nexdrop-download-selection', {
+        title: n > 0 ? `Download ${n} link${n === 1 ? '' : 's'} in selection with Nexdrop` : 'Download links in selection with Nexdrop',
+      }, () => void chrome.runtime.lastError);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    case 'SEND_LINKS':
+      return reply(sendLinks(message.tabId ?? (sender.tab && sender.tab.id), message.frameId || 0, message.mode || 'page'));
 
     case 'SKIP_NEXT': // Alt+click: let the browser handle this one itself
       remember(skipOnce, message.url, 8000);

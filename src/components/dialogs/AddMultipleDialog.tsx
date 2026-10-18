@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FileUp, Folder, Globe, Hash, ListPlus, Search, Sparkles } from 'lucide-react';
 import { api } from '../../services/api';
-import type { AddDownloadRequest, AppSettings, GrabbedLink } from '../../types/download';
+import type { AddDownloadRequest, AppSettings, BrowserRequest, GrabbedLink } from '../../types/download';
 import { CATEGORIES, categoryMeta, extractUrls, isHttpUrl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 import { Dialog } from '../ui/Dialog';
@@ -17,6 +17,12 @@ interface AddMultipleDialogProps {
   open: boolean;
   initialTab: AddMultipleTab;
   initialText: string;
+  /** Links handed over by the browser (the page's links, or the ones the user selected). */
+  initialLinks?: GrabbedLink[];
+  /** "all": preselect every link. "files": only links that look like files. */
+  preselect?: 'all' | 'files';
+  /** Referer, user agent and cookies from the browser. */
+  initialRequest?: BrowserRequest;
   settings: AppSettings;
   onClose: () => void;
   onSubmit: (reqs: AddDownloadRequest[]) => Promise<void>;
@@ -28,7 +34,7 @@ export const AddMultipleDialog: React.FC<AddMultipleDialogProps> = ({ open, onCl
   </Dialog>
 );
 
-const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initialTab, initialText, settings, onClose, onSubmit }) => {
+const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initialTab, initialText, initialLinks, preselect, initialRequest, settings, onClose, onSubmit }) => {
   const [tab, setTab] = useState<AddMultipleTab>(initialTab);
   const [destination, setDestination] = useState(settings.default_destination);
   const [submitting, setSubmitting] = useState(false);
@@ -69,8 +75,13 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
   // Page grabber
   const [pageUrl, setPageUrl] = useState('');
   const [scanning, setScanning] = useState(false);
-  const [links, setLinks] = useState<GrabbedLink[] | null>(null);
-  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [links, setLinks] = useState<GrabbedLink[] | null>(initialLinks ?? null);
+  const [picked, setPicked] = useState<Set<string>>(() => {
+    if (!initialLinks) return new Set();
+    const files = initialLinks.filter((l) => l.category !== 'other' || preselect === 'all');
+    // Nothing looks like a file: offer everything rather than an empty selection.
+    return new Set((preselect === 'all' || files.length === 0 ? initialLinks : files).map((l) => l.url));
+  });
   const [catFilter, setCatFilter] = useState<string>('all');
   const [query, setQuery] = useState('');
 
@@ -118,11 +129,18 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
   };
 
   const requests: AddDownloadRequest[] = useMemo(() => {
-    const base = { destination_path: destination.trim() || undefined, connections: settings.default_connections || 8 };
+    const base = {
+      destination_path: destination.trim() || undefined,
+      connections: settings.default_connections || 8,
+      // From the browser: the page it was on and the login it used (host-limited by the engine).
+      referer: initialRequest?.referer,
+      user_agent: initialRequest?.userAgent,
+      custom_headers: initialRequest?.headers && Object.keys(initialRequest.headers).length ? initialRequest.headers : undefined,
+    };
     if (tab === 'paste') return pastedUrls.map((url) => ({ url, ...base }));
     if (tab === 'pattern') return patternUrls.map((url) => ({ url, ...base }));
     return (links ?? []).filter((l) => picked.has(l.url)).map((l) => ({ url: l.url, filename: l.filename, ...base }));
-  }, [tab, pastedUrls, patternUrls, links, picked, destination, settings.default_connections]);
+  }, [tab, pastedUrls, patternUrls, links, picked, destination, settings.default_connections, initialRequest]);
 
   const submit = async () => {
     if (!requests.length || submitting) return;

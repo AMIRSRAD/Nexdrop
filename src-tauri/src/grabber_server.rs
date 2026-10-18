@@ -182,6 +182,15 @@ async fn route(req: &Request, from_extension: bool, app: &AppHandle, mgr: &Arc<D
             }
         }
 
+        // Several links at once (the links in a selection, or everything on a page): the app
+        // lists them in its multi-download window so the user can choose.
+        ("POST", "/download-many") => {
+            if !from_extension {
+                return Reply::error("403 Forbidden", "Only the Nexdrop browser extension may call this endpoint");
+            }
+            handle_download_many(&req.body, app)
+        }
+
         ("POST", "/download") | ("POST", "/parse-page") => {
             if !from_extension {
                 return Reply::error("403 Forbidden", "Only the Nexdrop browser extension may call this endpoint");
@@ -311,6 +320,82 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         }
         Err(e) => Reply::error("400 Bad Request", &e),
     }
+}
+
+const MAX_MANY: usize = 2000;
+
+#[derive(Debug, Deserialize)]
+struct ManyRequest {
+    urls: Vec<String>,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    cookies: Option<String>,
+    /// "selection": the user picked these, so all are preselected. "page": preselect only files.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// A link as the multi-download window lists it (name, type), or `None` if it isn't http(s).
+fn grabbed_link(raw: &str) -> Option<GrabbedLink> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let name = parsed
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|n| !n.is_empty())
+        .map(|n| url::form_urlencoded::parse(n.as_bytes()).map(|(k, v)| if v.is_empty() { k.to_string() } else { format!("{k}={v}") }).collect::<String>())
+        .unwrap_or_else(|| parsed.host_str().unwrap_or("link").to_string());
+    let extension = std::path::Path::new(parsed.path())
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let category = categorize_extension(&extension);
+    Some(GrabbedLink { url: parsed.to_string(), filename: name, category, extension })
+}
+
+fn handle_download_many(body: &[u8], app: &AppHandle) -> Reply {
+    let req = match serde_json::from_slice::<ManyRequest>(body) {
+        Ok(r) => r,
+        Err(e) => return Reply::error("400 Bad Request", &format!("Invalid JSON: {e}")),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let links: Vec<GrabbedLink> = req
+        .urls
+        .iter()
+        .take(MAX_MANY * 2)
+        .filter_map(|u| grabbed_link(u))
+        .filter(|l| seen.insert(l.url.clone()))
+        .take(MAX_MANY)
+        .collect();
+    if links.is_empty() {
+        return Reply::error("400 Bad Request", "No downloadable links were found");
+    }
+    let headers: Option<HashMap<String, String>> = req
+        .cookies
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && c.len() <= 16 * 1024 && !c.contains(['\r', '\n']))
+        .map(|c| HashMap::from([("Cookie".to_string(), c.to_string())]));
+    let count = links.len();
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        let _ = window.emit(
+            "links-requested",
+            serde_json::json!({
+                "links": links,
+                "referer": req.referer,
+                "user_agent": req.user_agent,
+                "headers": headers,
+                "preselect": if req.mode.as_deref() == Some("selection") { "all" } else { "files" },
+            }),
+        );
+    }
+    Reply::json("200 OK", serde_json::json!({ "success": true, "count": count }))
 }
 
 async fn handle_parse_page(body: &str) -> Reply {
@@ -500,7 +585,7 @@ fn is_downloadable_extension(ext: &str) -> bool {
 fn categorize_extension(ext: &str) -> String {
     match ext {
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso" | "dmg" => "compressed".to_string(),
-        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "ts" | "m3u8" => "video".to_string(),
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "ts" | "m3u8" => "videos".to_string(),
         "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a" => "music".to_string(),
         "exe" | "msi" | "apk" | "deb" | "rpm" => "programs".to_string(),
         "pdf" | "epub" | "docx" | "xlsx" | "pptx" | "csv" => "documents".to_string(),
@@ -511,6 +596,17 @@ fn categorize_extension(ext: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_get_names_and_categories_the_interface_understands() {
+        let l = grabbed_link("https://cdn.example.com/a/My%20Movie.mp4?token=1").unwrap();
+        assert_eq!((l.filename.as_str(), l.extension.as_str(), l.category.as_str()), ("My Movie.mp4", "mp4", "videos"));
+        assert_eq!(grabbed_link("https://example.com/files/report.pdf").unwrap().category, "documents");
+        assert_eq!(grabbed_link("https://example.com/").unwrap().filename, "example.com");
+        assert!(grabbed_link("javascript:alert(1)").is_none());
+        assert!(grabbed_link("mailto:a@b.c").is_none());
+        assert!(grabbed_link("not a url").is_none());
+    }
 
     #[test]
     fn only_extension_origins_are_trusted() {

@@ -146,6 +146,8 @@ def main():
         check('install: silent install succeeds', r.returncode == 0 and os.path.exists(EXE), r.returncode)
         ext_manifest = glob.glob(os.path.join(INSTALL_DIR, '**', 'manifest.json'), recursive=True)
         check('install: browser extension is bundled', any('extension' in p for p in ext_manifest), ext_manifest)
+        run_value = reg_value(RUN_KEY, 'Nexdrop') or reg_value(RUN_KEY, 'nexdrop')
+        check('install: starts with Windows by default, quietly in the tray', bool(run_value) and 'nexdrop.exe' in run_value.lower() and '--minimized' in run_value, run_value)
         signed = glob.glob(os.path.join(INSTALL_DIR, '**', 'nexdrop-firefox.xpi'), recursive=True)
         check('install: Mozilla-signed Firefox add-on is bundled', bool(signed), signed)
         entry = uninstall_entry()
@@ -213,6 +215,10 @@ def main():
             on = ui.invoke('set_autostart_cmd', {'enabled': True})
             val = reg_value(RUN_KEY, 'Nexdrop') or reg_value(RUN_KEY, 'nexdrop')
             check('autostart: enabling writes a Run entry that starts hidden', on.get('ok') is True and bool(val) and '--minimized' in val, (on, val))
+            import winreg as _wr
+            with _wr.OpenKey(_wr.HKEY_CURRENT_USER, RUN_KEY) as _k:
+                _n = sum(1 for _i in range(_wr.QueryInfoKey(_k)[1]) if 'nexdrop.exe' in str(_wr.EnumValue(_k, _i)[1]).lower())
+            check('autostart: the installer and the app share one entry (no duplicates)', _n == 1, _n)
             off = ui.invoke('set_autostart_cmd', {'enabled': False})
             check('autostart: disabling removes it', off.get('ok') is False and not (reg_value(RUN_KEY, 'Nexdrop') or reg_value(RUN_KEY, 'nexdrop')), off)
             info = ui.invoke('get_app_info_cmd')
