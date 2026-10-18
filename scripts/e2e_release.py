@@ -216,7 +216,7 @@ def main():
             off = ui.invoke('set_autostart_cmd', {'enabled': False})
             check('autostart: disabling removes it', off.get('ok') is False and not (reg_value(RUN_KEY, 'Nexdrop') or reg_value(RUN_KEY, 'nexdrop')), off)
             info = ui.invoke('get_app_info_cmd')
-            check('app info: name and version', info.get('ok', {}).get('version') == '1.0.0', info)
+            check('app info: name and version', info.get('ok', {}).get('version') == json.load(open(os.path.join(ROOT, 'src-tauri', 'tauri.conf.json'), encoding='utf-8'))['version'], info)
             ext = ui.invoke('get_extension_dir_cmd')
             check('extension folder resolves inside the install', 'ok' in ext and os.path.exists(os.path.join(ext['ok'], 'manifest.json')), ext)
 
