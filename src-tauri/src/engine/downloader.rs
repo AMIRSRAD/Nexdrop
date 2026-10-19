@@ -24,6 +24,7 @@
 //! which also retries (from the start, since it can't resume).
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -83,6 +84,9 @@ pub struct DownloadEngine {
     pub(crate) global_limit: Arc<RateLimiter>,
     /// Bandwidth shared by one group of downloads (a queue); set per run.
     pub(crate) group_limit: Option<Arc<RateLimiter>>,
+    /// Adapter addresses to download through. Several means each download's
+    /// connections are shared among them; empty means Windows chooses.
+    pub(crate) local_addrs: Vec<IpAddr>,
     pub(crate) retry_base: Duration,
 }
 
@@ -98,6 +102,7 @@ impl DownloadEngine {
             pool: Arc::new(ClientPool::new()),
             global_limit: Arc::new(RateLimiter::new(0)),
             group_limit: None,
+            local_addrs: Vec::new(),
             retry_base: Duration::from_secs(1),
         }
     }
@@ -117,6 +122,22 @@ impl DownloadEngine {
         let mut engine = self.clone();
         engine.group_limit = Some(limit);
         engine
+    }
+
+    /// A copy of this engine whose runs go out through the given network adapters.
+    pub fn with_local_addresses(&self, addrs: Vec<IpAddr>) -> Self {
+        let mut engine = self.clone();
+        engine.local_addrs = addrs;
+        engine
+    }
+
+    /// One client per adapter in use (a single default client when none is chosen).
+    pub(crate) fn download_clients(&self, proxy_mode: Option<&str>, custom_proxy: Option<&str>) -> Vec<reqwest::Client> {
+        if self.local_addrs.is_empty() {
+            vec![self.pool.download(proxy_mode, custom_proxy)]
+        } else {
+            self.local_addrs.iter().map(|ip| self.pool.download_from(proxy_mode, custom_proxy, Some(*ip))).collect()
+        }
     }
 
     /// Base delay for retry backoff (tests use a tiny one).
@@ -165,15 +186,13 @@ impl DownloadEngine {
         }
 
         let final_dest = dest_dir.join(&task.filename);
-        let client = self
-            .pool
-            .download(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
+        let clients = self.download_clients(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
 
         if task.resumable && task.total_bytes > 0 {
-            self.run_ranged(task, final_dest, client, headers, pause_rx, on_progress).await
+            self.run_ranged(task, final_dest, clients, headers, pause_rx, on_progress).await
         } else {
             let part_file = dest_dir.join(format!("{}.nexpart", task.filename));
-            self.run_single_stream(task, final_dest, part_file, client, headers, pause_rx, on_progress)
+            self.run_single_stream(task, final_dest, part_file, clients[0].clone(), headers, pause_rx, on_progress)
                 .await
         }
     }
@@ -383,7 +402,7 @@ impl DownloadEngine {
         &self,
         mut task: DownloadTask,
         final_dest: PathBuf,
-        client: reqwest::Client,
+        clients: Vec<reqwest::Client>,
         headers: Vec<(HeaderName, HeaderValue)>,
         mut pause_rx: watch::Receiver<bool>,
         on_progress: F,
@@ -396,7 +415,7 @@ impl DownloadEngine {
         let mut fresh = false;
         for round in 0..2 {
             match self
-                .ranged_round(&mut task, &final_dest, &client, &headers, &mut pause_rx, &on_progress, fresh)
+                .ranged_round(&mut task, &final_dest, &clients, &headers, &mut pause_rx, &on_progress, fresh)
                 .await
             {
                 Ok(()) => return Ok(task),
@@ -412,7 +431,7 @@ impl DownloadEngine {
                     task.resumable = false;
                     task.connections = 1;
                     return self
-                        .run_single_stream(task, final_dest, part, client, headers, pause_rx, on_progress)
+                        .run_single_stream(task, final_dest, part, clients[0].clone(), headers, pause_rx, on_progress)
                         .await;
                 }
                 Err(RoundFailure::Failed(msg)) => return Err(msg),
@@ -425,7 +444,7 @@ impl DownloadEngine {
         &self,
         task: &mut DownloadTask,
         final_dest: &Path,
-        client: &reqwest::Client,
+        clients: &[reqwest::Client],
         headers: &[(HeaderName, HeaderValue)],
         pause_rx: &mut watch::Receiver<bool>,
         on_progress: &F,
@@ -478,7 +497,7 @@ impl DownloadEngine {
         let writer = spawn_writer(file.clone(), done.clone(), writer_rx);
 
         let shared = Arc::new(Shared {
-            client: client.clone(),
+            clients: clients.to_vec(),
             resolved: Mutex::new(task.final_url.clone().filter(|u| !u.is_empty() && *u != task.url)),
             urls,
             user_agent: task.user_agent.clone().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
@@ -730,6 +749,8 @@ struct Slot {
     id: usize,
     start: u64,
     url_idx: AtomicUsize,
+    /// Which adapter's client this range uses; moves on when that adapter stops answering.
+    client_idx: AtomicUsize,
     state: Mutex<SlotState>,
 }
 
@@ -739,7 +760,8 @@ struct Plan {
 }
 
 struct Shared {
-    client: reqwest::Client,
+    /// One client per network adapter in use; each range sticks to one (see `Slot::client_idx`).
+    clients: Vec<reqwest::Client>,
     urls: Vec<String>,
     /// Where the original link redirects to. Ranges go straight there (saving a
     /// redirect per request); cleared when a signed link expires.
@@ -847,6 +869,7 @@ impl Shared {
             id,
             start,
             url_idx: AtomicUsize::new(id % self.urls.len()),
+            client_idx: AtomicUsize::new(id),
             state: Mutex::new(SlotState { pos: start, end }),
         });
         plan.slots.push(slot.clone());
@@ -1096,6 +1119,10 @@ async fn run_slot(
                 // No answer at all: the network is down (Wi-Fi drop, VPN, sleep).
                 // Don't burn through the retries; keep knocking every few seconds.
                 if network && !made_progress {
+                    // With several adapters, try the next one: this one may have lost its connection.
+                    if shared.clients.len() > 1 {
+                        slot.client_idx.fetch_add(1, Ordering::Relaxed);
+                    }
                     let since = *offline_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= NETWORK_GIVE_UP {
                         return SlotEnd::Fatal(RoundFailure::Failed(format!(
@@ -1160,8 +1187,8 @@ async fn attempt(
     let url_idx = slot.url_idx.load(Ordering::Relaxed) % shared.urls.len();
     let resolved = if url_idx == 0 { shared.resolved.lock().clone() } else { None };
     let target = resolved.as_deref().unwrap_or(&shared.urls[url_idx]);
-    let mut req = shared
-        .client
+    let client = &shared.clients[slot.client_idx.load(Ordering::Relaxed) % shared.clients.len()];
+    let mut req = client
         .get(target)
         .header(USER_AGENT, &shared.user_agent)
         .header(RANGE, format!("bytes={}-{}", st.pos, st.end - 1));

@@ -97,12 +97,37 @@ impl DownloadManager {
         Repository::open_or_create(&self.db_path)
     }
 
+    /// Addresses of the network adapters downloads should use (empty = let Windows choose).
+    pub fn local_addresses(&self) -> Vec<std::net::IpAddr> {
+        let settings = self.get_settings();
+        if settings.network_mode == "selected" && !settings.network_adapters.is_empty() {
+            crate::network::addresses_for(&settings.network_adapters)
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn get_settings(&self) -> AppSettings {
         if let Ok(conn) = self.get_db_conn() {
             Repository::load_settings(&conn).unwrap_or_default()
         } else {
             AppSettings::default()
         }
+    }
+
+    /// One-time upgrades of saved settings when a default changes.
+    /// Version 2: "Sort downloads into folders by type" became the default.
+    pub fn migrate_settings(&self) {
+        let Ok(conn) = self.get_db_conn() else { return };
+        let Ok(mut settings) = Repository::load_settings(&conn) else { return };
+        if settings.settings_version >= crate::db::models::CURRENT_SETTINGS_VERSION {
+            return;
+        }
+        if settings.settings_version < 2 {
+            settings.auto_categorize = true;
+        }
+        settings.settings_version = crate::db::models::CURRENT_SETTINGS_VERSION;
+        let _ = Repository::save_settings(&conn, &settings);
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
@@ -517,6 +542,7 @@ impl DownloadManager {
     /// Startup: recover interrupted downloads and resume them. Queues that are
     /// outside their schedule keep their downloads waiting.
     pub async fn startup_resume(self: &Arc<Self>) {
+        self.migrate_settings();
         self.ensure_queues();
         self.apply_runtime_settings();
 
@@ -1339,7 +1365,7 @@ impl DownloadManager {
 
         let manager = Arc::clone(self);
         let task_id = task.id.clone();
-        let engine = self.engine.clone();
+        let engine = self.engine.clone().with_local_addresses(self.local_addresses());
         let is_torrent = task.kind == "torrent";
         let is_stream = task.kind == "stream";
         let queue_id = task.queue_id.clone();

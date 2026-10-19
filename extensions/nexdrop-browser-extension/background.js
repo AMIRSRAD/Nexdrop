@@ -198,7 +198,7 @@ async function handleDownload(item) {
     if (recentlySent.has(url)) return;
     remember(recentlySent, url, 4000);
 
-    const filename = item.filename ? item.filename.split(/[\/]/).pop() : undefined;
+    const filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
     const ok = await sendToNexdrop(url, item.referrer, filename);
     if (ok) {
       // Nexdrop has it: drop the browser's own copy.

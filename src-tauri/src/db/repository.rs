@@ -931,6 +931,19 @@ mod tests {
     }
 
     #[test]
+    fn settings_saved_before_versioning_count_as_version_zero_and_new_installs_start_current() {
+        let conn = setup_test_db();
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)", rusqlite::params![r#"{"auto_categorize": false, "max_active_downloads": 4}"#]).unwrap();
+        let old = Repository::load_settings(&conn).unwrap();
+        assert_eq!(old.settings_version, 0, "an old save has no version");
+        assert!(!old.auto_categorize);
+        assert_eq!(old.max_active_downloads, 4);
+        let fresh = AppSettings::default();
+        assert_eq!(fresh.settings_version, crate::db::models::CURRENT_SETTINGS_VERSION);
+        assert!(fresh.auto_categorize, "sorting into folders by type is on by default");
+    }
+
+    #[test]
     fn test_site_credentials_crud() {
         let conn = setup_test_db();
         let cred = SiteCredential {

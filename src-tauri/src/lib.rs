@@ -9,6 +9,7 @@ pub mod secrets;
 pub mod tray;
 pub mod util;
 pub mod browsers;
+pub mod network;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -120,6 +121,8 @@ pub fn run() {
             probe_url_cmd,
             probe_stream_cmd,
             get_browsers_cmd,
+            get_network_adapters_cmd,
+            open_author_link_cmd,
             setup_browser_cmd,
             get_queues_cmd,
             save_queue_cmd,

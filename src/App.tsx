@@ -40,7 +40,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   notify_on_complete: true,
   theme: 'dark',
   clipboard_watch: false,
-  auto_categorize: false,
+  auto_categorize: true,
   proxy_mode: 'system',
   custom_proxy_url: undefined,
   on_complete_action: 'notify',
@@ -60,6 +60,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   torrent_upnp: false,
   browser_prompt: true,
   browser_setup_done: false,
+  network_mode: 'auto',
+  network_adapters: [],
 };
 
 const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|xz|bz2|iso|img|exe|msi|dmg|pkg|deb|rpm|apk|mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|pdf|epub|bin)(\?|#|$)/i;

@@ -91,3 +91,8 @@ docs/                 publishing guide and screenshots
 
 More: `ROADMAP.md` (what's done and what's next), `ENGINE_REPORT.md` (speed and reliability
 measurements), `docs/browser-extension-publishing.md` (signing and store publishing).
+
+---
+
+© 2026 AmirSRAD. All rights reserved. See [LICENSE](LICENSE).  
+[amirsrad.ir](https://amirsrad.ir) · [github.com/amirsrad](https://github.com/amirsrad)

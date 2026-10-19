@@ -1,8 +1,11 @@
 [package]
 name = "nexdrop"
-version = "1.2.0"
+version = "1.3.0"
 description = "Nexdrop - Modern Internet Download Manager"
-authors = ["Nexdrop Contributors"]
+authors = ["AmirSRAD"]
+homepage = "https://amirsrad.ir"
+repository = "https://github.com/amirsrad/Nexdrop"
+license-file = "../LICENSE"
 edition = "2024"
 rust-version = "1.90"
 
@@ -45,6 +48,9 @@ winreg = "0.56"
 tauri-winrt-notification = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",

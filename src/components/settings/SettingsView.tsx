@@ -7,6 +7,8 @@ import {
   Check,
   Copy,
   Folder,
+  Globe,
+  Info,
   Key,
   Magnet,
   Monitor,
@@ -23,8 +25,9 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import type { AppSettings, BrowserInfo, DownloadQueue, QueueInfo, SiteCredential } from '../../types/download';
+import type { AppSettings, BrowserInfo, NetworkAdapter, DownloadQueue, QueueInfo, SiteCredential } from '../../types/download';
 import { api } from '../../services/api';
+import appIcon from '../../assets/app-icon.png';
 import { CHUNK_SIZES, GRABBER_PORT } from '../../lib/meta';
 import { cn } from '../../lib/cn';
 import { Button, IconButton } from '../ui/Button';
@@ -42,7 +45,8 @@ export type SettingsSection =
   | 'security'
   | 'torrents'
   | 'logins'
-  | 'integrations';
+  | 'integrations'
+  | 'about';
 
 const SECTIONS: { id: SettingsSection; label: string; icon: LucideIcon }[] = [
   { id: 'general', label: 'General', icon: SlidersHorizontal },
@@ -54,6 +58,7 @@ const SECTIONS: { id: SettingsSection; label: string; icon: LucideIcon }[] = [
   { id: 'torrents', label: 'Torrents', icon: Magnet },
   { id: 'logins', label: 'Site logins', icon: Key },
   { id: 'integrations', label: 'Browser', icon: Puzzle },
+  { id: 'about', label: 'About', icon: Info },
 ];
 
 interface SettingsViewProps {
@@ -134,6 +139,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'security' && <Security s={settings} set={onChange} />}
           {section === 'torrents' && <Torrents s={settings} set={onChange} />}
           {section === 'logins' && <Logins />}
+          {section === 'about' && <About />}
           {section === 'integrations' && <Integrations s={settings} set={onChange} browsers={browsers} onSetup={onSetupBrowsers} />}
         </div>
       </div>
@@ -239,8 +245,81 @@ const General: React.FC<SectionProps> = ({ s, set }) => {
   );
 };
 
+const kindLabel: Record<NetworkAdapter['kind'], string> = { ethernet: 'Ethernet', wifi: 'Wi-Fi', vpn: 'VPN', other: 'Network' };
+
+const speedText = (mbps: number | null) => (mbps ? (mbps >= 1000 ? `${mbps / 1000} Gbps` : `${mbps} Mbps`) : null);
+
+/** Which internet connections downloads use: Windows' choice, or one or several at once. */
+const NetworkChoice: React.FC<SectionProps> = ({ s, set }) => {
+  const [adapters, setAdapters] = useState<NetworkAdapter[] | null>(null);
+  const selected = s.network_mode === 'selected';
+
+  const refresh = () => api.getNetworkAdapters().then(setAdapters).catch(() => setAdapters([]));
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const toggle = (id: string, on: boolean) => {
+    const next = on ? [...s.network_adapters, id] : s.network_adapters.filter((x) => x !== id);
+    set({ network_adapters: next });
+  };
+  const usable = (adapters ?? []).filter((a) => s.network_adapters.includes(a.id)).length;
+
+  return (
+    <Group title="Internet connection">
+      <SettingRow
+        title="Download through"
+        description={
+          selected
+            ? 'Pick one connection, or several to add their speeds together.'
+            : 'Windows picks the connection. Choose manually to use specific ones, or several at once.'
+        }
+      >
+        <Segmented
+          value={s.network_mode}
+          onChange={(network_mode) => set({ network_mode })}
+          options={[
+            { value: 'auto', label: 'Automatic' },
+            { value: 'selected', label: 'Choose' },
+          ]}
+        />
+      </SettingRow>
+      {selected && (
+        <>
+          {adapters === null && <div className="px-4 py-3.5 text-[12.5px] text-fg-3">Looking for connections…</div>}
+          {adapters?.length === 0 && (
+            <div className="px-4 py-3.5 text-[12.5px] text-fg-3">No active internet connections found. Connect to a network, then refresh.</div>
+          )}
+          {adapters?.map((a) => (
+            <SettingRow
+              key={a.id}
+              title={a.name}
+              description={[kindLabel[a.kind], a.ipv4, speedText(a.speed_mbps)].filter(Boolean).join(' · ')}
+            >
+              <Switch checked={s.network_adapters.includes(a.id)} onChange={(on) => toggle(a.id, on)} label={`Use ${a.name}`} />
+            </SettingRow>
+          ))}
+          <div className="flex items-center justify-between gap-4 px-4 py-3">
+            <span className="text-[12.5px] text-fg-3">
+              {usable === 0
+                ? 'Nothing selected: Windows chooses until you pick one.'
+                : usable === 1
+                  ? 'Downloads use this connection only.'
+                  : `Each download's connections are shared across these ${usable}.`}
+            </span>
+            <Button size="sm" variant="secondary" onClick={refresh}>
+              Refresh
+            </Button>
+          </div>
+        </>
+      )}
+    </Group>
+  );
+};
+
 const Connections: React.FC<SectionProps> = ({ s, set }) => (
   <>
+    <NetworkChoice s={s} set={set} />
     <Group title="Downloads">
       <SettingRow title="Simultaneous downloads" description="Others wait in the queue.">
         <NumberInput value={s.max_active_downloads} min={1} max={10} onChange={(v) => set({ max_active_downloads: v })} className="w-24" />
@@ -809,6 +888,43 @@ const Logins: React.FC = () => {
           Add login
         </Button>
       )}
+    </>
+  );
+};
+
+const AUTHOR_SITE = 'https://amirsrad.ir';
+const AUTHOR_GITHUB = 'https://github.com/amirsrad';
+
+const About: React.FC = () => {
+  const [version, setVersion] = useState('');
+  useEffect(() => {
+    api.getAppInfo().then((i) => setVersion(i.version)).catch(() => {});
+  }, []);
+  return (
+    <>
+      <div className="mb-6 flex flex-col items-center rounded-xl bg-surface px-6 py-9 text-center shadow-[0_0_0_1px_var(--line)]">
+        <img src={appIcon} alt="" width={72} height={72} draggable={false} className="select-none" />
+        <h2 className="mt-4 text-[20px] font-semibold tracking-[-0.01em] text-fg">Nexdrop</h2>
+        <p className="mt-1 text-[13px] text-fg-3">{version ? `Version ${version}` : ' '}</p>
+        <p className="mt-3 max-w-[360px] text-[13px] leading-relaxed text-fg-2">
+          A fast, safe download manager with queues, streaming video, torrents and browser integration.
+        </p>
+      </div>
+
+      <Group title="Made by">
+        <SettingRow title="Website" description="amirsrad.ir">
+          <Button size="sm" variant="secondary" icon={Globe} onClick={() => api.openAuthorLink(AUTHOR_SITE)}>
+            Open
+          </Button>
+        </SettingRow>
+        <SettingRow title="GitHub" description="github.com/amirsrad">
+          <Button size="sm" variant="secondary" icon={Globe} onClick={() => api.openAuthorLink(AUTHOR_GITHUB)}>
+            Open
+          </Button>
+        </SettingRow>
+      </Group>
+
+      <p className="px-0.5 text-[12.5px] text-fg-3">© 2026 AmirSRAD. All rights reserved.</p>
     </>
   );
 };

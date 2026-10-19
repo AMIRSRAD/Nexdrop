@@ -294,6 +294,9 @@ fn default_min_chunk() -> u64 {
     1024 * 1024 // 1 MB default
 }
 
+/// Bumped when a default changes in a way existing installs should pick up once.
+pub const CURRENT_SETTINGS_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -336,6 +339,18 @@ pub struct AppSettings {
     pub browser_prompt: bool,
     /// The first-run "connect your browsers" window has been shown.
     pub browser_setup_done: bool,
+    /// "auto" (Windows chooses the connection) or "selected" (use `network_adapters`).
+    pub network_mode: String,
+    /// Ids of the network adapters to download through when `network_mode` is "selected".
+    pub network_adapters: Vec<String>,
+    /// Which one-time settings upgrades have run (see `DownloadManager::migrate_settings`).
+    /// Settings saved before this existed have none, which counts as version 0.
+    #[serde(default = "settings_version_zero")]
+    pub settings_version: u32,
+}
+
+fn settings_version_zero() -> u32 {
+    0
 }
 
 impl Default for AppSettings {
@@ -355,7 +370,7 @@ impl Default for AppSettings {
             notify_on_complete: true,
             theme: "dark".to_string(),
             clipboard_watch: false,
-            auto_categorize: false,
+            auto_categorize: true,
             proxy_mode: "system".to_string(),
             custom_proxy_url: None,
             on_complete_action: "notify".to_string(),
@@ -383,6 +398,9 @@ impl Default for AppSettings {
             torrent_upnp: false,
             browser_prompt: true,
             browser_setup_done: false,
+            network_mode: "auto".to_string(),
+            network_adapters: Vec::new(),
+            settings_version: CURRENT_SETTINGS_VERSION,
         }
     }
 }

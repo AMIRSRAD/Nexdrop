@@ -153,7 +153,9 @@ pub struct StreamProbe {
 
 /// How to talk to the stream's servers.
 pub struct Fetch {
-    client: reqwest::Client,
+    /// One client per network adapter in use; requests take turns.
+    clients: Vec<reqwest::Client>,
+    next_client: std::sync::atomic::AtomicUsize,
     /// Cookies/logins: only sent to the host the stream was opened from.
     headers: Vec<(HeaderName, HeaderValue)>,
     origin: String,
@@ -173,7 +175,8 @@ impl Fetch {
         retry_base: Duration,
     ) -> Self {
         Self {
-            client,
+            clients: vec![client],
+            next_client: std::sync::atomic::AtomicUsize::new(0),
             headers,
             origin: origin.to_string(),
             referer,
@@ -183,8 +186,17 @@ impl Fetch {
         }
     }
 
+    /// Spread requests over several network adapters.
+    pub fn with_clients(mut self, clients: Vec<reqwest::Client>) -> Self {
+        if !clients.is_empty() {
+            self.clients = clients;
+        }
+        self
+    }
+
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut req = self.client.get(url).header(USER_AGENT, &self.user_agent);
+        let i = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        let mut req = self.clients[i].get(url).header(USER_AGENT, &self.user_agent);
         if let Some(r) = &self.referer {
             req = req.header("Referer", r);
         }
@@ -661,8 +673,11 @@ impl DownloadEngine {
         tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| format!("Cannot create destination folder: {e}"))?;
 
         let headers = build_header_list(&task.custom_headers, &extra_headers);
-        let client = self.pool.download(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
-        let fetch = Arc::new(Fetch::new(client, headers, &task.url, task.referer.clone(), task.user_agent.clone(), self.retry_base));
+        let clients = self.download_clients(task.proxy_mode.as_deref(), task.custom_proxy_url.as_deref());
+        let fetch = Arc::new(
+            Fetch::new(clients[0].clone(), headers, &task.url, task.referer.clone(), task.user_agent.clone(), self.retry_base)
+                .with_clients(clients),
+        );
 
         // Fresh playlist every start: signed links in them stay valid this way.
         let variant = task.etag.clone().filter(|v| !v.is_empty());
