@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   BrowserIntegration,
+  NetworkAdapter,
   BrowserSetupOutcome,
   BrowserRequest,
   StreamProbe,
@@ -253,7 +254,7 @@ let mockSettings: AppSettings = {
   notify_on_complete: true,
   theme: 'dark',
   clipboard_watch: false,
-  auto_categorize: false,
+  auto_categorize: true,
   proxy_mode: 'system',
   custom_proxy_url: undefined,
   on_complete_action: 'notify',
@@ -273,6 +274,8 @@ let mockSettings: AppSettings = {
   torrent_upnp: false,
   browser_prompt: true,
   browser_setup_done: false,
+  network_mode: 'auto',
+  network_adapters: [],
 };
 
 export const api = {
@@ -549,6 +552,25 @@ export const api = {
     };
   },
 
+  /** Opens one of the author's pages (website, GitHub) in the default browser. */
+  async openAuthorLink(url: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('open_author_link_cmd', { url });
+    }
+    window.open(url, '_blank', 'noopener');
+  },
+
+  /** Internet connections (network adapters) that are up right now. */
+  async getNetworkAdapters(): Promise<NetworkAdapter[]> {
+    if (isTauri()) {
+      return await invoke<NetworkAdapter[]>('get_network_adapters_cmd');
+    }
+    return [
+      { id: '{eth}', name: 'Ethernet', description: 'Realtek PCIe GbE', kind: 'ethernet', ipv4: '192.168.1.20', has_gateway: true, speed_mbps: 1000 },
+      { id: '{wifi}', name: 'Wi-Fi', description: 'Intel Wi-Fi 6', kind: 'wifi', ipv4: '192.168.43.7', has_gateway: true, speed_mbps: 433 },
+    ];
+  },
+
   /** Browsers on this computer and whether Nexdrop's extension is working in each. */
   async getBrowsers(): Promise<BrowserIntegration> {
     if (isTauri()) {
@@ -667,7 +689,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '1.2.0' };
+    return { name: 'Nexdrop', version: '1.3.0' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -31,14 +32,25 @@ pub fn create_download_client_with_proxy(
     proxy_mode: Option<&str>,
     custom_proxy_url: Option<&str>,
 ) -> reqwest::Client {
-    build_client(
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(idle_timeout)
-            .tcp_keepalive(Duration::from_secs(30)),
-        proxy_mode,
-        custom_proxy_url,
-    )
+    create_download_client_from(idle_timeout, proxy_mode, custom_proxy_url, None)
+}
+
+/// Like [`create_download_client_with_proxy`], but every connection leaves through
+/// the network adapter that owns `local` (when given).
+pub fn create_download_client_from(
+    idle_timeout: Duration,
+    proxy_mode: Option<&str>,
+    custom_proxy_url: Option<&str>,
+    local: Option<IpAddr>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(idle_timeout)
+        .tcp_keepalive(Duration::from_secs(30));
+    if let Some(ip) = local {
+        builder = builder.local_address(ip);
+    }
+    build_client(builder, proxy_mode, custom_proxy_url)
 }
 
 /// True when following a redirect would move from encrypted to unencrypted transport.
@@ -149,6 +161,7 @@ const SYSTEM_PROXY_TTL: Duration = Duration::from_secs(30);
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct PoolKey {
     bulk: bool,
+    local: Option<IpAddr>,
     mode: String,
     custom: String,
 }
@@ -170,18 +183,24 @@ impl ClientPool {
 
     /// Client for bulk transfers (no total timeout, idle-read timeout only).
     pub fn download(&self, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
-        self.get(true, proxy_mode, custom_proxy_url)
+        self.get(true, proxy_mode, custom_proxy_url, None)
+    }
+
+    /// Client for bulk transfers that leaves through the adapter owning `local`.
+    pub fn download_from(&self, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>, local: Option<IpAddr>) -> reqwest::Client {
+        self.get(true, proxy_mode, custom_proxy_url, local)
     }
 
     /// Client for short control requests (probing).
     pub fn probe(&self, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
-        self.get(false, proxy_mode, custom_proxy_url)
+        self.get(false, proxy_mode, custom_proxy_url, None)
     }
 
-    fn get(&self, bulk: bool, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>) -> reqwest::Client {
+    fn get(&self, bulk: bool, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>, local: Option<IpAddr>) -> reqwest::Client {
         let mode = proxy_mode.unwrap_or("system");
         let key = PoolKey {
             bulk,
+            local,
             mode: mode.to_string(),
             custom: if mode == "custom" { custom_proxy_url.unwrap_or("").trim().to_string() } else { String::new() },
         };
@@ -193,7 +212,7 @@ impl ClientPool {
             }
         }
         let client = if bulk {
-            create_download_client_with_proxy(Duration::from_secs(30), Some(mode), custom_proxy_url)
+            create_download_client_from(Duration::from_secs(30), Some(mode), custom_proxy_url, local)
         } else {
             create_http_client_with_proxy(Duration::from_secs(15), Some(mode), custom_proxy_url)
         };
@@ -205,6 +224,25 @@ impl ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_client_bound_to_an_address_connects_from_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, peer) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+            peer.ip()
+        });
+        let from: IpAddr = "127.0.0.1".parse().unwrap();
+        let client = create_download_client_from(Duration::from_secs(5), Some("direct"), None, Some(from));
+        let body = client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap().text().await.unwrap();
+        assert_eq!(body, "ok");
+        assert_eq!(server.await.unwrap(), from, "the server saw the connection come from the chosen address");
+    }
 
     #[test]
     fn only_https_to_http_is_a_downgrade() {

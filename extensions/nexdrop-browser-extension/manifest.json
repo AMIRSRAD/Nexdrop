@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nexdrop — Modern Download Manager Integration",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Sends downloads, videos and streams from your browser to Nexdrop, like IDM.",
   "icons": {
     "16": "icons/icon16.png",
@@ -52,5 +52,7 @@
       "id": "nexdrop@nexdrop.app",
       "strict_min_version": "115.0"
     }
-  }
+  },
+  "author": "AmirSRAD",
+  "homepage_url": "https://amirsrad.ir"
 }

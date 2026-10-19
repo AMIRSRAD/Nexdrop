@@ -152,6 +152,21 @@ export interface AppSettings {
   browser_prompt: boolean;
   /** The first-run "connect your browsers" window has been shown. */
   browser_setup_done: boolean;
+  /** 'auto' lets Windows pick the connection; 'selected' uses `network_adapters`. */
+  network_mode: 'auto' | 'selected';
+  /** Ids of the network adapters downloads use when `network_mode` is 'selected'. */
+  network_adapters: string[];
+  settings_version?: number;
+}
+
+export interface NetworkAdapter {
+  id: string;
+  name: string;
+  description: string;
+  kind: 'ethernet' | 'wifi' | 'vpn' | 'other';
+  ipv4: string;
+  has_gateway: boolean;
+  speed_mbps: number | null;
 }
 
 export interface UrlProbeResult {

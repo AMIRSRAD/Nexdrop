@@ -593,6 +593,12 @@ fn signed_xpi(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists()).map(|p| p.canonicalize().unwrap_or(p))
 }
 
+/// The computer's internet connections, for choosing which ones downloads use.
+#[tauri::command]
+pub async fn get_network_adapters_cmd() -> Result<Vec<crate::network::NetworkAdapter>, String> {
+    tokio::task::spawn_blocking(crate::network::list).await.map_err(|e| e.to_string())
+}
+
 /// Browsers on this computer and whether Nexdrop's extension is working in each.
 #[tauri::command]
 pub async fn get_browsers_cmd(app: tauri::AppHandle) -> Result<BrowserIntegration, String> {
@@ -609,4 +615,50 @@ pub async fn setup_browser_cmd(app: tauri::AppHandle, id: String) -> Result<crat
     let dir = extension_dir(&app).ok_or_else(|| "The browser extension folder was not found".to_string())?;
     let xpi = signed_xpi(&app);
     crate::browsers::setup(&id, &dir, xpi.as_deref())
+}
+
+// ───────────────────────────── about ─────────────────────────────
+
+/// The only places the About page may send the user's browser to.
+fn is_author_link(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else { return false };
+    if u.scheme() != "https" {
+        return false;
+    }
+    match u.host_str() {
+        Some("amirsrad.ir") | Some("www.amirsrad.ir") => true,
+        Some("github.com") => {
+            let path = u.path().trim_matches('/').to_ascii_lowercase();
+            path == "amirsrad" || path.starts_with("amirsrad/")
+        }
+        _ => false,
+    }
+}
+
+/// Opens one of the author's pages in the user's browser.
+#[tauri::command]
+pub async fn open_author_link_cmd(url: String) -> Result<(), String> {
+    if !is_author_link(&url) {
+        return Err("That link isn't one Nexdrop opens".to_string());
+    }
+    open::that(url).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod about_tests {
+    use super::is_author_link;
+
+    #[test]
+    fn only_the_authors_pages_open() {
+        assert!(is_author_link("https://amirsrad.ir"));
+        assert!(is_author_link("https://amirsrad.ir/projects"));
+        assert!(is_author_link("https://github.com/amirsrad"));
+        assert!(is_author_link("https://github.com/AMIRSRAD/Nexdrop"));
+        assert!(!is_author_link("https://github.com/amirsrad-evil/x"), "a different account");
+        assert!(!is_author_link("https://github.com/someone-else"));
+        assert!(!is_author_link("http://amirsrad.ir"), "https only");
+        assert!(!is_author_link("https://amirsrad.ir.evil.example/"));
+        assert!(!is_author_link("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_author_link("javascript:alert(1)"));
+    }
 }

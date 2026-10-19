@@ -275,6 +275,11 @@ fn is_reserved_device_name(stem: &str) -> bool {
 /// trailing dots/spaces (which Windows silently strips, changing the name),
 /// and a bounded length.
 pub fn sanitize_filename(name: &str) -> String {
+    // A path was given where a name was wanted (a browser reports the full location of the
+    // file on its own disk): keep only the name, as every browser does.
+    let Some(name) = name.rsplit(['\\', '/']).find(|part| !part.trim().is_empty()) else {
+        return "download.bin".to_string();
+    };
     let mut clean: String = name
         .chars()
         .filter(|c| !is_hidden_or_bidi(*c))
@@ -368,9 +373,17 @@ mod tests {
 
     #[test]
     fn strips_path_traversal_and_separators() {
-        assert_eq!(sanitize_filename("../../Windows/system32/evil.dll"), "____Windows_system32_evil.dll");
-        assert_eq!(sanitize_filename("a\\b/c:d*e?f\"g<h>i|j.txt"), "a_b_c_d_e_f_g_h_i_j.txt");
+        assert_eq!(sanitize_filename("../../Windows/system32/evil.dll"), "evil.dll");
+        assert_eq!(sanitize_filename("a\\b/c:d*e?f\"g<h>i|j.txt"), "c_d_e_f_g_h_i_j.txt");
         assert!(!sanitize_filename("....//x").contains(".."));
+    }
+
+    #[test]
+    fn a_full_windows_path_becomes_just_the_file_name() {
+        assert_eq!(sanitize_filename("C:\\Users\\a.saberi\\Downloads\\holiday video.mp4"), "holiday video.mp4");
+        assert_eq!(sanitize_filename("/home/me/files/archive.tar.gz"), "archive.tar.gz");
+        assert_eq!(sanitize_filename("folder\\"), "folder");
+        assert_eq!(sanitize_filename("\\\\"), "download.bin");
     }
 
     #[test]

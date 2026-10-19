@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Nexdrop",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "identifier": "com.nexdrop.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -38,8 +38,8 @@
     "targets": [
       "nsis"
     ],
-    "publisher": "Nexdrop",
-    "copyright": "Copyright © 2026 Nexdrop",
+    "publisher": "AmirSRAD",
+    "copyright": "Copyright © 2026 AmirSRAD. All rights reserved.",
     "category": "Utility",
     "shortDescription": "A fast, safe download manager with torrent support.",
     "longDescription": "Nexdrop accelerates downloads with multiple connections, resumes interrupted transfers, verifies file integrity, schedules downloads, and downloads torrents and magnet links. It integrates with your browser through an optional extension.",
