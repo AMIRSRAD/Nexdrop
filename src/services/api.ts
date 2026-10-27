@@ -578,7 +578,7 @@ export const api = {
     }
     return {
       browsers: [
-        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.3.0' },
+        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.3.1' },
         { id: 'firefox', name: 'Mozilla Firefox', family: 'firefox', installed: true, connected: false, ever_connected: false },
       ],
       signed_firefox: false,
@@ -689,7 +689,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '1.3.0' };
+    return { name: 'Nexdrop', version: '1.3.1' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */
