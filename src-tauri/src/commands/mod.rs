@@ -341,6 +341,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
         proxy_mode,
         custom_proxy_url,
         queue_id: None,
+        hold: None,
         stream_variant: None,
     })
 }

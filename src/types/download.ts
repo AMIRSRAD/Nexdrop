@@ -197,6 +197,8 @@ export interface AddDownloadRequest {
   /** Extra request headers (e.g. Cookie / Authorization imported from cURL). */
   custom_headers?: Record<string, string>;
   queue_id?: string;
+  /** Add to the queue without starting it now. */
+  hold?: boolean;
   /** HLS / DASH: the quality to download (an id from `probeStream`). */
   stream_variant?: string;
 }

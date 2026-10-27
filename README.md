@@ -20,6 +20,12 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
   (simultaneous downloads, shared speed cap), automatic retry, and a "when finished" action
   (quit, sleep, hibernate, shut down, lock, or run a program).
 - Start now / Stop for any queue; downloads outside their schedule wait and say when they start.
+- In the New download panel, pick the queue and press **Add to queue** to line a download up without
+  starting it; it runs when that queue starts.
+
+**Several internet connections**
+- Settings → Connections lists your active adapters (Ethernet, Wi-Fi, ...). Pick one, or several
+  to share each download's connections across them; a dead adapter's connections move to the next.
 
 ![Queues](docs/screenshots/queues.png)
 

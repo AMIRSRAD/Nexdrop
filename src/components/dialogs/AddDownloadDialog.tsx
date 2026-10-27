@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, TriangleAlert, Terminal, Zap } from 'lucide-react';
+import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, ListPlus, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
 import type { AddDownloadRequest, AppSettings, BrowserRequest, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
 import { formatBytes, formatDuration } from '../../utils/format';
@@ -191,7 +191,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   const validUrl = isHttpUrl(url);
   const canSubmit = validUrl && !submitting && (when === 'now' || !!scheduledAt) && !(stream && (stream.unsupported || !variantId));
 
-  const submit = async (e?: React.FormEvent) => {
+  const submit = async (e?: React.FormEvent, hold = false) => {
     e?.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
@@ -217,7 +217,8 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         proxy_mode: proxyMode,
         custom_proxy_url: proxyMode === 'custom' && proxyUrl.trim() ? proxyUrl.trim() : undefined,
         custom_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
-        queue_id: queues.length > 1 ? queueId : undefined,
+        queue_id: queues.length > 0 ? queueId : undefined,
+        hold: hold && when === 'now' ? true : undefined,
         stream_variant: stream ? variantId : undefined,
       });
       onClose();
@@ -349,14 +350,17 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
           <Input icon={Folder} mono value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Downloads" />
         </div>
 
-        {/* Queue (only when there is more than one) */}
-        {queues.length > 1 && (
+        {/* Queue */}
+        {queues.length > 0 && (
           <div className="flex items-center gap-3">
             <Label className="mb-0 w-24 shrink-0">Queue</Label>
             <Select value={queueId} onValueChange={setQueueId} options={queues.map((q) => ({ value: q.id, label: q.name }))} className="w-56" />
             {(() => {
               const q = queues.find((x) => x.id === queueId);
-              return q && !q.open ? <span className="text-[12px] text-fg-3">Waits for its schedule</span> : null;
+              if (!q) return null;
+              if (!q.open) return <span className="text-[12px] text-fg-3">Waits for its schedule</span>;
+              const waiting = q.active + q.queued;
+              return waiting > 0 ? <span className="text-[12px] text-fg-3 tabular">{waiting} in line</span> : null;
             })()}
           </div>
         )}
@@ -503,6 +507,17 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         <Button variant="ghost" onClick={onClose}>
           Cancel
         </Button>
+        {when === 'now' && queues.length > 0 && (
+          <Button
+            variant="secondary"
+            icon={ListPlus}
+            disabled={!canSubmit}
+            onClick={() => submit(undefined, true)}
+            title="Add to the selected queue without starting. It downloads when that queue starts."
+          >
+            Add to queue
+          </Button>
+        )}
         <Button type="submit" variant="primary" icon={Download} loading={submitting} disabled={!canSubmit}>
           {when === 'later' ? 'Schedule' : 'Download'}
         </Button>

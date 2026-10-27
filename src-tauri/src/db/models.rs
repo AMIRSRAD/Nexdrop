@@ -434,6 +434,8 @@ pub struct AddDownloadRequest {
     pub proxy_mode: Option<String>,
     pub custom_proxy_url: Option<String>,
     pub queue_id: Option<String>,
+    /// Add to the queue without starting: the download waits (paused) until its queue is started.
+    pub hold: Option<bool>,
     /// For HLS / DASH streams: the quality to download (an id from `probe_stream_cmd`); the best one if omitted.
     pub stream_variant: Option<String>,
 }

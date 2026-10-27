@@ -353,6 +353,8 @@ impl DownloadManager {
             downloaded_bytes: 0,
             status: if req.scheduled_time.is_some() {
                 DownloadStatus::Scheduled
+            } else if req.hold == Some(true) {
+                DownloadStatus::Paused
             } else {
                 DownloadStatus::Queued
             },
@@ -479,7 +481,13 @@ impl DownloadManager {
             temp_path: String::new(),
             total_bytes: resolved.estimated_bytes() as i64,
             downloaded_bytes: 0,
-            status: if req.scheduled_time.is_some() { DownloadStatus::Scheduled } else { DownloadStatus::Queued },
+            status: if req.scheduled_time.is_some() {
+                DownloadStatus::Scheduled
+            } else if req.hold == Some(true) {
+                DownloadStatus::Paused
+            } else {
+                DownloadStatus::Queued
+            },
             resumable: true,
             etag: variant,
             last_modified: None,

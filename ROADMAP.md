@@ -11,6 +11,8 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 - [x] Named queues that you create, rename and delete (a built-in Main queue always exists)
 - [x] Assign downloads to a queue: Add dialog, row menu "Move to queue", and "Move to queue" for a selection
+- [x] "Add to queue" in the New download dialog: choose the queue and add without starting
+- [x] Choose which network adapters downloads use, or several at once (Settings → Connections)
 - [x] Per-queue schedule: always on, or on chosen days with a start time and an optional stop time
 - [x] Start now / Stop for a queue, regardless of its schedule
 - [x] Per-queue limits: simultaneous downloads and a shared speed limit
