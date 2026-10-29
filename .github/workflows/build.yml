@@ -53,6 +53,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: Build the interface
+        run: pnpm build
+
       - name: Unit tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
