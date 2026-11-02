@@ -16,6 +16,11 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
     }
 }
 
+/// "3.0 MB"-style size for status text.
+pub fn format_bytes(bytes: u64) -> String {
+    format_speed(bytes).trim_end_matches("/s").to_string()
+}
+
 /// Where Nexdrop keeps its database and small state files.
 pub fn data_dir() -> std::path::PathBuf {
     dirs::data_local_dir()

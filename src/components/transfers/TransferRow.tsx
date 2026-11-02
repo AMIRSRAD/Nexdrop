@@ -1,6 +1,6 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowUp, CalendarClock, CircleCheck, Ellipsis, ExternalLink, FolderOpen, Pause, Play, Radio, RotateCw, Square } from 'lucide-react';
+import { ArrowUp, CalendarClock, CircleCheck, Ellipsis, ExternalLink, FolderOpen, Pause, Play, Radio, RotateCw, ShieldCheck, Square } from 'lucide-react';
 import type { DownloadTask } from '../../types/download';
 import { formatBytes, formatDate, formatDuration, formatRelative, formatSpeed, hostOf } from '../../utils/format';
 import { progressOf } from '../../lib/meta';
@@ -261,6 +261,18 @@ const ProgressCell: React.FC<{ task: DownloadTask; progress: number }> = ({ task
       <div className="flex items-center gap-1.5 text-[12.5px] text-violet" title={formatDate(task.scheduled_time)}>
         <CalendarClock size={14} />
         <span className="truncate font-medium">{task.scheduled_time ? formatDate(task.scheduled_time) : 'Scheduled'}</span>
+      </div>
+    );
+  }
+
+  if (task.status === 'downloading' && task.phase) {
+    return (
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-1.5 text-[11.5px] leading-none font-medium text-accent">
+          <ShieldCheck size={12} className="nx-pulse" />
+          {task.phase === 'verifying' ? 'Verifying with the server…' : 'Fixing parts the server sent wrong…'}
+        </div>
+        <ProgressTrack progress={1} status={task.status} segments={[]} totalBytes={task.total_bytes} />
       </div>
     );
   }

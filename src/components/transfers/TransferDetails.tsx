@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { Check, Copy, FileCheck, FolderOpen, ShieldAlert, ShieldCheck, Terminal } from 'lucide-react';
-import type { DownloadTask } from '../../types/download';
+import React, { useEffect, useState } from 'react';
+import { Check, ClipboardCopy, Copy, FileCheck, FolderOpen, ShieldAlert, ShieldCheck, Terminal } from 'lucide-react';
+import type { DownloadTask, LogEntry } from '../../types/download';
 import { api } from '../../services/api';
 import { formatBytes, formatDate, joinPath } from '../../utils/format';
 import { PRIORITIES, STATUS_COLOR, STATUS_LABEL, progressOf } from '../../lib/meta';
@@ -12,7 +12,7 @@ import { ProgressTrack } from './ProgressTrack';
 import type { TaskHandlers } from './taskMenu';
 import { errText } from '../../hooks/useDownloads';
 
-type Tab = 'overview' | 'connections' | 'files' | 'integrity';
+type Tab = 'overview' | 'connections' | 'files' | 'integrity' | 'activity';
 
 export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandlers }> = ({ task, handlers }) => {
   const [tab, setTab] = useState<Tab>('overview');
@@ -29,6 +29,7 @@ export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandl
         { id: 'overview', label: 'Overview' },
         { id: 'connections', label: `Connections${liveCount > 0 ? ` · ${liveCount}` : ''}` },
         { id: 'integrity', label: 'Integrity' },
+        { id: 'activity', label: 'Activity' },
       ];
 
   return (
@@ -64,6 +65,7 @@ export const TransferDetails: React.FC<{ task: DownloadTask; handlers: TaskHandl
       {tab === 'connections' && <Connections task={task} />}
       {tab === 'files' && <TorrentFiles task={task} />}
       {tab === 'integrity' && <Integrity task={task} />}
+      {tab === 'activity' && <Activity task={task} />}
     </div>
   );
 };
@@ -384,6 +386,80 @@ const HashRow: React.FC<{ label: string; value?: string }> = ({ label, value }) 
         )}
       </div>
       <div className="selectable font-mono text-[11.5px] break-all text-fg-2">{value || 'Not calculated'}</div>
+    </div>
+  );
+};
+
+/** What happened to this download: starts, retries, repairs, checks. */
+const Activity: React.FC<{ task: DownloadTask }> = ({ task }) => {
+  const toast = useToast();
+  const [log, setLog] = useState<LogEntry[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    const load = () => api.getDownloadLog(task.id).then((l) => live && setLog(l)).catch(() => live && setLog([]));
+    load();
+    const t = window.setInterval(load, 3000);
+    return () => {
+      live = false;
+      window.clearInterval(t);
+    };
+  }, [task.id]);
+
+  const copyDiagnostics = async () => {
+    let version = '';
+    try {
+      version = (await api.getAppInfo()).version;
+    } catch {
+      /* not essential */
+    }
+    let host = '';
+    try {
+      host = new URL(task.final_url || task.url).host;
+    } catch {
+      /* not a URL */
+    }
+    // Only what helps find a problem: no full link, no cookies or logins.
+    const text = [
+      `Nexdrop ${version}`,
+      `File: ${task.filename}`,
+      `Host: ${host}`,
+      `Status: ${task.status}${task.error_message ? ` (${task.error_message})` : ''}`,
+      `Size: ${task.total_bytes} bytes, downloaded ${task.downloaded_bytes}`,
+      `Connections: ${task.connections}, resumable: ${task.resumable}, proxy: ${task.proxy_mode ?? 'system'}`,
+      '',
+      ...(log ?? []).map((l) => `${new Date(l.at * 1000).toISOString()}  ${l.message}`),
+    ].join('\n');
+    await navigator.clipboard.writeText(text);
+    toast.show({ id: 'diag', tone: 'success', title: 'Diagnostics copied', description: 'Paste them into a bug report.', duration: 2500 });
+  };
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[11.5px] text-fg-3">{log ? `${log.length} event${log.length === 1 ? '' : 's'}` : 'Loading…'}</span>
+        <Button size="sm" variant="ghost" icon={ClipboardCopy} onClick={copyDiagnostics} className="-mr-2">
+          Copy diagnostics
+        </Button>
+      </div>
+      {log && log.length === 0 ? (
+        <div className="rounded-lg bg-surface-2 p-4 text-[12.5px] text-fg-2 shadow-[inset_0_0_0_1px_var(--line)]">Nothing recorded yet.</div>
+      ) : (
+        <ol className="selectable max-h-56 space-y-1 overflow-y-auto rounded-lg bg-surface-2 p-3 shadow-[inset_0_0_0_1px_var(--line)]">
+          {(log ?? []).map((l, i) => (
+            <li key={i} className="flex gap-3 text-[12px]">
+              <span className="w-16 shrink-0 text-fg-3 tabular">{new Date(l.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</span>
+              <span
+                className={cn(
+                  'min-w-0',
+                  l.message.startsWith('Verified') ? 'text-success' : l.message.startsWith('Failed') || l.message.includes('wrong data') ? 'text-danger' : 'text-fg-2',
+                )}
+              >
+                {l.message}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 };

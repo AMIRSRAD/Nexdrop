@@ -97,6 +97,11 @@ impl DownloadManager {
         Repository::open_or_create(&self.db_path)
     }
 
+    pub fn download_log(&self, id: &str) -> Result<Vec<crate::db::models::LogEntry>, String> {
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        Repository::get_log(&conn, id).map_err(|e| e.to_string())
+    }
+
     /// Addresses of the network adapters downloads should use (empty = let Windows choose).
     pub fn local_addresses(&self) -> Vec<std::net::IpAddr> {
         let settings = self.get_settings();
@@ -125,6 +130,11 @@ impl DownloadManager {
         }
         if settings.settings_version < 2 {
             settings.auto_categorize = true;
+        }
+        // "Connections per server" is enforced from version 3 on; the old untouched default (8)
+        // would now slow down several downloads from one site, so it moves to the new default.
+        if settings.settings_version < 3 && settings.max_connections_per_server == 8 {
+            settings.max_connections_per_server = 16;
         }
         settings.settings_version = crate::db::models::CURRENT_SETTINGS_VERSION;
         let _ = Repository::save_settings(&conn, &settings);
@@ -190,6 +200,7 @@ impl DownloadManager {
     /// after settings change, and when the scheduler window opens or closes.
     pub fn apply_runtime_settings(&self) {
         let settings = self.get_settings();
+        crate::engine::client::set_proxy_auth(&settings.proxy_username, &settings.proxy_password);
         let limit = settings.global_speed_limit;
         self.engine.set_global_speed_limit(limit);
         self.torrents.apply_limits(settings.torrent_upload_limit, limit);
@@ -343,6 +354,7 @@ impl DownloadManager {
             return self.add_stream(req, created_at).await;
         }
 
+        let overwrite = req.overwrite == Some(true);
         let filename = req
             .filename
             .filter(|f| !f.trim().is_empty())
@@ -434,6 +446,9 @@ impl DownloadManager {
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         Repository::save_download(&conn, &task).map_err(|e| e.to_string())?;
+        if overwrite {
+            let _ = Repository::set_flag(&conn, &task.id, "overwrite");
+        }
 
         // If not scheduled, check if queue has capacity to start immediately
         if task.status == DownloadStatus::Queued {
@@ -1411,7 +1426,14 @@ impl DownloadManager {
 
         let manager = Arc::clone(self);
         let task_id = task.id.clone();
-        let engine = self.engine.clone().with_local_addresses(self.local_addresses());
+        let overwrite = self.get_db_conn().map(|c| Repository::has_flag(&c, &task.id, "overwrite")).unwrap_or(false);
+        let per_host = self.get_settings().max_connections_per_server;
+        let engine = self
+            .engine
+            .clone()
+            .with_local_addresses(self.local_addresses())
+            .with_overwrite(overwrite)
+            .with_per_host_limit(per_host);
         let is_torrent = task.kind == "torrent";
         let is_stream = task.kind == "stream";
         let queue_id = task.queue_id.clone();
@@ -1423,6 +1445,14 @@ impl DownloadManager {
         // Saved-login headers are looked up fresh on every start (the login may have changed).
         let vault_headers = self.vault_headers(&task.url);
 
+        if let Ok(conn) = self.get_db_conn() {
+            let line = if task.downloaded_bytes > 0 {
+                format!("Resumed at {}", crate::util::format_bytes(task.downloaded_bytes.max(0) as u64))
+            } else {
+                format!("Started ({} connections)", task.connections.max(1))
+            };
+            let _ = Repository::add_log(&conn, &task.id, chrono::Utc::now().timestamp(), &[line]);
+        }
         tauri::async_runtime::spawn(async move {
             let app_handle = manager.app_handle.clone();
             let db_path = manager.db_path.clone();
@@ -1434,8 +1464,17 @@ impl DownloadManager {
             let progress_app = app_handle.clone();
             let progress_db = db_path.clone();
 
+            let log_db = db_path.clone();
             let on_progress = move |event: DownloadProgressEvent| {
                     let _ = progress_app.emit("download-progress", &event);
+                    if !event.notes.is_empty() {
+                        let (db, id, notes) = (log_db.clone(), event.id.clone(), event.notes.clone());
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if let Ok(conn) = Repository::open_or_create(&db) {
+                                let _ = Repository::add_log(&conn, &id, chrono::Utc::now().timestamp(), &notes);
+                            }
+                        });
+                    }
                     if event.status != DownloadStatus::Downloading {
                         return;
                     }
@@ -1468,6 +1507,16 @@ impl DownloadManager {
                 engine.run_download_with(task, pause_rx, vault_headers, on_progress).await
             };
 
+            {
+                let line = match &res {
+                    Ok(t) if t.status == DownloadStatus::Paused => format!("Paused at {}", crate::util::format_bytes(t.downloaded_bytes.max(0) as u64)),
+                    Ok(_) => "Finished downloading".to_string(),
+                    Err(e) => format!("Failed: {e}"),
+                };
+                if let Ok(conn) = Repository::open_or_create(&db_path) {
+                    let _ = Repository::add_log(&conn, &task_id, chrono::Utc::now().timestamp(), &[line]);
+                }
+            }
             match res {
                 // Stopped on request. The pause (or delete) already updated the
                 // task's status; just remember how far we got. This is NOT a
@@ -1634,6 +1683,69 @@ impl DownloadManager {
         } else {
             Err(format!("Download task {id} not found"))
         }
+    }
+
+    /// Where a download would be saved (the same rules as adding it), if a file is already there.
+    pub fn existing_file(&self, destination: Option<&str>, filename: &str, category: FileCategory) -> Option<String> {
+        let settings = self.get_settings();
+        let base = destination.filter(|d| !d.trim().is_empty()).map(str::to_string).unwrap_or(settings.default_destination.clone());
+        let mut dir = PathBuf::from(base);
+        if settings.auto_categorize && category != FileCategory::Other {
+            let sub = category.subfolder_name();
+            if !sub.is_empty() {
+                dir = dir.join(sub);
+            }
+        }
+        let path = dir.join(sanitize_filename(filename));
+        path.is_file().then(|| path.to_string_lossy().to_string())
+    }
+
+    /// Gives an unfinished download a new link for the same file (an expired link from a
+    /// file host, a mirror...) and resumes it from where it was.
+    pub async fn refresh_link(self: &Arc<Self>, id: &str, new_url: &str) -> Result<(), String> {
+        let parsed = url::Url::parse(new_url.trim()).map_err(|e| format!("Invalid link: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("Only http and https links can be used".to_string());
+        }
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        let task = Repository::get_download(&conn, id).map_err(|e| e.to_string())?.ok_or("Download not found")?;
+        if task.kind != "http" {
+            return Err("Only normal downloads can get a new link".to_string());
+        }
+        if task.status == DownloadStatus::Completed {
+            return Err("This download is already finished".to_string());
+        }
+        let settings = self.get_settings();
+        let opts = ProbeOptions {
+            user_agent: task.user_agent.clone(),
+            referer: task.referer.clone(),
+            headers: build_header_list(&task.custom_headers, &self.vault_headers(new_url)),
+        };
+        let mode = task.proxy_mode.clone().unwrap_or(settings.proxy_mode.clone());
+        let custom = task.custom_proxy_url.clone().or(settings.custom_proxy_url.clone());
+        let probe = self.probe(new_url.trim(), Some(&mode), custom.as_deref(), &opts).await?;
+        if task.total_bytes > 0 && probe.total_bytes > 0 && probe.total_bytes != task.total_bytes {
+            return Err(format!(
+                "This link is for a different file ({} instead of {})",
+                crate::util::format_bytes(probe.total_bytes as u64),
+                crate::util::format_bytes(task.total_bytes as u64)
+            ));
+        }
+        if task.downloaded_bytes > 0 && !probe.resumable {
+            return Err("The new link can't continue a partial download (the server doesn't allow it)".to_string());
+        }
+        // Stop the old run (if any) before switching links.
+        let _ = self.pause_download(id);
+        self.wait_until_idle(id).await;
+        let now = chrono::Utc::now().timestamp();
+        Repository::update_link(&conn, id, new_url.trim(), Some(&probe.final_url), probe.etag.as_deref(), probe.last_modified.as_deref(), now)
+            .map_err(|e| e.to_string())?;
+        let _ = Repository::add_log(&conn, id, now, &[format!("Link refreshed: now {}", parsed.host_str().unwrap_or(""))]);
+        self.retries_used.lock().remove(id);
+        Repository::update_status(&conn, id, DownloadStatus::Queued, None, None, now).map_err(|e| e.to_string())?;
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
+        self.process_queue().await;
+        Ok(())
     }
 
     pub async fn retry_download(self: &Arc<Self>, id: &str) -> Result<(), String> {

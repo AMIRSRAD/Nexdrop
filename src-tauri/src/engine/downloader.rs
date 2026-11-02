@@ -115,6 +115,10 @@ pub struct DownloadEngine {
     /// Adapter addresses to download through. Several means each download's
     /// connections are shared among them; empty means Windows chooses.
     pub(crate) local_addrs: Vec<IpAddr>,
+    /// Replace a file of the same name when finished, instead of keeping both.
+    pub(crate) overwrite: bool,
+    /// Most connections to one server across all downloads (0 = no limit).
+    pub(crate) per_host: usize,
     pub(crate) retry_base: Duration,
 }
 
@@ -131,6 +135,8 @@ impl DownloadEngine {
             global_limit: Arc::new(RateLimiter::new(0)),
             group_limit: None,
             local_addrs: Vec::new(),
+            overwrite: false,
+            per_host: 0,
             retry_base: Duration::from_secs(1),
         }
     }
@@ -150,6 +156,35 @@ impl DownloadEngine {
         let mut engine = self.clone();
         engine.group_limit = Some(limit);
         engine
+    }
+
+    /// A copy of this engine that opens at most `n` connections to one server, counting
+    /// every download from it (0 = no limit). Each download still keeps one connection.
+    pub fn with_per_host_limit(&self, n: usize) -> Self {
+        let mut engine = self.clone();
+        engine.per_host = n;
+        engine
+    }
+
+    /// A copy of this engine that replaces an existing file of the same name when done.
+    pub fn with_overwrite(&self, overwrite: bool) -> Self {
+        let mut engine = self.clone();
+        engine.overwrite = overwrite;
+        engine
+    }
+
+    /// Where a finished file goes: its own name (replacing what is there when asked to),
+    /// otherwise the first free "name (n).ext".
+    fn final_target(&self, dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+        if self.overwrite {
+            let target = dir.join(name);
+            if target.is_file() {
+                std::fs::remove_file(&target)?;
+            }
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&target)?;
+            return Ok(target);
+        }
+        reserve_unique_path(dir, name)
     }
 
     /// A copy of this engine whose runs go out through the given network adapters.
@@ -279,7 +314,7 @@ impl DownloadEngine {
             }
         }
 
-        let final_path = reserve_unique_path(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest))
+        let final_path = self.final_target(final_dest.parent().unwrap_or(Path::new(".")), &file_name_of(&final_dest))
             .map_err(|e| format!("Cannot create the final file: {e}"))?;
         if let Err(e) = tokio::fs::rename(&part_file, &final_path).await {
             let _ = tokio::fs::remove_file(&final_path).await;
@@ -290,6 +325,8 @@ impl DownloadEngine {
         task.downloaded_bytes = task.downloaded_bytes.max(task.total_bytes);
 
         on_progress(DownloadProgressEvent {
+            phase: None,
+            notes: Vec::new(),
             id: task.id.clone(),
             downloaded_bytes: task.downloaded_bytes,
             total_bytes: task.total_bytes,
@@ -389,6 +426,8 @@ impl DownloadEngine {
                 task.eta_seconds = eta;
 
                 on_progress(DownloadProgressEvent {
+                    phase: None,
+                    notes: Vec::new(),
                     id: task.id.clone(),
                     downloaded_bytes: task.downloaded_bytes,
                     total_bytes: task.total_bytes,
@@ -542,6 +581,9 @@ impl DownloadEngine {
 
         let shared = Arc::new(Shared {
             responses: Mutex::new(Vec::new()),
+            notes: Mutex::new(Vec::new()),
+            host: task.final_url.as_deref().filter(|u| !u.is_empty()).and_then(host_key).or_else(|| host_key(&task.url)),
+            per_host: self.per_host,
             slice_strict: slice_strict(&task.url) || task.final_url.as_deref().map(slice_strict).unwrap_or(false),
             clients: clients.to_vec(),
             resolved: Mutex::new(task.final_url.clone().filter(|u| !u.is_empty() && *u != task.url)),
@@ -572,9 +614,13 @@ impl DownloadEngine {
             retry_base: self.retry_base,
         });
 
+        let _on_host = HostDownload::new(shared.host.clone());
+        let mut waiting_noted = false;
         let mut workers: JoinSet<()> = JoinSet::new();
         for _ in 0..initial_workers {
-            workers.spawn(worker(shared.clone()));
+            if !spawn_worker(&mut workers, &shared, false) {
+                break;
+            }
         }
 
         // ── coordinator ────────────────────────────────────────────────────
@@ -614,6 +660,8 @@ impl DownloadEngine {
                     task.eta_seconds = eta;
 
                     on_progress(DownloadProgressEvent {
+                        phase: None,
+                        notes: std::mem::take(&mut *shared.notes.lock()),
                         id: task.id.clone(),
                         downloaded_bytes: task.downloaded_bytes,
                         total_bytes: task.total_bytes,
@@ -645,10 +693,9 @@ impl DownloadEngine {
                         last_ramp = now;
                         let room = shared.cap.load(Ordering::Relaxed).saturating_sub(workers.len());
                         for _ in 0..room.min(RAMP_STEP) {
-                            if !shared.can_feed_another_worker() {
+                            if !shared.can_feed_another_worker() || !spawn_worker(&mut workers, &shared, false) {
                                 break;
                             }
-                            workers.spawn(worker(shared.clone()));
                         }
                     }
                 }
@@ -659,8 +706,15 @@ impl DownloadEngine {
             }
             if workers.is_empty() {
                 if shared.has_unfinished_work() {
-                    // Every worker left (e.g. gave ranges back after throttling): keep one going.
-                    workers.spawn(worker(shared.clone()));
+                    // No worker (gave ranges back, or the server's connections are all taken by
+                    // other downloads): start one as soon as the server's limit allows.
+                    if !spawn_worker(&mut workers, &shared, false) && !waiting_noted {
+                        waiting_noted = true;
+                        shared.notes.lock().push(format!(
+                            "Waiting: other downloads use all {} connections allowed to this server",
+                            shared.per_host
+                        ));
+                    }
                 } else {
                     break End::Done;
                 }
@@ -728,7 +782,39 @@ impl DownloadEngine {
                 // Spot-check the finished file against the server; anything that does not
                 // match is forgotten and fetched again.
                 if total >= VERIFY_MIN_BYTES && shared.range_ok.load(Ordering::Relaxed) {
+                    on_progress(DownloadProgressEvent {
+                        phase: Some("verifying".to_string()),
+                        notes: std::mem::take(&mut *shared.notes.lock()),
+                        id: task.id.clone(),
+                        downloaded_bytes: task.total_bytes,
+                        total_bytes: task.total_bytes,
+                        speed_bps: 0,
+                        eta_seconds: None,
+                        status: DownloadStatus::Downloading,
+                        segments: vec![],
+                    });
                     let damaged = find_damage(&shared, &file, total).await;
+                    let note = if damaged.is_empty() {
+                        "Verified: the file matches the server".to_string()
+                    } else {
+                        let bytes: u64 = damaged.iter().map(|(s, e)| e - s).sum();
+                        format!(
+                            "The server sent wrong data for {} part(s) ({}); downloading them again",
+                            damaged.len(),
+                            fmt_offset(bytes)
+                        )
+                    };
+                    on_progress(DownloadProgressEvent {
+                        phase: if damaged.is_empty() { None } else { Some("repairing".to_string()) },
+                        notes: vec![note],
+                        id: task.id.clone(),
+                        downloaded_bytes: task.total_bytes,
+                        total_bytes: task.total_bytes,
+                        speed_bps: 0,
+                        eta_seconds: None,
+                        status: DownloadStatus::Downloading,
+                        segments: vec![],
+                    });
                     if !damaged.is_empty() {
                         let mut map = snapshot.clone();
                         for (s, e) in damaged {
@@ -746,7 +832,7 @@ impl DownloadEngine {
                 drop(shared);
                 drop(file);
 
-                let final_path = reserve_unique_path(&dest_dir, &file_name_of(final_dest))
+                let final_path = self.final_target(&dest_dir, &file_name_of(final_dest))
                     .map_err(|e| RoundFailure::Failed(format!("Cannot create the final file: {e}")))?;
                 if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
                     let _ = tokio::fs::remove_file(&final_path).await;
@@ -766,6 +852,8 @@ impl DownloadEngine {
                 }];
 
                 on_progress(DownloadProgressEvent {
+                    phase: None,
+                    notes: Vec::new(),
                     id: task.id.clone(),
                     downloaded_bytes: task.total_bytes,
                     total_bytes: task.total_bytes,
@@ -781,6 +869,16 @@ impl DownloadEngine {
 }
 
 // ───────────────────────── spot-check against the server ─────────────────────────
+
+/// `1.5 MiB`-style sizes and offsets for log lines.
+fn fmt_offset(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{} KiB", bytes / 1024)
+    }
+}
 
 /// Asks the server for a few bytes at `offset`. `None` if it could not be answered reliably.
 async fn fetch_sample(shared: &Shared, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -872,7 +970,10 @@ async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64
             let shared = shared.clone();
             let file = file.clone();
             async move {
-                let Some(theirs) = fetch_sample(&shared, offset, VERIFY_SAMPLE_BYTES).await else { return (i, None) };
+                let host_slot = HostSlot::acquire_wait(&shared).await;
+                let theirs = fetch_sample(&shared, offset, VERIFY_SAMPLE_BYTES).await;
+                drop(host_slot);
+                let Some(theirs) = theirs else { return (i, None) };
                 let read = tokio::task::spawn_blocking(move || {
                     let mut mine = vec![0u8; VERIFY_SAMPLE_BYTES];
                     read_exact_at(&file, &mut mine, offset).map(|_| mine)
@@ -961,6 +1062,11 @@ struct Shared {
     /// Every stretch written from one server response (`start..end`), so a response that
     /// turns out to be wrong can be fetched again exactly.
     responses: Mutex<Vec<Range>>,
+    /// `host:port` the connections go to, and the most allowed there across downloads.
+    host: Option<String>,
+    per_host: usize,
+    /// Lines for the activity log, collected by the workers and sent with the next progress tick.
+    notes: Mutex<Vec<String>>,
     /// Start every request on a slice boundary (see `SLICE_STRICT_HOSTS`).
     slice_strict: bool,
     /// One client per network adapter in use; each range sticks to one (see `Slot::client_idx`).
@@ -1261,7 +1367,115 @@ impl Drop for ActiveGuard {
     }
 }
 
-async fn worker(shared: Arc<Shared>) {
+/// Connections open to each server, across every download.
+static HOST_CONNECTIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// One connection's place in its server's count; given back when the worker ends.
+struct HostSlot(Option<String>);
+
+impl HostSlot {
+    /// A place for one more connection to this download's server, if the limit allows
+    /// (`force`: always, for a download's first connection).
+    fn acquire(shared: &Shared, force: bool) -> Option<HostSlot> {
+        let Some(host) = shared.host.clone() else { return Some(HostSlot(None)) };
+        let mut counts = HOST_CONNECTIONS.lock();
+        let n = counts.entry(host.clone()).or_insert(0);
+        if !force && shared.per_host > 0 && *n >= shared.per_host {
+            return None;
+        }
+        *n += 1;
+        Some(HostSlot(Some(host)))
+    }
+
+    /// Waits for a place (a short check request, not a long transfer): after a couple
+    /// of seconds it goes ahead anyway rather than stall a finished download.
+    async fn acquire_wait(shared: &Shared) -> HostSlot {
+        let started = Instant::now();
+        loop {
+            if let Some(slot) = Self::acquire(shared, started.elapsed() >= Duration::from_secs(3)) {
+                return slot;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        if let Some(host) = &self.0 {
+            let mut counts = HOST_CONNECTIONS.lock();
+            if let Some(n) = counts.get_mut(host) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(host);
+                }
+            }
+        }
+    }
+}
+
+/// Downloads currently running against each server (for sharing its connections fairly).
+static HOST_DOWNLOADS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Registers one running download with its server for as long as it is held.
+struct HostDownload(Option<String>);
+
+impl HostDownload {
+    fn new(host: Option<String>) -> Self {
+        if let Some(h) = &host {
+            *HOST_DOWNLOADS.lock().entry(h.clone()).or_insert(0) += 1;
+        }
+        HostDownload(host)
+    }
+}
+
+impl Drop for HostDownload {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            let mut m = HOST_DOWNLOADS.lock();
+            if let Some(n) = m.get_mut(h) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(h);
+                }
+            }
+        }
+    }
+}
+
+impl Shared {
+    /// The server is at its limit and this download holds more than its fair share.
+    fn should_yield(&self) -> bool {
+        let Some(host) = &self.host else { return false };
+        if self.per_host == 0 {
+            return false;
+        }
+        let open = HOST_CONNECTIONS.lock().get(host).copied().unwrap_or(0);
+        let downloads = HOST_DOWNLOADS.lock().get(host).copied().unwrap_or(1).max(1);
+        let fair = (self.per_host / downloads).max(1);
+        open >= self.per_host && self.active.load(Ordering::Relaxed) > fair
+    }
+}
+
+/// Starts a worker if the server's connection limit allows it.
+fn spawn_worker(workers: &mut JoinSet<()>, shared: &Arc<Shared>, force: bool) -> bool {
+    match HostSlot::acquire(shared, force) {
+        Some(slot) => {
+            workers.spawn(worker(shared.clone(), slot));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Connections open to `url`'s server right now (for tests and diagnostics).
+pub fn connections_to(url: &str) -> usize {
+    host_key(url).and_then(|h| HOST_CONNECTIONS.lock().get(&h).copied()).unwrap_or(0)
+}
+
+async fn worker(shared: Arc<Shared>, _host_slot: HostSlot) {
     shared.active.fetch_add(1, Ordering::Relaxed);
     let _active = ActiveGuard(shared.clone());
     let mut cancel = shared.cancel.subscribe();
@@ -1276,7 +1490,13 @@ async fn worker(shared: Arc<Shared>) {
             return;
         }
         match outcome {
-            SlotEnd::Done => shared.finish_slot(&slot),
+            SlotEnd::Done => {
+                shared.finish_slot(&slot);
+                // Another download is waiting for a connection to this server: step aside.
+                if shared.should_yield() {
+                    return;
+                }
+            }
             SlotEnd::Cancelled => return,
             SlotEnd::GiveBack => {
                 shared.give_back(&slot);
@@ -1326,6 +1546,7 @@ async fn run_slot(
                 return SlotEnd::Fatal(failure);
             }
             AttemptEnd::Retry { reason, made_progress, retry_after, throttled, network } => {
+                shared.notes.lock().push(format!("{reason}; retrying from {}", fmt_offset(slot.state.lock().pos)));
                 if made_progress {
                     failures = 0;
                     refreshes = 0;

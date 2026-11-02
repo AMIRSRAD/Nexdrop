@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use crate::db::models::{AppSettings, DownloadQueue, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, SiteCredential};
+use crate::db::models::{AppSettings, DownloadQueue, DownloadSegment, DownloadStatus, DownloadTask, FileCategory, LogEntry, SiteCredential};
 
 pub struct Repository;
 
@@ -157,6 +157,17 @@ impl Repository {
                 id TEXT PRIMARY KEY,
                 position INTEGER NOT NULL DEFAULT 0,
                 data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS download_log (
+                task_id TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_download_log_task ON download_log(task_id);
+            CREATE TABLE IF NOT EXISTS download_flags (
+                task_id TEXT NOT NULL,
+                flag TEXT NOT NULL,
+                PRIMARY KEY (task_id, flag)
             );",
         )?;
 
@@ -733,7 +744,59 @@ let status_str: String = row.get(8)?;
 
     pub fn delete_download(conn: &Connection, id: &str) -> Result<()> {
         conn.execute("DELETE FROM downloads WHERE id = ?1", params![id])?;
+        conn.execute("DELETE FROM download_log WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM download_flags WHERE task_id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Small per-download choices that don't need a column of their own ("overwrite").
+    pub fn set_flag(conn: &Connection, task_id: &str, flag: &str) -> Result<()> {
+        conn.execute("INSERT OR IGNORE INTO download_flags (task_id, flag) VALUES (?1, ?2)", params![task_id, flag])?;
+        Ok(())
+    }
+
+    pub fn has_flag(conn: &Connection, task_id: &str, flag: &str) -> bool {
+        conn.query_row("SELECT 1 FROM download_flags WHERE task_id = ?1 AND flag = ?2", params![task_id, flag], |_| Ok(()))
+            .is_ok()
+    }
+
+    /// Points a download at a new link for the same file, keeping its progress.
+    pub fn update_link(
+        conn: &Connection,
+        id: &str,
+        url: &str,
+        final_url: Option<&str>,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE downloads SET url = ?2, final_url = ?3, etag = ?4, last_modified = ?5, error_message = NULL, updated_at = ?6 WHERE id = ?1",
+            params![id, url, final_url, etag, last_modified, now],
+        )?;
+        Ok(())
+    }
+
+    /// Most lines kept per download (the oldest go first).
+    const LOG_LIMIT: i64 = 300;
+
+    /// Appends lines to a download's activity log.
+    pub fn add_log(conn: &Connection, task_id: &str, at: i64, messages: &[String]) -> Result<()> {
+        for m in messages {
+            conn.execute("INSERT INTO download_log (task_id, at, message) VALUES (?1, ?2, ?3)", params![task_id, at, m])?;
+        }
+        conn.execute(
+            "DELETE FROM download_log WHERE task_id = ?1 AND rowid NOT IN
+                (SELECT rowid FROM download_log WHERE task_id = ?1 ORDER BY rowid DESC LIMIT ?2)",
+            params![task_id, Self::LOG_LIMIT],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_log(conn: &Connection, task_id: &str) -> Result<Vec<LogEntry>> {
+        let mut stmt = conn.prepare("SELECT at, message FROM download_log WHERE task_id = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![task_id], |r| Ok(LogEntry { at: r.get(0)?, message: r.get(1)? }))?;
+        rows.collect()
     }
 
     pub fn load_settings(conn: &Connection) -> Result<AppSettings> {
@@ -741,7 +804,10 @@ let status_str: String = row.get(8)?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
             let json_str: String = row.get(0)?;
-            if let Ok(settings) = serde_json::from_str::<AppSettings>(&json_str) {
+            if let Ok(mut settings) = serde_json::from_str::<AppSettings>(&json_str) {
+                if crate::secrets::is_protected(&settings.proxy_password) {
+                    settings.proxy_password = crate::secrets::unprotect(&settings.proxy_password).unwrap_or_default();
+                }
                 return Ok(settings);
             }
         }
@@ -751,7 +817,11 @@ let status_str: String = row.get(8)?;
     }
 
     pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
-        let json_str = serde_json::to_string(settings).unwrap_or_default();
+        let mut stored = settings.clone();
+        if !stored.proxy_password.is_empty() {
+            stored.proxy_password = crate::secrets::protect(&stored.proxy_password);
+        }
+        let json_str = serde_json::to_string(&stored).unwrap_or_default();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
@@ -928,6 +998,31 @@ mod tests {
         Repository::delete_queue(&conn, "night", "main").unwrap();
         assert_eq!(Repository::get_download(&conn, "t1").unwrap().unwrap().queue_id, "main");
         assert_eq!(Repository::list_queues(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_proxy_password_is_not_stored_in_plain_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        Repository::create_tables(&conn).unwrap();
+        let settings = AppSettings { proxy_username: "me".into(), proxy_password: "s3cret-pass".into(), ..Default::default() };
+        Repository::save_settings(&conn, &settings).unwrap();
+        let raw: String = conn.query_row("SELECT value FROM settings WHERE key = 'app_settings'", [], |r| r.get(0)).unwrap();
+        assert!(!raw.contains("s3cret-pass"));
+        assert_eq!(Repository::load_settings(&conn).unwrap().proxy_password, "s3cret-pass");
+    }
+
+    #[test]
+    fn activity_log_keeps_the_newest_lines_and_goes_with_the_download() {
+        let conn = Connection::open_in_memory().unwrap();
+        Repository::create_tables(&conn).unwrap();
+        let lines: Vec<String> = (0..320).map(|i| format!("line {i}")).collect();
+        Repository::add_log(&conn, "t", 1, &lines).unwrap();
+        let log = Repository::get_log(&conn, "t").unwrap();
+        assert_eq!(log.len(), 300);
+        assert_eq!(log[0].message, "line 20");
+        assert_eq!(log[299].message, "line 319");
+        Repository::delete_download(&conn, "t").unwrap();
+        assert!(Repository::get_log(&conn, "t").unwrap().is_empty());
     }
 
     #[test]

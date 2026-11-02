@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   BrowserIntegration,
   NetworkAdapter,
+  LogEntry,
   BrowserSetupOutcome,
   BrowserRequest,
   StreamProbe,
@@ -247,7 +248,7 @@ let mockSettings: AppSettings = {
   default_destination: 'C:/Users/Downloads',
   max_active_downloads: 3,
   default_connections: 8,
-  max_connections_per_server: 8,
+  max_connections_per_server: 16,
   min_chunk_size: 1048576,
   global_speed_limit: 0,
   auto_resume_on_launch: true,
@@ -256,6 +257,9 @@ let mockSettings: AppSettings = {
   clipboard_watch: false,
   auto_categorize: true,
   proxy_mode: 'system',
+  proxy_username: '',
+  proxy_password: '',
+  auto_update: true,
   custom_proxy_url: undefined,
   on_complete_action: 'notify',
   sound_enabled: true,
@@ -560,6 +564,44 @@ export const api = {
     window.open(url, '_blank', 'noopener');
   },
 
+  /** Path of an existing file a new download with this name would collide with. */
+  async existingFile(destination: string | undefined, filename: string, category: string): Promise<string | null> {
+    if (isTauri()) {
+      return await invoke<string | null>('existing_file_cmd', { destination, filename, category });
+    }
+    return filename.toLowerCase().includes('exists') ? `C:/Users/Downloads/${filename}` : null;
+  },
+
+  /** Gives an unfinished download a new link for the same file and resumes it. */
+  async refreshLink(id: string, url: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('refresh_link_cmd', { id, url });
+    }
+  },
+
+  /** Tries proxy settings (before they are saved) against a public address. */
+  async testProxy(mode: string, url?: string, username?: string, password?: string): Promise<{ ok: boolean; millis: number; exit_ip?: string | null; country?: string | null; error?: string | null }> {
+    if (isTauri()) {
+      return await invoke('test_proxy_cmd', { mode, url, username, password });
+    }
+    await new Promise((r) => setTimeout(r, 600));
+    return { ok: true, millis: 412, exit_ip: '203.0.113.7', country: 'DE' };
+  },
+
+  /** A download's activity log, oldest first. */
+  async getDownloadLog(id: string): Promise<LogEntry[]> {
+    if (isTauri()) {
+      return await invoke<LogEntry[]>('get_download_log_cmd', { id });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    return [
+      { at: now - 600, message: 'Started (8 connections)' },
+      { at: now - 420, message: 'Connection closed early (1.2 MiB short); retrying from 512.4 MiB' },
+      { at: now - 30, message: 'Verified: the file matches the server' },
+      { at: now - 29, message: 'Finished downloading' },
+    ];
+  },
+
   /** Internet connections (network adapters) that are up right now. */
   async getNetworkAdapters(): Promise<NetworkAdapter[]> {
     if (isTauri()) {
@@ -578,7 +620,7 @@ export const api = {
     }
     return {
       browsers: [
-        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.3.3' },
+        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.4.0' },
         { id: 'firefox', name: 'Mozilla Firefox', family: 'firefox', installed: true, connected: false, ever_connected: false },
       ],
       signed_firefox: false,
@@ -689,7 +731,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '1.3.3' };
+    return { name: 'Nexdrop', version: '1.4.0' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */

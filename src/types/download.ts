@@ -66,6 +66,8 @@ export interface DownloadTask {
   kind?: 'http' | 'torrent' | 'stream';
   /** The queue this download belongs to. */
   queue_id?: string;
+  /** Live only: what a download at 100% is doing before it is kept. */
+  phase?: 'verifying' | 'repairing';
   info_hash?: string;
   uploaded_bytes?: number;
   peers?: number;
@@ -131,6 +133,10 @@ export interface AppSettings {
   auto_categorize: boolean;
   proxy_mode: 'system' | 'direct' | 'custom';
   custom_proxy_url?: string;
+  proxy_username: string;
+  proxy_password: string;
+  /** Look for new versions automatically (installing always asks first). */
+  auto_update: boolean;
   on_complete_action: 'none' | 'notify' | 'sleep' | 'shutdown';
   sound_enabled: boolean;
   scheduler_enabled: boolean;
@@ -199,6 +205,8 @@ export interface AddDownloadRequest {
   queue_id?: string;
   /** Add to the queue without starting it now. */
   hold?: boolean;
+  /** Replace a file of the same name when finished (instead of keeping both). */
+  overwrite?: boolean;
   /** HLS / DASH: the quality to download (an id from `probeStream`). */
   stream_variant?: string;
 }
@@ -211,6 +219,15 @@ export interface DownloadProgressEvent {
   eta_seconds?: number;
   status: DownloadStatus;
   segments: DownloadSegment[];
+  /** Set while a finished download is checked against the server ('verifying') or fixed ('repairing'). */
+  phase?: 'verifying' | 'repairing';
+  notes?: string[];
+}
+
+/** One line of a download's activity log. */
+export interface LogEntry {
+  at: number;
+  message: string;
 }
 
 export interface ChecksumResult {

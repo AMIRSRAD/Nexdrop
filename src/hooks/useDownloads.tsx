@@ -79,6 +79,7 @@ export function useDownloads(onOpenNewDownload: () => void, onOpenTorrent: (sour
             speed_bps: ev.speed_bps,
             eta_seconds: ev.eta_seconds,
             status: ev.status,
+            phase: ev.status === 'downloading' ? ev.phase : undefined,
             segments: ev.segments?.length ? ev.segments : item.segments,
           };
         }),

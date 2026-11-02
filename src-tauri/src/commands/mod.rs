@@ -337,6 +337,7 @@ pub async fn parse_curl_command_cmd(curl: String) -> Result<AddDownloadRequest, 
         custom_proxy_url,
         queue_id: None,
         hold: None,
+        overwrite: None,
         stream_variant: None,
     })
 }
@@ -587,6 +588,40 @@ fn signed_xpi(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
             .join("nexdrop-firefox.xpi"),
     );
     candidates.into_iter().find(|p| p.exists()).map(|p| p.canonicalize().unwrap_or(p))
+}
+
+/// Path of a file that a new download with this name would collide with, if any.
+#[tauri::command]
+pub async fn existing_file_cmd(
+    state: State<'_, AppState>,
+    destination: Option<String>,
+    filename: String,
+    category: crate::db::models::FileCategory,
+) -> Result<Option<String>, String> {
+    Ok(state.existing_file(destination.as_deref(), &filename, category))
+}
+
+/// Gives an unfinished download a new link for the same file and resumes it.
+#[tauri::command]
+pub async fn refresh_link_cmd(state: State<'_, AppState>, id: String, url: String) -> Result<(), String> {
+    state.refresh_link(&id, &url).await
+}
+
+/// Tries the given proxy settings (not yet saved) against a public address.
+#[tauri::command]
+pub async fn test_proxy_cmd(
+    mode: String,
+    url: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<crate::engine::client::ProxyTest, String> {
+    Ok(crate::engine::client::test_proxy(&mode, url.as_deref(), username.as_deref().unwrap_or(""), password.as_deref().unwrap_or("")).await)
+}
+
+/// A download's activity log, oldest first.
+#[tauri::command]
+pub async fn get_download_log_cmd(state: State<'_, AppState>, id: String) -> Result<Vec<crate::db::models::LogEntry>, String> {
+    state.download_log(&id)
 }
 
 /// The computer's internet connections, for choosing which ones downloads use.

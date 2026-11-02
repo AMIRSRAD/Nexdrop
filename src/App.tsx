@@ -16,6 +16,9 @@ import { STATUS_FILTERS, categoryMeta, extractUrls, isMagnet, isTorrentUrl, look
 import { plural } from './utils/format';
 import { useToast } from './components/ui/Toast';
 import { Menu, type MenuItem } from './components/ui/Menu';
+import { QueueSidebar } from './components/shell/QueueSidebar';
+import { checkForUpdate, checkIsDue, installUpdate } from './hooks/useUpdater';
+import { RefreshLinkDialog } from './components/dialogs/RefreshLinkDialog';
 import { TitleBar } from './components/shell/TitleBar';
 import { FilterBar } from './components/shell/FilterBar';
 import { StatusBar } from './components/shell/StatusBar';
@@ -33,7 +36,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   default_destination: 'Downloads',
   max_active_downloads: 3,
   default_connections: 8,
-  max_connections_per_server: 8,
+  max_connections_per_server: 16,
   min_chunk_size: 1048576,
   global_speed_limit: 0,
   auto_resume_on_launch: true,
@@ -42,6 +45,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   clipboard_watch: false,
   auto_categorize: true,
   proxy_mode: 'system',
+  proxy_username: '',
+  proxy_password: '',
+  auto_update: true,
   custom_proxy_url: undefined,
   on_complete_action: 'notify',
   sound_enabled: true,
@@ -98,12 +104,28 @@ export default function App() {
   );
   const { queues, refresh: refreshQueues } = useQueues();
   const [browserSetupOpen, setBrowserSetupOpen] = useState(false);
+  const [refreshTask, setRefreshTask] = useState<DownloadTask | null>(null);
+  const existingUrls = useMemo(() => new Set(downloads.flatMap((d) => (d.final_url ? [d.url, d.final_url] : [d.url]))), [downloads]);
   const [queueFilter, setQueueFilter] = useState('all');
   // A deleted queue can't stay selected.
   useEffect(() => {
     if (queueFilter !== 'all' && queues.length > 0 && !queues.some((q) => q.id === queueFilter)) setQueueFilter('all');
-    if (queues.length < 2 && queueFilter !== 'all') setQueueFilter('all');
   }, [queues, queueFilter]);
+  const [queuePanel, setQueuePanel] = useState(() => {
+    try {
+      return localStorage.getItem('nexdrop.queuePanel') !== 'hidden';
+    } catch {
+      return true;
+    }
+  });
+  const showQueuePanel = (show: boolean) => {
+    setQueuePanel(show);
+    try {
+      localStorage.setItem('nexdrop.queuePanel', show ? 'shown' : 'hidden');
+    } catch {
+      /* private mode */
+    }
+  };
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -176,6 +198,25 @@ export default function App() {
     }
     return counts;
   }, [downloads, status]);
+
+  // Per-queue numbers for the queue panel.
+  const queueCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    const startable = new Set<string>();
+    for (const d of downloads) {
+      const q = d.queue_id ?? 'main';
+      counts[q] = (counts[q] ?? 0) + 1;
+      if (d.status === 'queued' || d.status === 'paused') startable.add(q);
+    }
+    return { counts, startable };
+  }, [downloads]);
+  const queueAction = useCallback(
+    (run: (id: string) => Promise<void>, id: string) =>
+      run(id)
+        .then(refreshQueues)
+        .catch((err) => toast.show({ tone: 'error', title: "Couldn't change the queue", description: errText(err) })),
+    [refreshQueues, toast],
+  );
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -293,6 +334,7 @@ export default function App() {
       },
       focus: (id) => setFocusedId(id),
       contextMenu: (task, x, y) => setMenu({ id: task.id, x, y }),
+      refreshLink: (task) => setRefreshTask(task),
     }),
     [actions, toast, refreshQueues],
   );
@@ -362,6 +404,25 @@ export default function App() {
     },
     [actions, toast],
   );
+
+  // New versions: a quiet check a little after start (at most twice a day); installing asks first.
+  useEffect(() => {
+    if (!settingsLoaded || !settings.auto_update || !isTauri() || !checkIsDue(12)) return;
+    const t = window.setTimeout(async () => {
+      const r = await checkForUpdate();
+      if (r.kind === 'available') {
+        toast.show({
+          id: 'update',
+          tone: 'info',
+          title: `Nexdrop ${r.version} is available`,
+          description: 'Nexdrop restarts to finish. Unfinished downloads keep their progress.',
+          duration: 60000,
+          action: { label: 'Update', onClick: () => installUpdate() },
+        });
+      }
+    }, 15000);
+    return () => window.clearTimeout(t);
+  }, [settingsLoaded, settings.auto_update, toast]);
 
   // The browser extension found a streaming video: let the user pick its quality.
   useEffect(() => {
@@ -610,7 +671,26 @@ export default function App() {
         settingsOpen={settingsView.open}
       />
 
-      <main className="relative flex min-h-0 flex-1 flex-col">
+      <main className="relative flex min-h-0 flex-1">
+        {queuePanel && queues.length > 0 && (
+          <QueueSidebar
+            queues={queues}
+            selected={queueFilter}
+            onSelect={(id) => {
+              setQueueFilter(id);
+              setSelection(new Set());
+            }}
+            counts={queueCounts.counts}
+            total={downloads.length}
+            startable={queueCounts.startable}
+            onStart={(id) => queueAction((q) => api.startQueue(q), id)}
+            onStop={(id) => queueAction((q) => api.stopQueue(q), id)}
+            onEdit={() => setSettingsView({ open: true, section: 'scheduler' })}
+            onNew={() => setSettingsView({ open: true, section: 'scheduler' })}
+            onCollapse={() => showQueuePanel(false)}
+          />
+        )}
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         {loaded && downloads.length === 0 ? (
           <EmptyState variant="empty" onAdd={() => openAdd()} onAddMultiple={() => openMultiple()} onClearFilters={() => {}} />
         ) : (
@@ -636,8 +716,8 @@ export default function App() {
               onBulkRemove={() => setRemoveIds([...selection])}
               bulkCan={bulkCan}
               queues={queues}
-              queue={queueFilter}
-              onQueue={setQueueFilter}
+              queuePanelHidden={!queuePanel}
+              onShowQueuePanel={() => showQueuePanel(true)}
               onBulkMove={(queueId) => {
                 handlers.moveToQueue([...selection], queueId);
                 setSelection(new Set());
@@ -669,6 +749,7 @@ export default function App() {
             )}
           </>
         )}
+        </div>
 
         <AnimatePresence>
           {settingsView.open && (
@@ -733,6 +814,7 @@ export default function App() {
         queues={queues}
         defaultQueue={queueFilter === 'all' ? undefined : queueFilter}
         initialRequest={addState.request}
+        existing={downloads}
       />
       <AddTorrentDialog
         open={torrentState.open}
@@ -752,6 +834,12 @@ export default function App() {
         settings={settings}
         onClose={() => setMultiState((s) => ({ ...s, open: false }))}
         onSubmit={addMany}
+        existingUrls={existingUrls}
+      />
+      <RefreshLinkDialog
+        task={refreshTask}
+        onClose={() => setRefreshTask(null)}
+        onDone={(t) => toast.show({ tone: 'success', title: 'Link refreshed', description: `${t.filename} continues with the new link.` })}
       />
       <RemoveDialog
         tasks={downloads.filter((d) => removeIds.includes(d.id))}

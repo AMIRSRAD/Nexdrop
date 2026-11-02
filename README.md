@@ -23,6 +23,16 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 - In the New download panel, pick the queue and press **Add to queue** to line a download up without
   starting it; it runs when that queue starts.
 
+**Safe and in view**
+- Queues are always on screen in a side panel: pick one to see its downloads, start or stop it in place.
+- Every big download is checked against the server before it is kept ("Verifying…"); parts a server
+  sent wrong are downloaded again. Each download has an Activity log and a "Copy diagnostics" button.
+- Updates are signed and offered inside the app (Settings → About).
+
+**Proxies**
+- System proxy, direct, or a custom HTTP / SOCKS5 proxy with username and password, plus a
+  "Test connection" button that shows the address websites will see.
+
 **Several internet connections**
 - Settings → Connections lists your active adapters (Ethernet, Wi-Fi, ...). Pick one, or several
   to share each download's connections across them; a dead adapter's connections move to the next.

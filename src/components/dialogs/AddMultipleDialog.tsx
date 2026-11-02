@@ -26,6 +26,8 @@ interface AddMultipleDialogProps {
   settings: AppSettings;
   onClose: () => void;
   onSubmit: (reqs: AddDownloadRequest[]) => Promise<void>;
+  /** Links already in the list: skipped unless the user asks to add them again. */
+  existingUrls?: Set<string>;
 }
 
 export const AddMultipleDialog: React.FC<AddMultipleDialogProps> = ({ open, onClose, ...rest }) => (
@@ -34,7 +36,8 @@ export const AddMultipleDialog: React.FC<AddMultipleDialogProps> = ({ open, onCl
   </Dialog>
 );
 
-const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initialTab, initialText, initialLinks, preselect, initialRequest, settings, onClose, onSubmit }) => {
+const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initialTab, initialText, initialLinks, preselect, initialRequest, settings, onClose, onSubmit, existingUrls }) => {
+  const [addDuplicates, setAddDuplicates] = useState(false);
   const [tab, setTab] = useState<AddMultipleTab>(initialTab);
   const [destination, setDestination] = useState(settings.default_destination);
   const [submitting, setSubmitting] = useState(false);
@@ -142,12 +145,15 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
     return (links ?? []).filter((l) => picked.has(l.url)).map((l) => ({ url: l.url, filename: l.filename, ...base }));
   }, [tab, pastedUrls, patternUrls, links, picked, destination, settings.default_connections, initialRequest]);
 
+  const duplicates = existingUrls ? requests.filter((r) => existingUrls.has(r.url)).length : 0;
+  const toAdd = addDuplicates || !existingUrls ? requests : requests.filter((r) => !existingUrls.has(r.url));
+
   const submit = async () => {
-    if (!requests.length || submitting) return;
+    if (!toAdd.length || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
-      await onSubmit(requests);
+      await onSubmit(toAdd);
       onClose();
     } catch (err) {
       setError(errText(err));
@@ -356,11 +362,21 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
             {error}
           </span>
         )}
+        {duplicates > 0 && !error && (
+          <button
+            type="button"
+            onClick={() => setAddDuplicates((v) => !v)}
+            className="shrink-0 text-[12px] text-warning hover:underline"
+            title={addDuplicates ? 'Skip links that are already in your list' : 'Add them again anyway'}
+          >
+            {addDuplicates ? `Adding ${duplicates} already in list` : `${duplicates} already in list, skipped`}
+          </button>
+        )}
         <Button variant="ghost" onClick={onClose}>
           Cancel
         </Button>
-        <Button variant="primary" onClick={submit} loading={submitting} disabled={requests.length === 0}>
-          {requests.length ? `Add ${plural(requests.length, 'download')}` : 'Add downloads'}
+        <Button variant="primary" onClick={submit} loading={submitting} disabled={toAdd.length === 0}>
+          {toAdd.length ? `Add ${plural(toAdd.length, 'download')}` : 'Add downloads'}
         </Button>
       </footer>
     </div>

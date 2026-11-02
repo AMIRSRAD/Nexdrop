@@ -338,6 +338,8 @@ impl TorrentEngine {
             task.peers = snap.peers;
 
             on_progress(DownloadProgressEvent {
+                phase: None,
+                notes: Vec::new(),
                 id: task.id.clone(),
                 downloaded_bytes: snap.downloaded as i64,
                 total_bytes: total as i64,
@@ -390,6 +392,8 @@ impl TorrentEngine {
         task.segments = file_segments(&task, &snap.file_progress);
 
         on_progress(DownloadProgressEvent {
+            phase: None,
+            notes: Vec::new(),
             id: task.id.clone(),
             downloaded_bytes: task.downloaded_bytes,
             total_bytes: task.total_bytes,

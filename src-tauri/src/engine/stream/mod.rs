@@ -735,6 +735,8 @@ impl DownloadEngine {
             let total = if fraction > 0.02 { (bytes as f64 / fraction) as u64 } else { total_hint.max(0) as u64 }.max(bytes);
             let eta = if speed > 0 { Some(total.saturating_sub(bytes) / speed) } else { None };
             on_progress(DownloadProgressEvent {
+                phase: None,
+                notes: Vec::new(),
                 id: task_id.clone(),
                 downloaded_bytes: bytes as i64,
                 total_bytes: total as i64,
@@ -797,6 +799,8 @@ impl DownloadEngine {
         task.total_bytes = size as i64;
         task.downloaded_bytes = size as i64;
         on_progress(DownloadProgressEvent {
+            phase: None,
+            notes: Vec::new(),
             id: task.id.clone(),
             downloaded_bytes: size as i64,
             total_bytes: size as i64,

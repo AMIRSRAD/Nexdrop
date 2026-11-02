@@ -1,5 +1,5 @@
 import React from 'react';
-import { CalendarClock, ChevronDown, Layers, ListOrdered, Pause, Play, RotateCw, Search, Trash, X } from 'lucide-react';
+import { ChevronDown, Layers, ListOrdered, PanelLeftOpen, Pause, Play, RotateCw, Search, Trash, X } from 'lucide-react';
 import { CATEGORIES, STATUS_FILTERS, categoryMeta, type StatusFilter } from '../../lib/meta';
 import type { FileCategory, QueueInfo } from '../../types/download';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
@@ -24,15 +24,14 @@ interface FilterBarProps {
   onBulkRemove: () => void;
   bulkCan: { pause: boolean; resume: boolean; retry: boolean };
   queues: QueueInfo[];
-  /** 'all' or a queue id. */
-  queue: string;
-  onQueue: (id: string) => void;
+  /** The queue panel is collapsed: offer a button to bring it back. */
+  queuePanelHidden: boolean;
+  onShowQueuePanel: () => void;
   onBulkMove: (queueId: string) => void;
 }
 
 export const FilterBar: React.FC<FilterBarProps> = (p) => {
   const typeMenu = useDropdown('end');
-  const queueMenu = useDropdown('end');
   const moveMenu = useDropdown('end');
   const multiQueue = p.queues.length > 1;
 
@@ -98,21 +97,19 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
     })),
   ];
 
-  const activeQueue = p.queue === 'all' ? null : p.queues.find((q) => q.id === p.queue);
-  const queueItems: MenuItem[] = [
-    { label: 'All queues', icon: Layers, onSelect: () => p.onQueue('all'), checked: p.queue === 'all' },
-    { separator: true },
-    ...p.queues.map<MenuItem>((q) => ({
-      label: q.name,
-      icon: q.schedule_enabled ? CalendarClock : ListOrdered,
-      onSelect: () => p.onQueue(q.id),
-      checked: p.queue === q.id,
-      hint: q.active + q.queued > 0 ? String(q.active + q.queued) : undefined,
-    })),
-  ];
-
   return (
     <div className="flex h-11 shrink-0 items-center gap-3 border-b border-line px-4">
+      {p.queuePanelHidden && (
+        <button
+          type="button"
+          onClick={p.onShowQueuePanel}
+          title="Show queues"
+          aria-label="Show queues"
+          className="-ml-1.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-fg-3 hover:bg-hover hover:text-fg"
+        >
+          <PanelLeftOpen size={15} />
+        </button>
+      )}
       <nav className="-mb-px flex h-full min-w-0 items-stretch gap-1 overflow-x-auto" role="tablist">
         {STATUS_FILTERS.map((f) => {
           const active = p.status === f.id;
@@ -148,23 +145,6 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
       </nav>
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
-        {multiQueue && (
-          <>
-            <button
-              type="button"
-              onClick={queueMenu.open}
-              className={cn(
-                'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12.5px] font-medium transition-colors',
-                activeQueue ? 'bg-accent-soft text-accent' : 'text-fg-2 hover:bg-hover hover:text-fg',
-              )}
-            >
-              <ListOrdered size={14} />
-              {activeQueue ? activeQueue.name : 'All queues'}
-              <ChevronDown size={13} className="opacity-70" />
-            </button>
-            <Menu position={queueMenu.position} onClose={queueMenu.close} items={queueItems} minWidth={190} />
-          </>
-        )}
         <button
           type="button"
           onClick={typeMenu.open}

@@ -64,6 +64,9 @@ struct Stats {
     max_open_conns: AtomicUsize,
     full_body_bytes: AtomicU64,
     mid_slice_requests: AtomicUsize,
+    /// Responses whose body is being sent right now, and the most at once.
+    sending: AtomicUsize,
+    max_sending: AtomicUsize,
     wrong_answers: AtomicUsize,
 }
 
@@ -259,6 +262,15 @@ async fn serve_conn(mut socket: TcpStream, st: Arc<ServerState>) -> std::io::Res
             .unwrap_or(false);
 
         let piece = 64 * 1024;
+        let now_sending = st.stats.sending.fetch_add(1, Ordering::SeqCst) + 1;
+        st.stats.max_sending.fetch_max(now_sending, Ordering::SeqCst);
+        struct Sending(Arc<Stats>);
+        impl Drop for Sending {
+            fn drop(&mut self) {
+                self.0.sending.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _sending = Sending(st.stats.clone());
         let mut sent = 0usize;
         let t0 = Instant::now();
         while sent < body.len() {
@@ -350,6 +362,10 @@ struct Outcome {
 
 /// Probes `url` the way the app does, then downloads it, then checks every byte.
 async fn run(lab: &Lab, data: &[u8], path: &str, connections: usize, limit: Duration) -> Outcome {
+    run_with(lab, data, path, connections, limit, DownloadEngine::new()).await
+}
+
+async fn run_with(lab: &Lab, data: &[u8], path: &str, connections: usize, limit: Duration, engine: DownloadEngine) -> Outcome {
     let url = format!("{}{path}", lab.base);
     let client = create_http_client(Duration::from_secs(15));
     let started = Instant::now();
@@ -362,7 +378,6 @@ async fn run(lab: &Lab, data: &[u8], path: &str, connections: usize, limit: Dura
     t.total_bytes = probe.total_bytes;
     let dir = t.destination_path.clone();
     let (_tx, rx) = watch::channel(false);
-    let engine = DownloadEngine::new();
     let res = tokio::time::timeout(limit, engine.run_download(t, rx, |_| {})).await;
     let secs = started.elapsed().as_secs_f64();
     let out = match res {
@@ -589,4 +604,40 @@ async fn lab_ranges_start_on_slice_boundaries() {
     let mid = lab.stats.mid_slice_requests.load(Ordering::SeqCst);
     report("aligned cuts on a clean link", mib, &o, &format!("requests {}, mid-slice {mid}", lab.stats.requests.load(Ordering::SeqCst)));
     assert!(o.ok, "{:?}", o.error);
+}
+
+/// "Connections per server" holds across downloads: two 8-connection downloads from one
+/// server with a limit of 6 never have more than 6 connections open to it at once, and both finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn lab_connections_per_server_are_shared() {
+    let mib = 48;
+    let (lab, data) = start_lab(mib * MIB, Behavior { per_conn_bps: Some(2 * MIB as u64), ..Default::default() }).await;
+    let engine = DownloadEngine::new().with_per_host_limit(6);
+    let probe_url = format!("{}/a.bin", lab.base);
+    let peak = Arc::new(AtomicUsize::new(0));
+    let watcher = {
+        let peak = peak.clone();
+        tokio::spawn(async move {
+            loop {
+                peak.fetch_max(nexdrop_lib::engine::downloader::connections_to(&probe_url), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let (a, b) = tokio::join!(
+        run_with(&lab, &data, "/a.bin", 8, Duration::from_secs(120), engine.clone()),
+        run_with(&lab, &data, "/b.bin", 8, Duration::from_secs(120), engine.clone()),
+    );
+    watcher.abort();
+    let most = peak.load(Ordering::SeqCst);
+    report(
+        "per-server limit 6, two 8-connection downloads",
+        mib * 2,
+        &Outcome { ok: a.ok && b.ok, secs: a.secs.max(b.secs), error: a.error.clone().or(b.error.clone()) },
+        &format!("most open at once {most} (server saw {})", lab.stats.max_sending.load(Ordering::SeqCst)),
+    );
+    assert!(a.ok && b.ok);
+    assert!(most <= 6, "{most} connections at once");
+    assert!(most >= 5, "the limit should be used, saw {most}");
 }

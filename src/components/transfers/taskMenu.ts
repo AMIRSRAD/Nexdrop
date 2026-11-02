@@ -1,4 +1,4 @@
-import { Copy, ExternalLink, FolderOpen, Info, Pause, Play, Radio, RotateCw, Square, Terminal, Trash } from 'lucide-react';
+import { Copy, ExternalLink, FolderOpen, Info, Link2, Pause, Play, Radio, RotateCw, Square, Terminal, Trash } from 'lucide-react';
 import type { DownloadTask, QueueInfo } from '../../types/download';
 import type { MenuItem } from '../ui/Menu';
 
@@ -18,6 +18,7 @@ export interface TaskHandlers {
   toggleSelect: (id: string, range?: boolean) => void;
   focus: (id: string) => void;
   contextMenu: (task: DownloadTask, x: number, y: number) => void;
+  refreshLink: (task: DownloadTask) => void;
 }
 
 export function canPause(t: DownloadTask) {
@@ -49,6 +50,7 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
     if (canResume(task))
       items.push({ label: task.status === 'scheduled' ? 'Start now' : 'Resume', icon: Play, shortcut: 'Space', onSelect: () => h.resume(task.id) });
     if (canRetry(task)) items.push({ label: 'Retry', icon: RotateCw, onSelect: () => h.retry(task.id) });
+    if ((task.kind ?? 'http') === 'http') items.push({ label: 'Refresh link…', icon: Link2, onSelect: () => h.refreshLink(task) });
     items.push({ label: 'Show in folder', icon: FolderOpen, onSelect: () => h.reveal(task.id) });
   }
   items.push(

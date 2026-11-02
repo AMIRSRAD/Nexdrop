@@ -67,6 +67,8 @@ pub fn run() {
             tray::show_main(app);
         }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![MINIMIZED_FLAG])))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -122,6 +124,10 @@ pub fn run() {
             probe_stream_cmd,
             get_browsers_cmd,
             get_network_adapters_cmd,
+            get_download_log_cmd,
+            test_proxy_cmd,
+            existing_file_cmd,
+            refresh_link_cmd,
             open_author_link_cmd,
             setup_browser_cmd,
             get_queues_cmd,

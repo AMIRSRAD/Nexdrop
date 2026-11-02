@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, ListPlus, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
-import type { AddDownloadRequest, AppSettings, BrowserRequest, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
+import type { AddDownloadRequest, AppSettings, BrowserRequest, DownloadTask, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
 import { formatBytes, formatDuration } from '../../utils/format';
 import { CHUNK_SIZES, PRIORITIES, USER_AGENTS, categoryMeta, isHttpUrl, looksLikeCurl } from '../../lib/meta';
 import { cn } from '../../lib/cn';
@@ -23,6 +23,8 @@ interface AddDownloadDialogProps {
   defaultQueue?: string;
   /** What the browser sent with the link: name, page, user agent and cookies. */
   initialRequest?: BrowserRequest;
+  /** Downloads already in the list (to warn about adding the same link twice). */
+  existing?: DownloadTask[];
 }
 
 const STREAM_URL_RE = /\.(m3u8?|mpd)(\?|#|$)/i;
@@ -34,7 +36,7 @@ type ProbeState =
   | { kind: 'ok'; result: UrlProbeResult }
   | { kind: 'error'; message: string };
 
-export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue, initialRequest }) => (
+export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, initialText, settings, onClose, onSubmit, queues, defaultQueue, initialRequest, existing }) => (
   <Dialog open={open} onClose={onClose} title="New download" width={560} bare>
     {open && (
       <AddDownloadForm
@@ -45,12 +47,13 @@ export const AddDownloadDialog: React.FC<AddDownloadDialogProps> = ({ open, init
         queues={queues}
         defaultQueue={defaultQueue}
         initialRequest={initialRequest}
+        existing={existing}
       />
     )}
   </Dialog>
 );
 
-const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue, initialRequest }) => {
+const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initialText, settings, onClose, onSubmit, queues = [], defaultQueue, initialRequest, existing = [] }) => {
   // A streaming-video link (HLS / DASH): shows a quality picker instead of file details.
   const [stream, setStream] = useState<StreamProbe | null>(null);
   const [variantId, setVariantId] = useState('');
@@ -187,6 +190,30 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
   };
 
   const result = probe.kind === 'ok' ? probe.result : null;
+
+  // The same link is already in the list?
+  const duplicate = url.trim() ? existing.find((d) => d.url === url.trim() || d.final_url === url.trim()) : undefined;
+
+  // A file with this name is already where it would be saved?
+  const [conflictPath, setConflictPath] = useState<string | null>(null);
+  const [onConflict, setOnConflict] = useState<'keep' | 'replace'>('keep');
+  useEffect(() => {
+    if (!result || stream || !filename.trim()) {
+      setConflictPath(null);
+      return;
+    }
+    let live = true;
+    const t = window.setTimeout(() => {
+      api
+        .existingFile(destination.trim() || undefined, filename.trim(), result.category)
+        .then((p) => live && setConflictPath(p))
+        .catch(() => live && setConflictPath(null));
+    }, 250);
+    return () => {
+      live = false;
+      window.clearTimeout(t);
+    };
+  }, [result, stream, filename, destination]);
   const resumable = result?.resumable ?? true;
   const validUrl = isHttpUrl(url);
   const canSubmit = validUrl && !submitting && (when === 'now' || !!scheduledAt) && !(stream && (stream.unsupported || !variantId));
@@ -219,6 +246,7 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         custom_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
         queue_id: queues.length > 0 ? queueId : undefined,
         hold: hold && when === 'now' ? true : undefined,
+        overwrite: conflictPath && onConflict === 'replace' ? true : undefined,
         stream_variant: stream ? variantId : undefined,
       });
       onClose();
@@ -256,6 +284,14 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
             }
           />
           {curlNote && <div className="mt-1.5 text-[12px] text-accent">{curlNote}</div>}
+          {duplicate && (
+            <div className="mt-1.5 flex items-center gap-1.5 text-[12px] text-warning">
+              <TriangleAlert size={12} className="shrink-0" />
+              <span className="truncate">
+                Already in your list: {duplicate.filename} ({duplicate.status === 'completed' ? 'finished' : duplicate.status})
+              </span>
+            </div>
+          )}
         </div>
 
         {/* File preview */}
@@ -348,6 +384,22 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
         <div>
           <Label>Save to</Label>
           <Input icon={Folder} mono value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Downloads" />
+          {conflictPath && (
+            <div className="mt-2 flex items-center gap-3">
+              <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[12px] text-warning" title={conflictPath}>
+                <TriangleAlert size={12} className="shrink-0" />
+                <span className="truncate">A file with this name is already there</span>
+              </span>
+              <Segmented
+                value={onConflict}
+                onChange={setOnConflict}
+                options={[
+                  { value: 'keep', label: 'Keep both' },
+                  { value: 'replace', label: 'Replace it' },
+                ]}
+              />
+            </div>
+          )}
         </div>
 
         {/* Queue */}

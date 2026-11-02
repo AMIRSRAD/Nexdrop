@@ -295,7 +295,7 @@ fn default_min_chunk() -> u64 {
 }
 
 /// Bumped when a default changes in a way existing installs should pick up once.
-pub const CURRENT_SETTINGS_VERSION: u32 = 2;
+pub const CURRENT_SETTINGS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -313,6 +313,11 @@ pub struct AppSettings {
     pub auto_categorize: bool,
     pub proxy_mode: String,
     pub custom_proxy_url: Option<String>,
+    /// Login for the custom proxy (the password is encrypted on disk).
+    pub proxy_username: String,
+    pub proxy_password: String,
+    /// Look for a new version on GitHub now and then (installing always asks first).
+    pub auto_update: bool,
     pub on_complete_action: String,
     pub sound_enabled: bool,
     // IDM-grade Scheduler Options
@@ -363,7 +368,7 @@ impl Default for AppSettings {
             default_destination,
             max_active_downloads: 3,
             default_connections: 8,
-            max_connections_per_server: 8,
+            max_connections_per_server: 16,
             min_chunk_size: 1024 * 1024, // 1 MB
             global_speed_limit: 0,
             auto_resume_on_launch: true,
@@ -373,6 +378,9 @@ impl Default for AppSettings {
             auto_categorize: true,
             proxy_mode: "system".to_string(),
             custom_proxy_url: None,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            auto_update: true,
             on_complete_action: "notify".to_string(),
             sound_enabled: true,
             scheduler_enabled: false,
@@ -436,6 +444,9 @@ pub struct AddDownloadRequest {
     pub queue_id: Option<String>,
     /// Add to the queue without starting: the download waits (paused) until its queue is started.
     pub hold: Option<bool>,
+    /// Replace a file of the same name when the download finishes (instead of keeping both).
+    #[serde(default)]
+    pub overwrite: Option<bool>,
     /// For HLS / DASH streams: the quality to download (an id from `probe_stream_cmd`); the best one if omitted.
     pub stream_variant: Option<String>,
 }
@@ -471,6 +482,19 @@ pub struct DownloadProgressEvent {
     pub eta_seconds: Option<u64>,
     pub status: DownloadStatus,
     pub segments: Vec<DownloadSegment>,
+    /// What a download that reached 100% is doing before it is kept ("verifying").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Things worth recording in the download's activity log (retries, repairs...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// One line of a download's activity log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub at: i64,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

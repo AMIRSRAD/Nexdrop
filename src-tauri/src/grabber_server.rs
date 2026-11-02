@@ -303,6 +303,7 @@ async fn handle_download(body: &str, app: &AppHandle, mgr: &Arc<DownloadManager>
         custom_proxy_url: None,
         queue_id: None,
         hold: None,
+        overwrite: None,
         stream_variant: None,
     };
 

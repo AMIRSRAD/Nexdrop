@@ -38,12 +38,12 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 ## 3. Proxy depth
 
-- [ ] SOCKS4 / SOCKS5 proxies
-- [ ] Proxy username and password
+- [x] SOCKS5 proxies (names resolved through the proxy)
+- [x] Proxy username and password (password encrypted on disk)
 - [ ] PAC script URL
 - [ ] Bypass list (`localhost; *.local; 192.168.*`)
 - [ ] Per-protocol proxy (HTTP, HTTPS)
-- [ ] Proxy test button ("Test connection")
+- [x] Proxy test button ("Test connection", shows the address websites see)
 
 ## 4. Browser integration
 
@@ -65,14 +65,14 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 ## 5. Failed and expired downloads
 
-- [ ] "Refresh link": paste a new link onto a failed or expired download and resume it
+- [x] "Refresh link": paste a new link onto a failed or expired download and resume it
 - [x] Automatic retry of failed downloads (see Queues)
 - [ ] Re-fetch an expired link from the page it came from (extension)
 
 ## 6. Download dialogs and prompts
 
-- [ ] "File already exists": overwrite, rename or skip
-- [ ] Duplicate link detection when adding
+- [x] "File already exists": keep both or replace
+- [x] Duplicate link detection when adding (single and multiple)
 - [ ] "Download complete" prompt: Open, Open folder (optional, off by default)
 - [ ] Live per-download details window with the segment map
 - [ ] Remember the last folder per file type
@@ -81,7 +81,7 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 ## 7. Per-site connection limits
 
-- [ ] Make "max connections per server" actually limit connections per host
+- [x] Make "max connections per server" actually limit connections per host (shared fairly between downloads)
 - [ ] Per-site overrides (connections, speed)
 
 ## 8. Sites and protocols

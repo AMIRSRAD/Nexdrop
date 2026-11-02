@@ -79,10 +79,60 @@ fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// The custom proxy's login, set from the settings (shared by every client built).
+static PROXY_AUTH: std::sync::LazyLock<parking_lot::RwLock<(String, String)>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new((String::new(), String::new())));
+/// Bumped whenever the login changes, so cached clients are rebuilt with it.
+static PROXY_AUTH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_proxy_auth(username: &str, password: &str) {
+    let mut auth = PROXY_AUTH.write();
+    if auth.0 != username || auth.1 != password {
+        *auth = (username.to_string(), password.to_string());
+        PROXY_AUTH_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A proxy address as typed (`127.0.0.1:1080`, `socks5://host:port`, `http://...`) turned
+/// into what the HTTP client needs. SOCKS5 resolves names through the proxy (`socks5h`),
+/// so blocked or poisoned DNS on this computer doesn't matter. The login is added unless
+/// the address already carries one.
+pub fn proxy_url_with_auth(raw: &str, username: &str, password: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let with_scheme = if lower.starts_with("socks5h://") || lower.starts_with("http://") || lower.starts_with("https://") {
+        trimmed.to_string()
+    } else if let Some(rest) = lower.strip_prefix("socks5://").or_else(|| lower.strip_prefix("socks://")) {
+        format!("socks5h://{}", &trimmed[trimmed.len() - rest.len()..])
+    } else {
+        format!("http://{trimmed}")
+    };
+    let mut url = url::Url::parse(&with_scheme).ok()?;
+    if url.username().is_empty() && !username.is_empty() {
+        let _ = url.set_username(username);
+        let _ = url.set_password(if password.is_empty() { None } else { Some(password) });
+    }
+    Some(url.to_string())
+}
+
 fn build_client(
     builder: reqwest::ClientBuilder,
     proxy_mode: Option<&str>,
     custom_proxy_url: Option<&str>,
+) -> reqwest::Client {
+    let (user, pass) = PROXY_AUTH.read().clone();
+    build_client_with_auth(builder, proxy_mode, custom_proxy_url, &user, &pass)
+}
+
+fn build_client_with_auth(
+    builder: reqwest::ClientBuilder,
+    proxy_mode: Option<&str>,
+    custom_proxy_url: Option<&str>,
+    user: &str,
+    pass: &str,
 ) -> reqwest::Client {
     let mut builder = builder.pool_max_idle_per_host(32).redirect(redirect_policy());
 
@@ -94,20 +144,12 @@ fn build_client(
             builder = builder.no_proxy();
         }
         "custom" => {
-            if let Some(custom_url) = custom_proxy_url {
-                let trimmed = custom_url.trim();
-                if !trimmed.is_empty() {
-                    let full_url = if trimmed.starts_with("http://")
-                        || trimmed.starts_with("https://")
-                        || trimmed.starts_with("socks5://")
-                    {
-                        trimmed.to_string()
-                    } else {
-                        format!("http://{}", trimmed)
-                    };
-                    if let Ok(proxy) = reqwest::Proxy::all(&full_url) {
-                        builder = builder.proxy(proxy);
-                    }
+            if let Some(raw) = custom_proxy_url.filter(|u| !u.trim().is_empty()) {
+                match proxy_url_with_auth(raw, user, pass).and_then(|u| reqwest::Proxy::all(&u).ok()) {
+                    Some(proxy) => builder = builder.proxy(proxy),
+                    // A proxy was asked for but its address is unusable: never fall back to a
+                    // direct connection, send everything to an address that refuses it.
+                    None => builder = builder.proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("static proxy URL")),
                 }
             }
         }
@@ -123,16 +165,20 @@ fn build_client(
                         if let Ok(proxy_server) = hkcu.get_value::<String, _>("ProxyServer") {
                             let server_clean = proxy_server.trim();
                             if !server_clean.is_empty() {
+                                // "host:port", or per protocol: "http=host:port;socks=host:port"
                                 let proxy_target = if let Some(http_part) =
                                     server_clean.split(';').find(|s| s.starts_with("http="))
                                 {
                                     http_part.trim_start_matches("http=").to_string()
+                                } else if let Some(socks) = server_clean.split(';').find(|s| s.starts_with("socks=")) {
+                                    format!("socks5h://{}", socks.trim_start_matches("socks="))
                                 } else {
                                     server_clean.to_string()
                                 };
 
                                 let proxy_url = if proxy_target.starts_with("http://")
                                     || proxy_target.starts_with("socks5://")
+                                    || proxy_target.starts_with("socks5h://")
                                 {
                                     proxy_target
                                 } else {
@@ -160,6 +206,7 @@ const SYSTEM_PROXY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct PoolKey {
+    auth_gen: u64,
     bulk: bool,
     local: Option<IpAddr>,
     mode: String,
@@ -199,6 +246,7 @@ impl ClientPool {
     fn get(&self, bulk: bool, proxy_mode: Option<&str>, custom_proxy_url: Option<&str>, local: Option<IpAddr>) -> reqwest::Client {
         let mode = proxy_mode.unwrap_or("system");
         let key = PoolKey {
+            auth_gen: PROXY_AUTH_GEN.load(std::sync::atomic::Ordering::Relaxed),
             bulk,
             local,
             mode: mode.to_string(),
@@ -221,9 +269,148 @@ impl ClientPool {
     }
 }
 
+/// Result of trying the proxy settings against a public address.
+#[derive(serde::Serialize)]
+pub struct ProxyTest {
+    pub ok: bool,
+    pub millis: u64,
+    /// The address websites see (when the test page tells us).
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Fetches a tiny page through the given proxy settings and reports what happened.
+pub async fn test_proxy(mode: &str, url: Option<&str>, username: &str, password: &str) -> ProxyTest {
+    let client = build_client_with_auth(
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(15)),
+        Some(mode),
+        url,
+        username,
+        password,
+    );
+    let started = Instant::now();
+    match client.get("https://cloudflare.com/cdn-cgi/trace").send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            let field = |k: &str| body.lines().find_map(|l| l.strip_prefix(&format!("{k}=")).map(str::to_string));
+            ProxyTest { ok: true, millis: started.elapsed().as_millis() as u64, exit_ip: field("ip"), country: field("loc"), error: None }
+        }
+        Ok(resp) => ProxyTest {
+            ok: false,
+            millis: started.elapsed().as_millis() as u64,
+            exit_ip: None,
+            country: None,
+            error: Some(if resp.status().as_u16() == 407 { "The proxy wants a different username or password".to_string() } else { format!("HTTP {}", resp.status()) }),
+        },
+        Err(e) => {
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(inner) = src {
+                msg = inner.to_string();
+                src = inner.source();
+            }
+            ProxyTest { ok: false, millis: started.elapsed().as_millis() as u64, exit_ip: None, country: None, error: Some(msg) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal SOCKS5 server that insists on a username and password, in front of a web server.
+    #[tokio::test]
+    async fn downloads_go_through_a_socks5_proxy_with_a_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        let web = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let web_port = web.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = web.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    let _ = s.read(&mut b).await;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nviasock").await;
+                });
+            }
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut h = [0u8; 2];
+                    c.read_exact(&mut h).await?;
+                    let mut methods = vec![0u8; h[1] as usize];
+                    c.read_exact(&mut methods).await?;
+                    if !methods.contains(&2) {
+                        c.write_all(&[5, 0xff]).await?;
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    c.write_all(&[5, 2]).await?;
+                    let mut v = [0u8; 2];
+                    c.read_exact(&mut v).await?;
+                    let mut user = vec![0u8; v[1] as usize];
+                    c.read_exact(&mut user).await?;
+                    let mut pl = [0u8; 1];
+                    c.read_exact(&mut pl).await?;
+                    let mut pass = vec![0u8; pl[0] as usize];
+                    c.read_exact(&mut pass).await?;
+                    let ok = user == b"alice" && pass == b"p@ss";
+                    c.write_all(&[1, if ok { 0 } else { 1 }]).await?;
+                    if !ok {
+                        return Ok(());
+                    }
+                    let mut req = [0u8; 4];
+                    c.read_exact(&mut req).await?;
+                    let port_of = |b: [u8; 2]| u16::from_be_bytes(b);
+                    let host = match req[3] {
+                        3 => {
+                            let mut l = [0u8; 1];
+                            c.read_exact(&mut l).await?;
+                            let mut name = vec![0u8; l[0] as usize];
+                            c.read_exact(&mut name).await?;
+                            String::from_utf8_lossy(&name).to_string()
+                        }
+                        _ => {
+                            let mut ip = [0u8; 4];
+                            c.read_exact(&mut ip).await?;
+                            std::net::Ipv4Addr::from(ip).to_string()
+                        }
+                    };
+                    let mut pb = [0u8; 2];
+                    c.read_exact(&mut pb).await?;
+                    let mut upstream = TcpStream::connect((host.as_str(), port_of(pb))).await?;
+                    c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                    tokio::io::copy_bidirectional(&mut c, &mut upstream).await?;
+                    Ok(())
+                });
+            }
+        });
+        let proxy_url = format!("socks5://127.0.0.1:{proxy_port}");
+        let target = format!("http://localhost:{web_port}/");
+
+        let good = build_client_with_auth(reqwest::Client::builder(), Some("custom"), Some(&proxy_url), "alice", "p@ss");
+        assert_eq!(good.get(&target).send().await.unwrap().text().await.unwrap(), "viasock");
+
+        let wrong = build_client_with_auth(reqwest::Client::builder(), Some("custom"), Some(&proxy_url), "alice", "nope");
+        assert!(wrong.get(&target).send().await.is_err(), "a wrong login must not get through");
+
+        // A broken proxy address must never fall back to a direct connection.
+        let broken = build_client_with_auth(reqwest::Client::builder(), Some("custom"), Some("socks5://[::bad"), "", "");
+        assert!(broken.get(&target).send().await.is_err());
+    }
+
+    #[test]
+    fn proxy_addresses_are_normalised_and_get_the_login() {
+        assert_eq!(proxy_url_with_auth("127.0.0.1:10808", "", "").unwrap(), "http://127.0.0.1:10808/");
+        assert_eq!(proxy_url_with_auth("socks5://127.0.0.1:1080", "", "").unwrap(), "socks5h://127.0.0.1:1080");
+        assert_eq!(proxy_url_with_auth("SOCKS://10.0.0.1:1080", "", "").unwrap(), "socks5h://10.0.0.1:1080");
+        assert_eq!(proxy_url_with_auth("socks5://127.0.0.1:1080", "me", "p@ss:word").unwrap(), "socks5h://me:p%40ss%3Aword@127.0.0.1:1080");
+        assert_eq!(proxy_url_with_auth("http://u:x@h:8080", "me", "y").unwrap(), "http://u:x@h:8080/", "a login in the address wins");
+        assert!(proxy_url_with_auth("   ", "me", "y").is_none());
+    }
 
     #[tokio::test]
     async fn a_client_bound_to_an_address_connects_from_it() {

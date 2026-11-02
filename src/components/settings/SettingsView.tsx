@@ -34,6 +34,7 @@ import { Button, IconButton } from '../ui/Button';
 import { Input, Label, NumberInput, Segmented, Select, Switch } from '../ui/Field';
 import { useToast } from '../ui/Toast';
 import { errText } from '../../hooks/useDownloads';
+import { checkForUpdate, installUpdate, useUpdateState } from '../../hooks/useUpdater';
 import { whenText } from '../../hooks/useQueues';
 
 export type SettingsSection =
@@ -139,7 +140,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onChange, 
           {section === 'security' && <Security s={settings} set={onChange} />}
           {section === 'torrents' && <Torrents s={settings} set={onChange} />}
           {section === 'logins' && <Logins />}
-          {section === 'about' && <About />}
+          {section === 'about' && <About s={settings} set={onChange} />}
           {section === 'integrations' && <Integrations s={settings} set={onChange} browsers={browsers} onSetup={onSetupBrowsers} />}
         </div>
       </div>
@@ -345,7 +346,7 @@ const Connections: React.FC<SectionProps> = ({ s, set }) => (
       </SettingRow>
       <SettingRow title="Connections per server" description="Cap to avoid being rate-limited by a host.">
         <Select
-          value={s.max_connections_per_server || 8}
+          value={s.max_connections_per_server || 16}
           onValueChange={(v) => set({ max_connections_per_server: parseInt(v, 10) })}
           options={[1, 2, 4, 8, 12, 16, 24, 32].map((n) => ({ value: n, label: String(n) }))}
           className="w-24"
@@ -367,35 +368,83 @@ const Proxy: React.FC<SectionProps> = ({ s, set }) => {
   const options: { value: AppSettings['proxy_mode']; title: string; description: string }[] = [
     { value: 'system', title: 'Use system proxy', description: 'Follows Windows proxy and VPN settings. Recommended.' },
     { value: 'direct', title: 'Connect directly', description: 'Ignore all proxies.' },
-    { value: 'custom', title: 'Custom proxy', description: 'Route downloads through a specific HTTP or SOCKS5 proxy.' },
+    { value: 'custom', title: 'Custom proxy', description: 'An HTTP or SOCKS5 proxy (v2ray, Clash, Shadowsocks clients and others).' },
   ];
+  const [test, setTest] = useState<{ busy: boolean; ok?: boolean; text?: string }>({ busy: false });
+  const runTest = async () => {
+    setTest({ busy: true });
+    try {
+      const r = await api.testProxy(s.proxy_mode, s.custom_proxy_url ?? undefined, s.proxy_username, s.proxy_password);
+      setTest({
+        busy: false,
+        ok: r.ok,
+        text: r.ok
+          ? `Connected in ${r.millis} ms${r.exit_ip ? ` · websites see ${r.exit_ip}${r.country ? ` (${r.country})` : ''}` : ''}`
+          : r.error || "Couldn't connect",
+      });
+    } catch (err) {
+      setTest({ busy: false, ok: false, text: errText(err) });
+    }
+  };
   return (
-    <Group>
-      {options.map((o) => (
-        <label key={o.value} className="flex cursor-default items-start gap-3 px-4 py-3.5 hover:bg-hover">
-          <input
-            type="radio"
-            name="proxy_mode"
-            checked={s.proxy_mode === o.value}
-            onChange={() => set({ proxy_mode: o.value })}
-            className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
-          />
-          <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-medium text-fg">{o.title}</div>
-            <div className="mt-0.5 text-[12.5px] text-fg-3">{o.description}</div>
-            {o.value === 'custom' && s.proxy_mode === 'custom' && (
-              <Input
-                mono
-                className="mt-2.5"
-                value={s.custom_proxy_url ?? ''}
-                onChange={(e) => set({ custom_proxy_url: e.target.value })}
-                placeholder="http://127.0.0.1:10808 or socks5://127.0.0.1:1080"
-              />
-            )}
-          </div>
-        </label>
-      ))}
-    </Group>
+    <>
+      <Group>
+        {options.map((o) => (
+          <label key={o.value} className="flex cursor-default items-start gap-3 px-4 py-3.5 hover:bg-hover">
+            <input
+              type="radio"
+              name="proxy_mode"
+              checked={s.proxy_mode === o.value}
+              onChange={() => {
+                set({ proxy_mode: o.value });
+                setTest({ busy: false });
+              }}
+              className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium text-fg">{o.title}</div>
+              <div className="mt-0.5 text-[12.5px] text-fg-3">{o.description}</div>
+              {o.value === 'custom' && s.proxy_mode === 'custom' && (
+                <div className="mt-2.5 space-y-2" onClick={(e) => e.preventDefault()}>
+                  <Input
+                    mono
+                    value={s.custom_proxy_url ?? ''}
+                    onChange={(e) => set({ custom_proxy_url: e.target.value })}
+                    placeholder="socks5://127.0.0.1:10808 or http://127.0.0.1:10809"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input value={s.proxy_username} onChange={(e) => set({ proxy_username: e.target.value })} placeholder="Username (optional)" autoComplete="off" />
+                    <Input
+                      type="password"
+                      value={s.proxy_password}
+                      onChange={(e) => set({ proxy_password: e.target.value })}
+                      placeholder="Password (optional)"
+                      autoComplete="new-password"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </label>
+        ))}
+      </Group>
+      <Group>
+        <SettingRow
+          title="Test connection"
+          description={
+            test.text ? (
+              <span className={test.ok ? 'text-success' : 'text-danger'}>{test.text}</span>
+            ) : (
+              'Opens a small page through these settings and shows the address websites will see.'
+            )
+          }
+        >
+          <Button size="sm" variant="secondary" loading={test.busy} onClick={runTest}>
+            Test
+          </Button>
+        </SettingRow>
+      </Group>
+    </>
   );
 };
 
@@ -895,8 +944,21 @@ const Logins: React.FC = () => {
 const AUTHOR_SITE = 'https://amirsrad.ir';
 const AUTHOR_GITHUB = 'https://github.com/amirsrad';
 
-const About: React.FC = () => {
+const About: React.FC<SectionProps> = ({ s, set }) => {
   const [version, setVersion] = useState('');
+  const update = useUpdateState();
+  const updateText =
+    update.kind === 'checking'
+      ? 'Checking…'
+      : update.kind === 'none'
+        ? 'You have the latest version.'
+        : update.kind === 'available'
+          ? `Version ${update.version} is available.`
+          : update.kind === 'installing'
+            ? `Installing ${update.version}${update.percent != null ? ` · ${update.percent}%` : '…'}`
+            : update.kind === 'error'
+              ? `Couldn't check: ${update.message}`
+              : 'Updates are signed, and installing always asks first.';
   useEffect(() => {
     api.getAppInfo().then((i) => setVersion(i.version)).catch(() => {});
   }, []);
@@ -910,6 +972,26 @@ const About: React.FC = () => {
           A fast, safe download manager with queues, streaming video, torrents and browser integration.
         </p>
       </div>
+
+      <Group title="Updates">
+        <SettingRow
+          title="Check for updates"
+          description={<span className={update.kind === 'available' ? 'text-accent' : update.kind === 'error' ? 'text-danger' : undefined}>{updateText}</span>}
+        >
+          {update.kind === 'available' || update.kind === 'installing' ? (
+            <Button size="sm" variant="primary" loading={update.kind === 'installing'} onClick={() => installUpdate()}>
+              Update and restart
+            </Button>
+          ) : (
+            <Button size="sm" variant="secondary" loading={update.kind === 'checking'} onClick={() => checkForUpdate()}>
+              Check now
+            </Button>
+          )}
+        </SettingRow>
+        <SettingRow title="Check automatically" description="Looks for a new version now and then.">
+          <Switch checked={s.auto_update} onChange={(v) => set({ auto_update: v })} label="Check for updates automatically" />
+        </SettingRow>
+      </Group>
 
       <Group title="Made by">
         <SettingRow title="Website" description="amirsrad.ir">
