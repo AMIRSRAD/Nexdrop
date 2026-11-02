@@ -108,6 +108,22 @@ export function useDownloads(onOpenNewDownload: () => void, onOpenTorrent: (sour
         refresh();
       }),
     ];
+    if (isTauri()) {
+      unlisteners.push(
+        listen<{ added: number; failed: { url: string; error: string }[] }>('batch-add-finished', (e) => {
+          const { added, failed } = e.payload;
+          if (failed.length === 0) {
+            toast.show({ tone: 'success', title: `Added ${added} ${added === 1 ? 'download' : 'downloads'}` });
+          } else {
+            toast.show({
+              tone: 'error',
+              title: `${failed.length} ${failed.length === 1 ? 'link' : 'links'} couldn't be added`,
+              description: `${failed[0].error}${failed.length > 1 ? ` (and ${failed.length - 1} more)` : ''}: ${failed[0].url}`,
+            });
+          }
+        }),
+      );
+    }
 
     if (isTauri()) {
       unlisteners.push(

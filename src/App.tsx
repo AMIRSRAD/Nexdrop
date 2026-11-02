@@ -354,8 +354,10 @@ export default function App() {
 
   const addMany = useCallback(
     async (reqs: AddDownloadRequest[]) => {
-      const created = await actions.addMany(reqs);
-      toast.show({ tone: 'success', title: `Added ${plural(created.length, 'download')}` });
+      await actions.addMany(reqs);
+      // The links are checked in the background; each one appears in the list as it is ready.
+      if (!isTauri()) toast.show({ tone: 'success', title: `Added ${plural(reqs.length, 'download')}` });
+      else toast.show({ tone: 'info', title: `Adding ${plural(reqs.length, 'download')}…` });
       setStatus('all');
     },
     [actions, toast],

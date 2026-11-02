@@ -50,9 +50,10 @@ struct Behavior {
     redirect: bool,
     /// A signed link works for this many requests, then returns 403 (expired).
     sig_uses: Option<usize>,
-    /// Per-mille chance that a long range answer starts `shift_bytes` too late (a lying server).
-    shift_permille: u64,
-    shift_bytes: usize,
+    /// Like some CDNs that store files in 4 MiB slices: a range that starts inside a slice
+    /// gets (with this per-mille chance) the data from the *next* slice boundary instead,
+    /// under a header that claims the requested start, and the answer ends short.
+    slice_bug_permille: u64,
 }
 
 #[derive(Default)]
@@ -62,6 +63,8 @@ struct Stats {
     open_conns: AtomicUsize,
     max_open_conns: AtomicUsize,
     full_body_bytes: AtomicU64,
+    mid_slice_requests: AtomicUsize,
+    wrong_answers: AtomicUsize,
 }
 
 struct Lab {
@@ -233,9 +236,15 @@ async fn serve_conn(mut socket: TcpStream, st: Arc<ServerState>) -> std::io::Res
         socket.write_all(head.as_bytes()).await?;
 
         let mut body = &st.payload[start..=end];
-        if st.b.shift_permille > 0 && body.len() > MIB && st.roll() < st.b.shift_permille {
-            let s2 = (start + st.b.shift_bytes).min(total - body.len());
-            body = &st.payload[s2..s2 + body.len()];
+        let slice = 4 * MIB;
+        if range.is_some() && start % slice != 0 {
+            st.stats.mid_slice_requests.fetch_add(1, Ordering::SeqCst);
+            if std::env::var("LAB_TRACE").is_ok() { eprintln!("mid-slice {start}-{end} ({} KiB)", (end - start + 1) / 1024); }
+            let next = (start / slice + 1) * slice;
+            if st.b.slice_bug_permille > 0 && next <= end && st.roll() < st.b.slice_bug_permille {
+                st.stats.wrong_answers.fetch_add(1, Ordering::SeqCst);
+                body = &st.payload[next..=end];
+            }
         }
         let cut_at = if st.roll() < st.b.drop_permille { Some(body.len() * st.roll() as usize / 1000) } else { None };
         let stall_here = st
@@ -537,18 +546,42 @@ async fn lab_stress_steals_and_cuts() {
     assert!(o.ok);
 }
 
-/// A server that sometimes answers long ranges with the wrong bytes: the finished file is
-/// spot-checked against the server, the damaged parts are fetched again, and the result is exact.
+/// A CDN that mangles every range starting inside one of its 4 MiB slices (the bug that
+/// corrupted real downloads), on a flaky link so retries resume mid-slice. Ranges are cut on
+/// slice boundaries, the finished file is checked against the server, wrong responses are
+/// fetched again from slice boundaries, and the result is exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn lab_lying_server_is_repaired() {
-    let mib = 96;
+async fn lab_slice_cdn_is_never_corrupt() {
+    let mib = 150;
     let (lab, data) = start_lab(
-        mib * MIB,
-        Behavior { per_conn_bps: Some(8 * MIB as u64), shift_permille: 150, shift_bytes: 1_300_000, ..Default::default() },
+        mib * MIB + 12_345,
+        Behavior { per_conn_bps: Some(6 * MIB as u64), slice_bug_permille: 1000, drop_permille: 400, ..Default::default() },
     )
     .await;
-    let o = run(&lab, &data, "/f.bin", 8, Duration::from_secs(240)).await;
-    report("lying server: 15% of long ranges shifted", mib, &o, &format!("requests {}", lab.stats.requests.load(Ordering::SeqCst)));
+    let o = run(&lab, &data, "/f.bin", 8, Duration::from_secs(300)).await;
+    report(
+        "slice CDN: every mid-slice range is wrong, 40% cut",
+        mib,
+        &o,
+        &format!(
+            "requests {}, mid-slice {}, wrong answers {}",
+            lab.stats.requests.load(Ordering::SeqCst),
+            lab.stats.mid_slice_requests.load(Ordering::SeqCst),
+            lab.stats.wrong_answers.load(Ordering::SeqCst)
+        ),
+    );
+    assert!(o.ok, "{:?}", o.error);
+}
+
+/// Without any failures, cutting on slice boundaries means (almost) no request starts mid-slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn lab_ranges_start_on_slice_boundaries() {
+    let mib = 200;
+    let (lab, data) = start_lab(mib * MIB + 777, Behavior { per_conn_bps: Some(8 * MIB as u64), ..Default::default() }).await;
+    let o = run(&lab, &data, "/f.bin", 16, Duration::from_secs(120)).await;
+    let mid = lab.stats.mid_slice_requests.load(Ordering::SeqCst);
+    report("aligned cuts on a clean link", mib, &o, &format!("requests {}, mid-slice {mid}", lab.stats.requests.load(Ordering::SeqCst)));
     assert!(o.ok, "{:?}", o.error);
 }

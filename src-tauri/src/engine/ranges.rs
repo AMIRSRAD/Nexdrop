@@ -119,6 +119,27 @@ impl DoneMap {
     }
 }
 
+/// Many CDNs store and serve files in fixed slices (4 MiB is the common size). Some
+/// of them answer a range that starts *inside* a slice with the data of the *next*
+/// slice while claiming to start where asked, which silently shifts everything that
+/// follows. Range requests that start on a slice boundary avoid that path.
+pub const SLICE_ALIGN: u64 = 4 * 1024 * 1024;
+
+/// Moves `cut` (between `lo` and `hi`) onto a slice boundary when that still leaves
+/// at least `min` bytes on each side; otherwise keeps it (small files are left alone).
+pub fn aligned_cut(cut: u64, lo: u64, hi: u64, min: u64) -> u64 {
+    let fits = |c: u64| c >= lo.saturating_add(min) && hi.saturating_sub(c) >= min && c > lo && c < hi;
+    let down = cut - cut % SLICE_ALIGN;
+    if fits(down) {
+        return down;
+    }
+    let up = down + SLICE_ALIGN;
+    if fits(up) {
+        return up;
+    }
+    cut
+}
+
 /// Cuts the missing `gaps` into about `parts` pieces (never smaller than
 /// `min_piece`), so each connection starts with a sizeable range of its own.
 pub fn split_gaps(gaps: &[Range], parts: usize, min_piece: u64) -> Vec<Range> {
@@ -132,6 +153,9 @@ pub fn split_gaps(gaps: &[Range], parts: usize, min_piece: u64) -> Vec<Range> {
         let mut cur = s;
         while cur < e {
             let mut next = (cur + piece).min(e);
+            if next < e {
+                next = aligned_cut(next, cur, e, min_piece.min(piece));
+            }
             // Don't leave a sliver at the end of a gap.
             if e - next < piece / 2 {
                 next = e;
@@ -148,7 +172,7 @@ pub fn split_gaps(gaps: &[Range], parts: usize, min_piece: u64) -> Vec<Range> {
 pub fn steal_point(pos: u64, end: u64, min_steal: u64) -> Option<u64> {
     let remaining = end.saturating_sub(pos);
     if remaining >= min_steal.saturating_mul(2) {
-        Some(pos + remaining / 2)
+        Some(aligned_cut(pos + remaining / 2, pos, end, min_steal))
     } else {
         None
     }
@@ -248,6 +272,21 @@ mod tests {
         // 32 parts were requested, but no piece (except the tail) may be below the minimum.
         assert_eq!(pieces.len(), 3, "{pieces:?}");
         assert!(pieces[..pieces.len() - 1].iter().all(|(s, e)| e - s >= 4_000), "{pieces:?}");
+    }
+
+    #[test]
+    fn big_cuts_land_on_slice_boundaries() {
+        const MIB: u64 = 1024 * 1024;
+        // Half of 693.9..1000 MiB is mid-slice: the cut moves to a 4 MiB boundary.
+        let cut = steal_point(727_596_718, 1000 * MIB, 256 * 1024).unwrap();
+        assert_eq!(cut % (4 * MIB), 0, "{cut}");
+        assert!(cut > 727_596_718 && cut < 1000 * MIB);
+        // Initial pieces of a file whose size isn't a round number still start on boundaries.
+        for (s, _) in split_gaps(&[(0, 2_147_483_000)], 8, MIB) {
+            assert_eq!(s % (4 * MIB), 0, "{s}");
+        }
+        // Too small to move without starving one side: left alone.
+        assert_eq!(aligned_cut(1_500_000, 1_000_000, 2_000_000, 400_000), 1_500_000);
     }
 
     #[test]

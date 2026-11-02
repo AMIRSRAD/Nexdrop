@@ -267,9 +267,47 @@ impl DownloadManager {
     }
 
     pub async fn add_download(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
+        self.add_download_at(req, None).await
+    }
+
+    /// Adds many links without making the user wait: the work happens in the background,
+    /// several links are checked at once, each one shows up in the list as soon as it is
+    /// ready (in the order given), and one summary event reports what could not be added.
+    pub fn add_many(self: &Arc<Self>, reqs: Vec<AddDownloadRequest>) {
+        use futures_util::StreamExt;
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let n = reqs.len() as i64;
+            let base = chrono::Utc::now().timestamp();
+            let results: Vec<(String, Result<(), String>)> = futures_util::stream::iter(reqs.into_iter().enumerate())
+                .map(|(i, req)| {
+                    let manager = manager.clone();
+                    async move {
+                        let url = req.url.clone();
+                        // Earlier links count as added earlier, whatever order the checks finish in.
+                        let r = manager.add_download_at(req, Some(base - (n - i as i64))).await.map(|_| ());
+                        let _ = manager.app_handle.emit("download-status-changed", serde_json::json!({}));
+                        (url, r)
+                    }
+                })
+                .buffer_unordered(6)
+                .collect()
+                .await;
+            let failed: Vec<serde_json::Value> = results
+                .iter()
+                .filter_map(|(url, r)| r.as_ref().err().map(|e| serde_json::json!({ "url": url, "error": e })))
+                .collect();
+            let _ = manager.app_handle.emit(
+                "batch-add-finished",
+                serde_json::json!({ "added": results.len() - failed.len(), "failed": failed }),
+            );
+        });
+    }
+
+    async fn add_download_at(self: &Arc<Self>, req: AddDownloadRequest, created_at: Option<i64>) -> Result<DownloadTask, String> {
         // HLS / DASH links are downloaded segment by segment, not as one file.
         if req.stream_variant.is_some() || stream::is_stream_url(&req.url) {
-            return self.add_stream(req).await;
+            return self.add_stream(req, created_at).await;
         }
         let settings = self.get_settings();
 
@@ -302,7 +340,7 @@ impl DownloadManager {
             .await?;
         // A link without a telltale extension can still turn out to be a playlist.
         if probe.mime_type.as_deref().map(stream::is_stream_mime).unwrap_or(false) {
-            return self.add_stream(req).await;
+            return self.add_stream(req, created_at).await;
         }
 
         let filename = req
@@ -339,7 +377,7 @@ impl DownloadManager {
             calculate_segments(probe.total_bytes, 1)
         };
 
-        let now = chrono::Utc::now().timestamp();
+        let now = created_at.unwrap_or_else(|| chrono::Utc::now().timestamp());
         let id = Uuid::new_v4().to_string();
 
         let task = DownloadTask {
@@ -425,7 +463,7 @@ impl DownloadManager {
 
     /// Adds an HLS / DASH stream: reads its playlist now (so problems show up
     /// at once), then queues it like any other download.
-    async fn add_stream(self: &Arc<Self>, req: AddDownloadRequest) -> Result<DownloadTask, String> {
+    async fn add_stream(self: &Arc<Self>, req: AddDownloadRequest, created_at: Option<i64>) -> Result<DownloadTask, String> {
         let settings = self.get_settings();
         let url = req.url.trim().to_string();
         let parsed = url::Url::parse(&url).map_err(|e| format!("Invalid link: {e}"))?;
@@ -467,7 +505,7 @@ impl DownloadManager {
         }
         let _ = std::fs::create_dir_all(&dest_dir);
 
-        let now = chrono::Utc::now().timestamp();
+        let now = created_at.unwrap_or_else(|| chrono::Utc::now().timestamp());
         let id = Uuid::new_v4().to_string();
         // The chosen quality travels in `etag` (unused by streams otherwise): when the
         // download starts again later, the playlist is read afresh and this picks the same quality.

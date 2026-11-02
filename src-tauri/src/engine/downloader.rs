@@ -45,7 +45,7 @@ use crate::engine::client::ClientPool;
 use crate::engine::auth::build_header_list;
 use crate::engine::fileio::{free_space, open_preallocated, read_exact_at, write_all_at};
 use crate::engine::probe::reserve_unique_path;
-use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range};
+use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range, SLICE_ALIGN};
 use crate::engine::speed::{RateLimiter, SpeedCalculator};
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Nexdrop/1.0";
@@ -79,13 +79,32 @@ const NETWORK_RETRY_CAP: Duration = Duration::from_secs(8);
 const SINGLE_STREAM_ATTEMPTS: u32 = 5;
 /// Finished files at least this big are spot-checked against the server before they are kept.
 const VERIFY_MIN_BYTES: u64 = 16 * 1024 * 1024;
-/// Gap between spot-check samples (bigger for huge files, to bound the number of requests).
-const VERIFY_STEP: u64 = 3 * 1024 * 1024;
 const VERIFY_MAX_SAMPLES: u64 = 700;
 const VERIFY_SAMPLE_BYTES: usize = 16 * 1024;
 const VERIFY_PARALLEL: usize = 8;
 /// How many times damaged parts are fetched again before giving up.
 const MAX_REPAIRS: u32 = 3;
+
+/// Hosts caught answering mid-slice ranges with the wrong bytes. Requests to them always
+/// start on a slice boundary (the few bytes before the wanted position are thrown away).
+static SLICE_STRICT_HOSTS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn host_key(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    Some(format!("{}:{}", u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+}
+
+fn slice_strict(url: &str) -> bool {
+    host_key(url).map(|h| SLICE_STRICT_HOSTS.lock().contains(&h)).unwrap_or(false)
+}
+
+/// From now on, ask this host for ranges that start on slice boundaries only.
+pub fn mark_slice_strict(url: &str) {
+    if let Some(h) = host_key(url) {
+        SLICE_STRICT_HOSTS.lock().insert(h);
+    }
+}
 
 #[derive(Clone)]
 pub struct DownloadEngine {
@@ -431,6 +450,11 @@ impl DownloadEngine {
             {
                 Ok(()) => return Ok(task),
                 Err(RoundFailure::Repair) => {
+                    // This server mangles mid-slice ranges: only ask it for whole slices from now on.
+                    mark_slice_strict(&task.url);
+                    if let Some(u) = task.final_url.as_deref() {
+                        mark_slice_strict(u);
+                    }
                     repairs += 1;
                     if repairs > MAX_REPAIRS {
                         return Err("The server keeps sending data that does not match itself, so a reliable copy could not be made. Try again later, or with 1 connection.".to_string());
@@ -517,6 +541,8 @@ impl DownloadEngine {
         let writer = spawn_writer(file.clone(), done.clone(), writer_rx);
 
         let shared = Arc::new(Shared {
+            responses: Mutex::new(Vec::new()),
+            slice_strict: slice_strict(&task.url) || task.final_url.as_deref().map(slice_strict).unwrap_or(false),
             clients: clients.to_vec(),
             resolved: Mutex::new(task.final_url.clone().filter(|u| !u.is_empty() && *u != task.url)),
             urls,
@@ -795,20 +821,28 @@ async fn fetch_sample(shared: &Shared, offset: u64, len: usize) -> Option<Vec<u8
     None
 }
 
-/// Compares small samples spread over the finished file with what the server serves
-/// today. Returns the stretches that may be wrong (always generous: a bad sample puts
-/// everything up to its neighbours under suspicion).
+/// Compares samples of the finished file with what the server serves now. Samples sit
+/// on slice boundaries (so the check itself never asks for a mid-slice range), one at
+/// least every 4 MiB, plus the start of any response too short to contain a boundary.
+/// Returns the stretches to fetch again: exactly the responses that covered a bad
+/// sample, or the neighbourhood of the sample when no response is known (resumed data).
 async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64) -> Vec<Range> {
     let len = VERIFY_SAMPLE_BYTES as u64;
     if total < len * 2 {
         return Vec::new();
     }
-    let step = VERIFY_STEP.max(total / VERIFY_MAX_SAMPLES);
-    let mut offsets: Vec<u64> = (0u64..)
-        .map(|k| k * step + (k % 7) * 4099 + step / 2)
-        .take_while(|o| o + len <= total)
-        .collect();
+    let per = (total / VERIFY_MAX_SAMPLES).max(SLICE_ALIGN);
+    let step = per.div_ceil(SLICE_ALIGN) * SLICE_ALIGN;
+    let mut offsets: Vec<u64> = (0u64..).map(|k| k * step).take_while(|o| o + len <= total).collect();
+    let responses = shared.responses.lock().clone();
+    for &(s, e) in &responses {
+        let first_boundary = s.div_ceil(step) * step;
+        if first_boundary + len > e && s + len <= total {
+            offsets.push(s);
+        }
+    }
     offsets.push(total - len);
+    offsets.sort_unstable();
     offsets.dedup();
 
     let results: Vec<(usize, Option<bool>)> = futures_util::stream::iter(offsets.iter().copied().enumerate())
@@ -834,10 +868,17 @@ async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64
 
     let mut bad: Vec<Range> = Vec::new();
     for (i, verdict) in results {
-        if verdict == Some(false) {
+        if verdict != Some(false) {
+            continue;
+        }
+        let o = offsets[i];
+        let culprits: Vec<Range> = responses.iter().copied().filter(|&(s, e)| s < o + len && e > o).collect();
+        if culprits.is_empty() {
             let from = if i == 0 { 0 } else { offsets[i - 1] + len };
-            let to = offsets.get(i + 1).copied().map(|o| o + len).unwrap_or(total);
+            let to = offsets.get(i + 1).copied().map(|n| n + len).unwrap_or(total);
             bad.push((from, to.min(total)));
+        } else {
+            bad.extend(culprits);
         }
     }
     bad
@@ -889,6 +930,11 @@ struct Plan {
 }
 
 struct Shared {
+    /// Every stretch written from one server response (`start..end`), so a response that
+    /// turns out to be wrong can be fetched again exactly.
+    responses: Mutex<Vec<Range>>,
+    /// Start every request on a slice boundary (see `SLICE_STRICT_HOSTS`).
+    slice_strict: bool,
     /// One client per network adapter in use; each range sticks to one (see `Slot::client_idx`).
     clients: Vec<reqwest::Client>,
     urls: Vec<String>,
@@ -1166,6 +1212,20 @@ fn net_retry(reason: String, made_progress: bool) -> AttemptEnd {
     AttemptEnd::Retry { reason, made_progress, retry_after: None, throttled: false, network: true }
 }
 
+/// Records the stretch one response wrote (when it is dropped, whatever ended it).
+struct ResponseLog {
+    shared: Arc<Shared>,
+    start: u64,
+    end: u64,
+}
+impl Drop for ResponseLog {
+    fn drop(&mut self) {
+        if self.end > self.start {
+            self.shared.responses.lock().push((self.start, self.end));
+        }
+    }
+}
+
 struct ActiveGuard(Arc<Shared>);
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
@@ -1317,10 +1377,13 @@ async fn attempt(
     let resolved = if url_idx == 0 { shared.resolved.lock().clone() } else { None };
     let target = resolved.as_deref().unwrap_or(&shared.urls[url_idx]);
     let client = &shared.clients[slot.client_idx.load(Ordering::Relaxed) % shared.clients.len()];
+    // On a strict host, ask from the slice boundary and skip what comes before `pos`.
+    let req_start = if shared.slice_strict { st.pos - st.pos % SLICE_ALIGN } else { st.pos };
+    let mut skip = st.pos - req_start;
     let mut req = client
         .get(target)
         .header(USER_AGENT, &shared.user_agent)
-        .header(RANGE, format!("bytes={}-{}", st.pos, st.end - 1));
+        .header(RANGE, format!("bytes={}-{}", req_start, st.end - 1));
     if let Some(referer) = &shared.referer {
         req = req.header("Referer", referer);
     }
@@ -1377,10 +1440,9 @@ async fn attempt(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range)
         {
-            if first != st.pos {
+            if first != req_start {
                 return AttemptEnd::Fatal(RoundFailure::Failed(format!(
-                    "Server returned bytes starting at {first} but {} was requested",
-                    st.pos
+                    "Server returned bytes starting at {first} but {req_start} was requested"
                 )));
             }
             if let Some(total) = total {
@@ -1429,6 +1491,7 @@ async fn attempt(
     }
 
     let mut stream = resp.bytes_stream();
+    let mut log = ResponseLog { shared: shared.clone(), start: st.pos, end: st.pos };
     let mut made_progress = false;
     let mut last_data = Instant::now();
     let mut flush_tick = tokio::time::interval(WRITE_BATCH_MAX_AGE);
@@ -1452,12 +1515,22 @@ async fn attempt(
             next = stream.next() => next,
         };
 
-        let chunk = match next {
+        let mut chunk = match next {
             None => break,
             Some(Err(e)) => return retry(format!("Connection error: {e}"), made_progress),
             Some(Ok(chunk)) => chunk,
         };
         shared.last_rx_ms.store(shared.clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if skip > 0 {
+            // Bytes before `pos`, requested only to start on a slice boundary.
+            let n = skip.min(chunk.len() as u64);
+            skip -= n;
+            last_data = Instant::now();
+            chunk = chunk.slice(n as usize..);
+            if chunk.is_empty() {
+                continue;
+            }
+        }
 
         // Reserve the bytes under the slot lock: this is what makes work
         // stealing exact, because `end` may have been lowered meanwhile.
@@ -1473,6 +1546,7 @@ async fn attempt(
         }
 
         buf.push(offset, &chunk[..take as usize]);
+        log.end = offset + take;
         shared.received.fetch_add(take, Ordering::Relaxed);
         made_progress = true;
 

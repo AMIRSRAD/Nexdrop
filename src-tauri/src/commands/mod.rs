@@ -47,14 +47,9 @@ pub async fn batch_add_downloads_cmd(
     state: State<'_, AppState>,
     reqs: Vec<AddDownloadRequest>,
 ) -> Result<Vec<DownloadTask>, String> {
-    let mut tasks = Vec::new();
-    for req in reqs {
-        match state.add_download(req).await {
-            Ok(task) => tasks.push(task),
-            Err(e) => log::error!("Failed to add batch item: {e}"),
-        }
-    }
-    Ok(tasks)
+    // Returns at once: the links are checked and added in the background (see `add_many`).
+    state.add_many(reqs);
+    Ok(Vec::new())
 }
 
 #[tauri::command]
