@@ -89,6 +89,27 @@ impl DoneMap {
         gaps
     }
 
+    /// Forgets `start..end` (it has to be downloaded again).
+    pub fn remove(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.ranges.len() + 1);
+        for &(s, e) in &self.ranges {
+            if e <= start || s >= end {
+                out.push((s, e));
+                continue;
+            }
+            if s < start {
+                out.push((s, start));
+            }
+            if e > end {
+                out.push((end, e));
+            }
+        }
+        self.ranges = out;
+    }
+
     /// Drops anything beyond `total` (a defence against a corrupt sidecar).
     pub fn clamp(&mut self, total: u64) {
         self.ranges.retain(|(s, _)| *s < total);

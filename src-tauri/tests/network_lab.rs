@@ -50,6 +50,9 @@ struct Behavior {
     redirect: bool,
     /// A signed link works for this many requests, then returns 403 (expired).
     sig_uses: Option<usize>,
+    /// Per-mille chance that a long range answer starts `shift_bytes` too late (a lying server).
+    shift_permille: u64,
+    shift_bytes: usize,
 }
 
 #[derive(Default)]
@@ -229,7 +232,11 @@ async fn serve_conn(mut socket: TcpStream, st: Arc<ServerState>) -> std::io::Res
         }
         socket.write_all(head.as_bytes()).await?;
 
-        let body = &st.payload[start..=end];
+        let mut body = &st.payload[start..=end];
+        if st.b.shift_permille > 0 && body.len() > MIB && st.roll() < st.b.shift_permille {
+            let s2 = (start + st.b.shift_bytes).min(total - body.len());
+            body = &st.payload[s2..s2 + body.len()];
+        }
         let cut_at = if st.roll() < st.b.drop_permille { Some(body.len() * st.roll() as usize / 1000) } else { None };
         let stall_here = st
             .b
@@ -513,4 +520,35 @@ async fn lab_loopback_throughput() {
     let o = run(&lab, &data, "/f.bin", 8, Duration::from_secs(120)).await;
     report("loopback, uncapped, 8 conns", mib, &o, "");
     assert!(o.ok);
+}
+
+/// Many steals and retries on a big file: every byte must still land where it belongs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn lab_stress_steals_and_cuts() {
+    let mib = 200;
+    let (lab, data) = start_lab(
+        mib * MIB,
+        Behavior { per_conn_bps: Some(3 * MIB as u64), latency: Duration::from_millis(20), drop_permille: 600, busy_permille: 100, ..Default::default() },
+    )
+    .await;
+    let o = run(&lab, &data, "/f.bin", 16, Duration::from_secs(300)).await;
+    report("stress: 200 MiB, 16 conns, 60% cut, 10% busy", mib, &o, &format!("requests {}", lab.stats.requests.load(Ordering::SeqCst)));
+    assert!(o.ok);
+}
+
+/// A server that sometimes answers long ranges with the wrong bytes: the finished file is
+/// spot-checked against the server, the damaged parts are fetched again, and the result is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn lab_lying_server_is_repaired() {
+    let mib = 96;
+    let (lab, data) = start_lab(
+        mib * MIB,
+        Behavior { per_conn_bps: Some(8 * MIB as u64), shift_permille: 150, shift_bytes: 1_300_000, ..Default::default() },
+    )
+    .await;
+    let o = run(&lab, &data, "/f.bin", 8, Duration::from_secs(240)).await;
+    report("lying server: 15% of long ranges shifted", mib, &o, &format!("requests {}", lab.stats.requests.load(Ordering::SeqCst)));
+    assert!(o.ok, "{:?}", o.error);
 }

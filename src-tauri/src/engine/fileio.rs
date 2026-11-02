@@ -45,6 +45,29 @@ pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<
     Ok(())
 }
 
+/// Reads exactly `buf.len()` bytes at `offset` without touching a shared cursor.
+pub fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(buf, offset)?
+        };
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(buf, offset)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "download file is shorter than expected"));
+        }
+        let rest = std::mem::take(&mut buf);
+        buf = &mut rest[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 /// Free space available to the current user on the volume holding `dir`, in
 /// bytes. `None` when it can't be determined (then no check is made).
 pub fn free_space(dir: &Path) -> Option<u64> {

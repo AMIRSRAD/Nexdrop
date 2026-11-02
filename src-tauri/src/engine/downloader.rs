@@ -43,7 +43,7 @@ use tokio::task::JoinSet;
 use crate::db::models::{DownloadProgressEvent, DownloadSegment, DownloadStatus, DownloadTask};
 use crate::engine::client::ClientPool;
 use crate::engine::auth::build_header_list;
-use crate::engine::fileio::{free_space, open_preallocated, write_all_at};
+use crate::engine::fileio::{free_space, open_preallocated, read_exact_at, write_all_at};
 use crate::engine::probe::reserve_unique_path;
 use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range};
 use crate::engine::speed::{RateLimiter, SpeedCalculator};
@@ -77,6 +77,15 @@ const NETWORK_GIVE_UP: Duration = Duration::from_secs(10 * 60);
 const NETWORK_RETRY_CAP: Duration = Duration::from_secs(8);
 /// Restarts allowed for a download that can't be resumed (no range support).
 const SINGLE_STREAM_ATTEMPTS: u32 = 5;
+/// Finished files at least this big are spot-checked against the server before they are kept.
+const VERIFY_MIN_BYTES: u64 = 16 * 1024 * 1024;
+/// Gap between spot-check samples (bigger for huge files, to bound the number of requests).
+const VERIFY_STEP: u64 = 3 * 1024 * 1024;
+const VERIFY_MAX_SAMPLES: u64 = 700;
+const VERIFY_SAMPLE_BYTES: usize = 16 * 1024;
+const VERIFY_PARALLEL: usize = 8;
+/// How many times damaged parts are fetched again before giving up.
+const MAX_REPAIRS: u32 = 3;
 
 #[derive(Clone)]
 pub struct DownloadEngine {
@@ -413,13 +422,24 @@ impl DownloadEngine {
         // If the server reveals that the file changed since we started, the
         // partial data is worthless: restart once from scratch.
         let mut fresh = false;
-        for round in 0..2 {
+        let mut repairs = 0u32;
+        let mut changed_once = false;
+        for _ in 0..(MAX_REPAIRS + 3) {
             match self
                 .ranged_round(&mut task, &final_dest, &clients, &headers, &mut pause_rx, &on_progress, fresh)
                 .await
             {
                 Ok(()) => return Ok(task),
-                Err(RoundFailure::FileChanged) if round == 0 => fresh = true,
+                Err(RoundFailure::Repair) => {
+                    repairs += 1;
+                    if repairs > MAX_REPAIRS {
+                        return Err("The server keeps sending data that does not match itself, so a reliable copy could not be made. Try again later, or with 1 connection.".to_string());
+                    }
+                }
+                Err(RoundFailure::FileChanged) if !changed_once => {
+                    changed_once = true;
+                    fresh = true;
+                }
                 Err(RoundFailure::FileChanged) => {
                     return Err("The file on the server changed while it was being downloaded".to_string())
                 }
@@ -679,6 +699,24 @@ impl DownloadEngine {
                         total.saturating_sub(covered)
                     )));
                 }
+                // Spot-check the finished file against the server; anything that does not
+                // match is forgotten and fetched again.
+                if total >= VERIFY_MIN_BYTES && shared.range_ok.load(Ordering::Relaxed) {
+                    let damaged = find_damage(&shared, &file, total).await;
+                    if !damaged.is_empty() {
+                        let mut map = snapshot.clone();
+                        for (s, e) in damaged {
+                            map.remove(s, e);
+                        }
+                        let (f, p) = (file.clone(), map_path.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = f.sync_data();
+                            let _ = save_map(&p, total, &map);
+                        })
+                        .await;
+                        return Err(RoundFailure::Repair);
+                    }
+                }
                 drop(shared);
                 drop(file);
 
@@ -716,6 +754,95 @@ impl DownloadEngine {
     }
 }
 
+// ───────────────────────── spot-check against the server ─────────────────────────
+
+/// Asks the server for a few bytes at `offset`. `None` if it could not be answered reliably.
+async fn fetch_sample(shared: &Shared, offset: u64, len: usize) -> Option<Vec<u8>> {
+    let resolved = shared.resolved.lock().clone();
+    let mut targets: Vec<Option<String>> = Vec::new();
+    if resolved.is_some() {
+        targets.push(resolved);
+    }
+    targets.push(None);
+    for resolved in targets {
+        let target = resolved.as_deref().unwrap_or(&shared.urls[0]);
+        let client = &shared.clients[offset as usize % shared.clients.len()];
+        let mut req = client
+            .get(target)
+            .header(USER_AGENT, &shared.user_agent)
+            .header(RANGE, format!("bytes={}-{}", offset, offset + len as u64 - 1));
+        if let Some(referer) = &shared.referer {
+            req = req.header("Referer", referer);
+        }
+        if resolved.is_none() || same_host(target, &shared.urls[0]) {
+            for (name, value) in &shared.headers {
+                req = req.header(name.clone(), value.clone());
+            }
+        }
+        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(20), req.send()).await else { continue };
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            continue;
+        }
+        let first = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(parse_content_range).map(|r| r.0);
+        if first != Some(offset) {
+            continue;
+        }
+        let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(20), resp.bytes()).await else { continue };
+        if bytes.len() == len {
+            return Some(bytes.to_vec());
+        }
+    }
+    None
+}
+
+/// Compares small samples spread over the finished file with what the server serves
+/// today. Returns the stretches that may be wrong (always generous: a bad sample puts
+/// everything up to its neighbours under suspicion).
+async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64) -> Vec<Range> {
+    let len = VERIFY_SAMPLE_BYTES as u64;
+    if total < len * 2 {
+        return Vec::new();
+    }
+    let step = VERIFY_STEP.max(total / VERIFY_MAX_SAMPLES);
+    let mut offsets: Vec<u64> = (0u64..)
+        .map(|k| k * step + (k % 7) * 4099 + step / 2)
+        .take_while(|o| o + len <= total)
+        .collect();
+    offsets.push(total - len);
+    offsets.dedup();
+
+    let results: Vec<(usize, Option<bool>)> = futures_util::stream::iter(offsets.iter().copied().enumerate())
+        .map(|(i, offset)| {
+            let shared = shared.clone();
+            let file = file.clone();
+            async move {
+                let Some(theirs) = fetch_sample(&shared, offset, VERIFY_SAMPLE_BYTES).await else { return (i, None) };
+                let read = tokio::task::spawn_blocking(move || {
+                    let mut mine = vec![0u8; VERIFY_SAMPLE_BYTES];
+                    read_exact_at(&file, &mut mine, offset).map(|_| mine)
+                })
+                .await;
+                match read {
+                    Ok(Ok(mine)) => (i, Some(mine == theirs)),
+                    _ => (i, None),
+                }
+            }
+        })
+        .buffer_unordered(VERIFY_PARALLEL)
+        .collect()
+        .await;
+
+    let mut bad: Vec<Range> = Vec::new();
+    for (i, verdict) in results {
+        if verdict == Some(false) {
+            let from = if i == 0 { 0 } else { offsets[i - 1] + len };
+            let to = offsets.get(i + 1).copied().map(|o| o + len).unwrap_or(total);
+            bad.push((from, to.min(total)));
+        }
+    }
+    bad
+}
+
 // ───────────────────────────── shared state ─────────────────────────────
 
 #[derive(Clone)]
@@ -724,6 +851,8 @@ enum RoundFailure {
     FileChanged,
     /// The server ignores Range requests: only a single stream can work.
     NoRanges,
+    /// The spot-check found parts that differ from the server's: they were forgotten and must be fetched again.
+    Repair,
     Failed(String),
 }
 

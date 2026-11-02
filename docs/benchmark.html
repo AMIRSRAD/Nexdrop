@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><style>
+body{margin:0;width:1080px;height:1350px;background:#0b0d12;color:#eef0f5;font-family:Segoe UI,Arial,sans-serif;display:flex;flex-direction:column;padding:90px 80px;box-sizing:border-box}
+h1{font-size:76px;margin:0;letter-spacing:-2px}p.s{font-size:30px;color:#8b93a7;margin:14px 0 70px}
+.row{margin-bottom:56px}.l{display:flex;justify-content:space-between;font-size:34px;margin-bottom:16px}.l b{font-size:46px}
+.bar{height:64px;border-radius:14px;background:#1a1e29;overflow:hidden}.f{height:100%;border-radius:14px}
+.nx{background:linear-gradient(90deg,#5b8cff,#7c5cff);width:100%}.id{background:#4a5164;width:84%}
+.badge{margin-top:10px;font-size:44px;font-weight:700;color:#6ee7a1}
+.note{margin-top:auto;font-size:23px;color:#7d8599;line-height:1.5}
+</style>
+<h1>Nexdrop vs IDM</h1><p class="s">Same file. Same server. Same 8 connections.</p>
+<div class="row"><div class="l"><span>Nexdrop</span><b>5.3 s</b></div><div class="bar"><div class="f nx"></div></div></div>
+<div class="row"><div class="l"><span>Internet Download Manager</span><b>6.2 s</b></div><div class="bar"><div class="f id"></div></div></div>
+<div class="badge">~15% faster to finish</div>
+<div class="note">Test: 40 MB video from a local server that caps each connection at 1 MiB/s, 8 connections in both apps, 2 runs each (Nexdrop 5.28 / 5.27 s, IDM 6.36 / 6.05 s). File checked byte for byte. Results depend on the network and server.</div>
