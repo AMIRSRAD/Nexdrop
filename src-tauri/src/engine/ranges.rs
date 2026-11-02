@@ -140,6 +140,50 @@ pub fn aligned_cut(cut: u64, lo: u64, hi: u64, min: u64) -> u64 {
     cut
 }
 
+/// Finds stretches that hold a copy of the data at the next slice boundary: the exact
+/// fingerprint of a CDN answering a mid-slice range with the next slice. For every
+/// boundary `b`, the first 4 KiB at `b` is looked for in `(b - slice, b)`; compressed or
+/// random data never repeats there by chance. Returns each copy as `start..end`.
+/// `read(offset, len)` returns the file's bytes (fewer only at the end of the file).
+pub fn find_slice_copies(total: u64, slice: u64, mut read: impl FnMut(u64, usize) -> Vec<u8>) -> Vec<Range> {
+    const PROBE: usize = 4096;
+    let mut out = Vec::new();
+    let mut b = slice;
+    while b + PROBE as u64 <= total {
+        let window = read(b - slice, (slice as usize) + PROBE);
+        if window.len() < slice as usize + PROBE {
+            break;
+        }
+        let (before, probe) = window.split_at(slice as usize);
+        let probe = &probe[..PROBE];
+        // Ignore a probe that is one repeated byte (sparse zeros, padding): it would match anywhere.
+        if probe.iter().any(|&x| x != probe[0]) {
+            if let Some(at) = memchr::memmem::find(&before[1..], probe) {
+                let s = b - slice + 1 + at as u64;
+                // How long the copy runs: compare file[s..] with file[b..] in blocks.
+                let mut n = 0u64;
+                let step = 64 * 1024u64;
+                loop {
+                    let want = step.min(total - b - n) as usize;
+                    if want == 0 {
+                        break;
+                    }
+                    let x = read(s + n, want);
+                    let y = read(b + n, want);
+                    let same = x.iter().zip(&y).take_while(|(p, q)| p == q).count();
+                    n += same as u64;
+                    if same < want || s + n >= b {
+                        break;
+                    }
+                }
+                out.push((s, (s + n).min(b)));
+            }
+        }
+        b += slice;
+    }
+    out
+}
+
 /// Cuts the missing `gaps` into about `parts` pieces (never smaller than
 /// `min_piece`), so each connection starts with a sizeable range of its own.
 pub fn split_gaps(gaps: &[Range], parts: usize, min_piece: u64) -> Vec<Range> {
@@ -272,6 +316,28 @@ mod tests {
         // 32 parts were requested, but no piece (except the tail) may be below the minimum.
         assert_eq!(pieces.len(), 3, "{pieces:?}");
         assert!(pieces[..pieces.len() - 1].iter().all(|(s, e)| e - s >= 4_000), "{pieces:?}");
+    }
+
+    #[test]
+    fn copies_of_the_next_slice_are_found_exactly() {
+        let slice = 64 * 1024u64;
+        // Pseudo-random bytes, like compressed data.
+        let mut x = 0x1234_5678u32;
+        let mut data: Vec<u8> = (0..slice * 6)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        assert!(find_slice_copies(data.len() as u64, slice, |o, n| data[o as usize..(o as usize + n).min(data.len())].to_vec()).is_empty());
+        // A short wrong answer: 10 000 bytes at 150 000 hold the data from 196 608 (the next boundary).
+        let (s, b, n) = (150_000usize, 3 * slice as usize, 10_000usize);
+        let copy = data[b..b + n].to_vec();
+        data[s..s + n].copy_from_slice(&copy);
+        let found = find_slice_copies(data.len() as u64, slice, |o, k| data[o as usize..(o as usize + k).min(data.len())].to_vec());
+        assert_eq!(found, vec![(s as u64, (s + n) as u64)]);
     }
 
     #[test]

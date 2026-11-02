@@ -45,7 +45,7 @@ use crate::engine::client::ClientPool;
 use crate::engine::auth::build_header_list;
 use crate::engine::fileio::{free_space, open_preallocated, read_exact_at, write_all_at};
 use crate::engine::probe::reserve_unique_path;
-use crate::engine::ranges::{load_map, save_map, split_gaps, steal_point, DoneMap, Range, SLICE_ALIGN};
+use crate::engine::ranges::{find_slice_copies, load_map, save_map, split_gaps, steal_point, DoneMap, Range, SLICE_ALIGN};
 use crate::engine::speed::{RateLimiter, SpeedCalculator};
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Nexdrop/1.0";
@@ -831,15 +831,37 @@ async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64
     if total < len * 2 {
         return Vec::new();
     }
+    let responses = shared.responses.lock().clone();
+
+    // Suspects found offline: copies of the next slice's data (the CDN bug's fingerprint).
+    // Files with repeated content produce look-alikes, so each one is only a suspect
+    // until the server confirms the bytes there are different.
+    let scan_file = file.clone();
+    let mut suspects: Vec<Range> = tokio::task::spawn_blocking(move || {
+        find_slice_copies(total, SLICE_ALIGN, |o, n| {
+            let n = (n as u64).min(total.saturating_sub(o)) as usize;
+            let mut b = vec![0u8; n];
+            if read_exact_at(&scan_file, &mut b, o).is_err() {
+                b.clear();
+            }
+            b
+        })
+    })
+    .await
+    .unwrap_or_default();
+    suspects.truncate(VERIFY_MAX_SAMPLES as usize);
+
     let per = (total / VERIFY_MAX_SAMPLES).max(SLICE_ALIGN);
     let step = per.div_ceil(SLICE_ALIGN) * SLICE_ALIGN;
     let mut offsets: Vec<u64> = (0u64..).map(|k| k * step).take_while(|o| o + len <= total).collect();
-    let responses = shared.responses.lock().clone();
-    for &(s, e) in &responses {
-        let first_boundary = s.div_ceil(step) * step;
-        if first_boundary + len > e && s + len <= total {
+    // The start of every response that began mid-slice: a wrong answer is wrong from there.
+    for &(s, _) in &responses {
+        if s % SLICE_ALIGN != 0 && s + len <= total {
             offsets.push(s);
         }
+    }
+    for &(s, _) in &suspects {
+        offsets.push(s.min(total - len));
     }
     offsets.push(total - len);
     offsets.sort_unstable();
@@ -873,12 +895,18 @@ async fn find_damage(shared: &Arc<Shared>, file: &Arc<std::fs::File>, total: u64
         }
         let o = offsets[i];
         let culprits: Vec<Range> = responses.iter().copied().filter(|&(s, e)| s < o + len && e > o).collect();
-        if culprits.is_empty() {
+        if !culprits.is_empty() {
+            bad.extend(culprits);
+            continue;
+        }
+        // No response known (data from an earlier session): a confirmed suspect is exact,
+        // otherwise everything up to the neighbouring samples is suspect.
+        if let Some(&(s, e)) = suspects.iter().find(|&&(s, e)| s <= o && o < e.max(s + 1)) {
+            bad.push((s - s % (64 * 1024), (e + 64 * 1024).min(total)));
+        } else {
             let from = if i == 0 { 0 } else { offsets[i - 1] + len };
             let to = offsets.get(i + 1).copied().map(|n| n + len).unwrap_or(total);
             bad.push((from, to.min(total)));
-        } else {
-            bad.extend(culprits);
         }
     }
     bad

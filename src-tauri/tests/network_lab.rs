@@ -244,6 +244,11 @@ async fn serve_conn(mut socket: TcpStream, st: Arc<ServerState>) -> std::io::Res
             if st.b.slice_bug_permille > 0 && next <= end && st.roll() < st.b.slice_bug_permille {
                 st.stats.wrong_answers.fetch_add(1, Ordering::SeqCst);
                 body = &st.payload[next..=end];
+                // Often the wrong answer is also cut short, before the next boundary is reached.
+                if st.roll() < 600 {
+                    let short = (next - start).min(body.len()) * (1 + st.roll() as usize) / 1001;
+                    body = &body[..short.max(1)];
+                }
             }
         }
         let cut_at = if st.roll() < st.b.drop_permille { Some(body.len() * st.roll() as usize / 1000) } else { None };
