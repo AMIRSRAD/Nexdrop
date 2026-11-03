@@ -328,6 +328,20 @@ impl Repository {
         )
     }
 
+    /// Scheduled downloads and their start times, without loading (or decrypting) whole rows.
+    pub fn scheduled_times(conn: &Connection) -> Result<Vec<(String, Option<i64>)>> {
+        let mut stmt = conn.prepare("SELECT id, scheduled_time FROM downloads WHERE status = 'scheduled'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Id, queue and status of every unfinished download: enough to count what each queue holds.
+    pub fn queue_membership(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = conn.prepare("SELECT id, queue_id, status FROM downloads WHERE status IN ('queued', 'downloading')")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
     /// Startup recovery: tasks left as `downloading` by a crash or quit have no
     /// running engine; move them to `status` so they can be resumed.
     pub fn reset_interrupted(conn: &Connection, status: DownloadStatus, now: i64) -> Result<usize> {

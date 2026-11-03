@@ -1,6 +1,6 @@
 [package]
 name = "nexdrop"
-version = "1.4.0"
+version = "1.4.1"
 description = "Nexdrop - Modern Internet Download Manager"
 authors = ["AmirSRAD"]
 homepage = "https://amirsrad.ir"
@@ -48,6 +48,8 @@ tauri-plugin-process = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+webview2-com = "0.39"
+windows-core = "0.62"
 tauri-winrt-notification = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

@@ -1,11 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { QueueInfo } from '../types/download';
 import { api } from '../services/api';
+import { usePageVisible } from './usePageVisible';
 
 /** The queues, kept fresh: after changes, after downloads change state, and every so often (schedules open and close with time). */
 export function useQueues() {
   const [queues, setQueues] = useState<QueueInfo[]>([]);
   const timer = useRef<number | undefined>(undefined);
+  const visible = usePageVisible();
 
   const refresh = useCallback(() => {
     api
@@ -15,6 +17,8 @@ export function useQueues() {
   }, []);
 
   useEffect(() => {
+    // Hidden in the tray: no polling (changes still arrive as events); catch up when shown.
+    if (!visible) return;
     refresh();
     const soon = () => {
       window.clearTimeout(timer.current);
@@ -27,7 +31,7 @@ export function useQueues() {
       window.clearTimeout(timer.current);
       unlisten.forEach((p) => p.then((u) => u()).catch(() => {}));
     };
-  }, [refresh]);
+  }, [refresh, visible]);
 
   return { queues, refresh };
 }

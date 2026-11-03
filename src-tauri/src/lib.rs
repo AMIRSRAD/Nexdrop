@@ -10,6 +10,7 @@ pub mod tray;
 pub mod util;
 pub mod browsers;
 pub mod network;
+pub mod resting;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -107,6 +108,9 @@ pub fn run() {
             // Show it, unless we were started with Windows and belong in the tray.
             if !std::env::args().any(|a| a == MINIMIZED_FLAG) {
                 tray::show_main(app.handle());
+            } else if let Some(window) = app.get_webview_window("main") {
+                // Started with Windows: rest in the tray until opened.
+                resting::set_resting(&window, true);
             }
 
             Ok(())
@@ -115,6 +119,9 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // Closing the window keeps Nexdrop running in the tray.
                 let _ = window.hide();
+                if let Some(w) = window.app_handle().get_webview_window(window.label()) {
+                    crate::resting::set_resting(&w, true);
+                }
                 api.prevent_close();
                 tell_about_the_tray_once(window.app_handle());
             }

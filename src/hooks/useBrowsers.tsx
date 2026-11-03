@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { BrowserIntegration } from '../types/download';
 import { api } from '../services/api';
+import { usePageVisible } from './usePageVisible';
 
 /**
  * Which browsers are on this computer and whether Nexdrop's extension has checked in from them.
@@ -16,11 +17,14 @@ export function useBrowsers(watching: boolean) {
       .catch(() => {});
   }, []);
 
+  const visible = usePageVisible();
   useEffect(() => {
+    // Looking for browsers reads the registry and disk: never while hidden in the tray.
+    if (!visible) return;
     refresh();
     const timer = window.setInterval(refresh, watching ? 3000 : 60000);
     return () => window.clearInterval(timer);
-  }, [refresh, watching]);
+  }, [refresh, watching, visible]);
 
   return { data, refresh };
 }

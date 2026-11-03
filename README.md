@@ -59,6 +59,19 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 checksum verification, saved site logins (encrypted), proxy support, system tray with
 live status, start with Windows, and a single clean interface that stays out of the way.
 
+## Light when idle
+
+Nexdrop runs in the tray all day, so idle cost matters. Measured on Windows 11 with nothing
+downloading (app plus its WebView2 processes, one minute; `scripts/measure_idle.ps1`):
+
+| | CPU (one core) | Memory |
+|---|---|---|
+| Window open | about 0.4% | about 380 MB |
+| Hidden in the tray | about 0.35% | about 135 MB |
+
+In the tray the web view gives back its memory, the interface stops polling, and the
+background checks read only the few rows they need instead of the whole download list.
+
 ## Install
 
 Run `Nexdrop_<version>_x64-setup.exe`. It installs for the current user, needs no admin

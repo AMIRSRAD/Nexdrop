@@ -24,6 +24,7 @@ const TRAY_ID: &str = "main";
 /// Brings the main window to the front (creating no new window).
 pub fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        crate::resting::set_resting(&window, false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -34,6 +35,7 @@ fn toggle_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false) {
             let _ = window.hide();
+            crate::resting::set_resting(&window, true);
         } else {
             show_main(app);
         }
@@ -142,8 +144,10 @@ pub fn setup_tray(app: &tauri::App, manager: Arc<DownloadManager>) -> Result<(),
 fn spawn_status_updater(app: AppHandle, manager: Arc<DownloadManager>, items: Items) {
     tauri::async_runtime::spawn(async move {
         let mut last = String::new();
+        let mut round = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            round = round.wrapping_add(1);
             let summary = manager.status_summary();
             let line = status_line(summary.downloading, summary.queued, summary.paused, summary.speed_bps);
             let key = format!("{line}|{}", summary.paused + summary.queued + summary.downloading);
@@ -157,7 +161,10 @@ fn spawn_status_updater(app: AppHandle, manager: Arc<DownloadManager>, items: It
                 }
             }
             // Keep the check mark honest if the setting was changed elsewhere (e.g. in Settings).
-            let _ = items.autostart.set_checked(app.autolaunch().is_enabled().unwrap_or(false));
+            // That reads the registry, so only every half minute.
+            if round % 15 == 1 {
+                let _ = items.autostart.set_checked(app.autolaunch().is_enabled().unwrap_or(false));
+            }
         }
     });
 }

@@ -894,12 +894,12 @@ impl DownloadManager {
     pub async fn start_due_scheduled(self: &Arc<Self>) {
         let now = chrono::Utc::now().timestamp();
         let mut any = false;
+        // Runs every few seconds even when nothing happens: only the scheduled rows are read.
         if let Ok(conn) = self.get_db_conn() {
-            for task in Repository::get_all_downloads(&conn).unwrap_or_default() {
-                let due = task.status == DownloadStatus::Scheduled
-                    && task.scheduled_time.map(|t| crate::engine::scheduler::to_unix_seconds(t) <= now).unwrap_or(true);
+            for (id, at) in Repository::scheduled_times(&conn).unwrap_or_default() {
+                let due = at.map(|t| crate::engine::scheduler::to_unix_seconds(t) <= now).unwrap_or(true);
                 if due {
-                    let _ = Repository::update_status(&conn, &task.id, DownloadStatus::Queued, None, None, now);
+                    let _ = Repository::update_status(&conn, &id, DownloadStatus::Queued, None, None, now);
                     any = true;
                 }
             }
@@ -954,9 +954,10 @@ impl DownloadManager {
 
     /// Queues with live numbers for the interface.
     pub fn queue_infos(&self) -> Vec<QueueInfo> {
-        let all = self
+        // Asked for often (every change, and the interface polls): only ids, queues and statuses are read.
+        let rows = self
             .get_db_conn()
-            .and_then(|conn| Repository::get_all_downloads(&conn))
+            .and_then(|conn| Repository::queue_membership(&conn))
             .unwrap_or_default();
         let active = self.get_active_task_ids();
         let now = chrono::Local::now();
@@ -964,9 +965,9 @@ impl DownloadManager {
             .into_iter()
             .map(|queue| {
                 let open = self.queue_is_open(&queue);
-                let in_queue = |t: &&DownloadTask| t.queue_id == queue.id;
-                let active_n = all.iter().filter(in_queue).filter(|t| active.contains(&t.id)).count();
-                let queued = all.iter().filter(in_queue).filter(|t| t.status == DownloadStatus::Queued && !active.contains(&t.id)).count();
+                let in_queue = rows.iter().filter(|(_, q, _)| *q == queue.id);
+                let active_n = in_queue.clone().filter(|(id, _, _)| active.contains(id)).count();
+                let queued = in_queue.filter(|(id, _, st)| st == "queued" && !active.contains(id)).count();
                 let next_start = if open { None } else { queues::next_start(&queue, now).map(|t| t.timestamp()) };
                 QueueInfo { queue, open, active: active_n, queued, next_start }
             })
