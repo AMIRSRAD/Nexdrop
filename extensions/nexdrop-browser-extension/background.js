@@ -355,12 +355,12 @@ chrome.runtime.onInstalled.addListener(async () => {
     });
     chrome.contextMenus.create({
       id: 'nexdrop-download-selection',
-      title: 'Download links in selection with Nexdrop',
+      title: 'Download selected links with Nexdrop',
       contexts: ['selection'],
     });
     chrome.contextMenus.create({
       id: 'nexdrop-grab-all-links',
-      title: 'Grab all links on this page with Nexdrop',
+      title: 'Download all files on this page with Nexdrop',
       contexts: ['page'],
     });
   });
@@ -374,7 +374,9 @@ async function sendLinks(tabId, frameId, mode) {
   try {
     reply = await chrome.tabs.sendMessage(tabId, { type: 'GET_LINKS', mode }, { frameId: frameId || 0 });
   } catch (_) { /* the page can't run our script (browser pages, the store) */ }
-  const urls = (reply && reply.links) || [];
+  // Older page scripts answered with plain addresses; now each link comes with its text.
+  const items = ((reply && reply.links) || []).map((l) => (typeof l === 'string' ? { url: l } : l)).filter((l) => l && l.url);
+  const urls = items.map((l) => l.url);
   if (urls.length === 0) {
     chrome.action.setBadgeBackgroundColor({ tabId, color: '#8b8f9b' });
     chrome.action.setBadgeText({ tabId, text: '0' });
@@ -389,7 +391,14 @@ async function sendLinks(tabId, frameId, mode) {
     const res = await fetch(`${NEXDROP_SERVER}/download-many`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls, mode, referer: page || undefined, user_agent: navigator.userAgent, cookies: page ? await cookieHeaderFor(page) : undefined }),
+      body: JSON.stringify({
+        urls,
+        items: items.map((l) => ({ url: l.url, text: l.text || undefined, file: !!l.file })),
+        mode,
+        referer: page || undefined,
+        user_agent: navigator.userAgent,
+        cookies: page ? await cookieHeaderFor(page) : undefined,
+      }),
     });
     return { success: res.ok, count: urls.length };
   } catch (_) {
@@ -436,11 +445,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         getMedia(message.tabId ?? (sender.tab && sender.tab.id)).then((media) => ({ media, best: media.length ? bestMedia(media) : null })),
       );
 
+    case 'MENU_COUNTS':
     case 'SELECTION_LINKS': {
-      const n = Number(message.count) || 0;
+      // Only offer what this right-click can do: the selection item when it holds links,
+      // the page item when the page has files, each with its count.
+      const sel = Number(message.selection ?? message.count) || 0;
+      const files = message.pageFiles == null ? null : Number(message.pageFiles) || 0;
       chrome.contextMenus.update('nexdrop-download-selection', {
-        title: n > 0 ? `Download ${n} link${n === 1 ? '' : 's'} in selection with Nexdrop` : 'Download links in selection with Nexdrop',
+        visible: sel > 0,
+        title: sel > 0 ? `Download ${sel} selected link${sel === 1 ? '' : 's'} with Nexdrop` : 'Download selected links with Nexdrop',
       }, () => void chrome.runtime.lastError);
+      if (files != null) {
+        chrome.contextMenus.update('nexdrop-grab-all-links', {
+          visible: files > 0,
+          title: files > 0 ? `Download all ${files} file${files === 1 ? '' : 's'} on this page with Nexdrop` : 'Download all files on this page with Nexdrop',
+        }, () => void chrome.runtime.lastError);
+      }
       sendResponse({ ok: true });
       return false;
     }

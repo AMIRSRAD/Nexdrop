@@ -1,10 +1,11 @@
 // Nexdrop page script.
 //
-//  * A small "Download" button appears over videos and audio players (like
-//    IDM's). With one candidate it sends it straight to Nexdrop; with several
-//    it lists them.
-//  * Clicking a link to a file the browser would just open in the tab (video,
-//    audio, PDF) sends it to Nexdrop instead, unless Alt/Shift is held.
+//  * A small "Download" button appears over a video or audio player while the pointer is
+//    on it (like IDM's), only when there is something to download, and never over
+//    decorative clips. One candidate goes straight to Nexdrop; several are listed.
+//  * Clicking a link to a file the browser would just open in the tab (video, audio, PDF)
+//    sends it to Nexdrop instead, unless Alt/Shift is held.
+//  * Collects the links of a selection, or the file links of the page, for the menus.
 //
 // Everything visible lives in a shadow root so the page's styles can't touch it.
 (function () {
@@ -78,45 +79,105 @@
     true,
   );
 
-  // ── links for "download links in selection" and "grab all links" ───────────
+  // ── links for "download links in selection" and "download all files" ──────
   const MAX_LINKS = 2000;
-  const httpOnly = (href) => {
+  // Extensions that mean "this link is a file", beyond the ones the user takes over.
+  const FILE_EXT = new Set(
+    ('zip rar 7z tar gz tgz xz bz2 zst iso img dmg pkg exe msi msix deb rpm apk appimage bin torrent cab ' +
+      'mp4 mkv webm avi mov flv wmv m4v mpg mpeg ts mp3 flac wav aac ogg opus m4a wma ' +
+      'pdf epub mobi djvu doc docx xls xlsx ppt pptx odt ods odp rtf csv ' +
+      'jpg jpeg png gif webp bmp tif tiff svg psd raw heic ' +
+      'srt vtt ass sub ttf otf woff woff2 jar py').split(' '),
+  );
+  const httpUrl = (href) => {
     try {
       const u = new URL(href, location.href);
-      return /^https?:$/.test(u.protocol) ? u.href : null;
+      if (!/^https?:$/.test(u.protocol)) return null;
+      u.hash = '';
+      return u.href;
     } catch (_) {
       return null;
     }
+  };
+  const extOf = (url) => {
+    try {
+      const last = new URL(url).pathname.split('/').pop() || '';
+      const dot = last.lastIndexOf('.');
+      return dot > 0 ? last.slice(dot + 1).toLowerCase() : '';
+    } catch (_) {
+      return '';
+    }
+  };
+  const textOf = (a) => (a ? (a.getAttribute('download') || a.textContent || a.title || '').replace(/\s+/g, ' ').trim().slice(0, 140) : '');
+  // A link whose text is a file name ("Setup-2.1.exe" on a download.php?id= link) is a file too.
+  const textNamesFile = (a) => {
+    const m = /\.([a-z0-9]{2,5})$/i.exec(textOf(a));
+    return !!m && FILE_EXT.has(m[1].toLowerCase());
+  };
+  const isFileLink = (url, a) =>
+    FILE_EXT.has(extOf(url)) || words(settings.fileTypes).includes(extOf(url)) || !!(a && (a.hasAttribute('download') || textNamesFile(a)));
+  const here = () => location.href.split('#')[0];
+
+  /** Adds a link once: `found` maps url → { url, text, file }. */
+  const collect = (found, href, a, forceFile) => {
+    const url = httpUrl(href);
+    if (!url || url === here() || found.size >= MAX_LINKS) return;
+    const prev = found.get(url);
+    const text = textOf(a);
+    if (prev) {
+      if (!prev.text && text) prev.text = text;
+      return;
+    }
+    found.set(url, { url, text, file: forceFile || isFileLink(url, a) });
   };
 
   /** Links inside the current selection: anchors it touches, plus plain-text addresses in it. */
   function selectedLinks() {
     const sel = window.getSelection();
-    if (!sel || sel.isCollapsed) return [];
-    const found = new Set();
-    document.querySelectorAll('a[href]').forEach((a) => {
-      try {
-        if (sel.containsNode(a, true)) {
-          const u = httpOnly(a.href);
-          if (u) found.add(u);
-        }
-      } catch (_) { /* detached node */ }
-    });
-    (sel.toString().match(/https?:\/\/[^\s<>"')\]]+/gi) || []).forEach((u) => found.add(u));
-    return [...found].slice(0, MAX_LINKS);
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return [];
+    const found = new Map();
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const range = sel.getRangeAt(i);
+      let scope = range.commonAncestorContainer;
+      if (scope.nodeType !== Node.ELEMENT_NODE) scope = scope.parentElement;
+      if (!scope) continue;
+      // A selection inside one link's text.
+      const inside = scope.closest && scope.closest('a[href]');
+      if (inside) collect(found, inside.href, inside);
+      scope.querySelectorAll('a[href]').forEach((a) => {
+        try {
+          if (range.intersectsNode(a)) collect(found, a.href, a);
+        } catch (_) { /* detached */ }
+      });
+    }
+    (sel.toString().match(/https?:\/\/[^\s<>"'`)\]]+/gi) || []).forEach((u) => collect(found, u.replace(/[.,;:!?]+$/, ''), null));
+    return [...found.values()];
   }
 
-  /** Every link and media source on the page (not in-page anchors). */
+  /** The page's file links (and media sources); every link only if no file link exists. */
   function pageLinks() {
-    const found = new Set();
-    const add = (href) => {
-      const u = httpOnly(href);
-      if (u && u.split('#')[0] !== location.href.split('#')[0]) found.add(u);
-    };
-    document.querySelectorAll('a[href]').forEach((a) => add(a.href));
-    document.querySelectorAll('video[src], audio[src], source[src], embed[src]').forEach((m) => add(m.src));
-    return [...found].slice(0, MAX_LINKS);
+    const found = new Map();
+    document.querySelectorAll('a[href]').forEach((a) => collect(found, a.href, a));
+    document.querySelectorAll('video[src], audio[src], source[src]').forEach((m) => {
+      if (!/^blob:/i.test(m.src)) collect(found, m.src, null, true);
+    });
+    const all = [...found.values()];
+    const files = all.filter((l) => l.file);
+    return files.length ? files : all;
   }
+
+  const countPageFiles = () => {
+    let n = 0;
+    const seen = new Set();
+    for (const a of document.querySelectorAll('a[href]')) {
+      const url = httpUrl(a.href);
+      if (url && !seen.has(url) && isFileLink(url, a)) {
+        seen.add(url);
+        if (++n >= 999) break;
+      }
+    }
+    return n;
+  };
 
   chrome.runtime.onMessage.addListener((message, _sender, reply) => {
     if (message && message.type === 'GET_LINKS') {
@@ -124,15 +185,19 @@
     }
   });
 
-  // Tell the menu how many links the selection holds, just before it opens.
-  document.addEventListener(
-    'contextmenu',
-    () => {
-      const n = selectedLinks().length;
-      chrome.runtime.sendMessage({ type: 'SELECTION_LINKS', count: n }, () => void chrome.runtime.lastError);
-    },
-    true,
-  );
+  // Tell the menu what this right-click can offer, before the menu opens (mousedown comes
+  // first, so the menu is usually up to date when it appears).
+  // (Sent every time: the menu is shared by all tabs and frames.)
+  let lastReport = 0;
+  const reportCounts = () => {
+    const now = performance.now();
+    if (now - lastReport < 50) return; // mousedown and contextmenu of the same click
+    lastReport = now;
+    const counts = { selection: selectedLinks().length, pageFiles: countPageFiles() };
+    chrome.runtime.sendMessage({ type: 'MENU_COUNTS', ...counts }, () => void chrome.runtime.lastError);
+  };
+  document.addEventListener('mousedown', (e) => e.button === 2 && reportCounts(), true);
+  document.addEventListener('contextmenu', reportCounts, true);
 
   // ── the video button ──────────────────────────────────────────────────────
   const host = document.createElement('div');
@@ -140,10 +205,13 @@
   const root = host.attachShadow({ mode: 'closed' });
   root.innerHTML = `
     <style>
-      .btn { position: fixed; display: none; align-items: center; gap: 6px; height: 28px; padding: 0 11px 0 9px;
-        background: #5b8cff; color: #fff; border: 0; border-radius: 7px; cursor: pointer; font: 600 12px/1 -apple-system, "Segoe UI", Roboto, sans-serif;
-        box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none; transition: background .12s; }
-      .btn:hover { background: #7aa2ff; }
+      .bar { position: fixed; display: none; align-items: stretch; height: 28px; border-radius: 7px; overflow: hidden;
+        box-shadow: 0 4px 16px rgba(0,0,0,.35); font: 600 12px/1 -apple-system, "Segoe UI", Roboto, sans-serif; opacity: 0; transition: opacity .15s; }
+      .bar.on { opacity: 1; }
+      .btn, .x { border: 0; background: #5b8cff; color: #fff; cursor: pointer; display: flex; align-items: center; user-select: none; font: inherit; }
+      .btn { gap: 6px; padding: 0 10px 0 9px; }
+      .btn:hover, .x:hover { background: #7aa2ff; }
+      .x { padding: 0 7px; border-left: 1px solid rgba(255,255,255,.25); font-size: 14px; font-weight: 500; }
       .btn svg { width: 14px; height: 14px; }
       .menu { position: fixed; display: none; min-width: 230px; max-width: 340px; padding: 5px; background: #16181d; color: #ecedf1;
         border: 1px solid rgba(255,255,255,.1); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,.5);
@@ -154,26 +222,29 @@
       .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .size { flex: none; color: #8b8f9b; font-variant-numeric: tabular-nums; }
     </style>
-    <button class="btn" part="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10"/><path d="m7.5 10 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></svg><span>Download</span></button>
+    <div class="bar"><button class="btn" title="Download with Nexdrop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10"/><path d="m7.5 10 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></svg><span>Download</span></button><button class="x" title="Hide on this page">×</button></div>
     <div class="menu"></div>`;
+  const bar = root.querySelector('.bar');
   const btn = root.querySelector('.btn');
+  const closeBtn = root.querySelector('.x');
   const menu = root.querySelector('.menu');
   const label = btn.querySelector('span');
   host.setAttribute('data-nexdrop', 'hidden');
   const attach = () => {
     const fs = document.fullscreenElement;
     const parent = fs && fs.tagName !== 'VIDEO' && fs.tagName !== 'AUDIO' ? fs : document.documentElement || document.body;
-    if (parent) parent.appendChild(host);
+    if (parent && host.parentNode !== parent) parent.appendChild(host);
   };
   attach();
 
   let current = null; // the media element the button belongs to
   let hideTimer = 0;
   let overOverlay = false;
-  btn.addEventListener('pointerenter', () => (overOverlay = true));
-  btn.addEventListener('pointerleave', () => (overOverlay = false));
-  menu.addEventListener('pointerenter', () => (overOverlay = true));
-  menu.addEventListener('pointerleave', () => (overOverlay = false));
+  let dismissed = false; // "×": not again on this page
+  [bar, menu].forEach((el) => {
+    el.addEventListener('pointerenter', () => (overOverlay = true));
+    el.addEventListener('pointerleave', () => (overOverlay = false));
+  });
 
   const sizeText = (n) => (n > 0 ? (n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1048576)) + ' MB') : '');
   const nameOf = (m) => {
@@ -184,23 +255,54 @@
       return m.url;
     }
   };
+  let flashTimer = 0;
   const flash = (text, ms = 1800) => {
+    clearTimeout(flashTimer);
     label.textContent = text;
-    setTimeout(() => (label.textContent = 'Download'), ms);
+    flashTimer = setTimeout(() => (label.textContent = 'Download'), ms);
+  };
+
+  const MIN_W = 200;
+  const MIN_H = 112;
+  /** A video worth offering: big enough, and not a muted background loop or a short clip. */
+  const worthy = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < MIN_W || r.height < MIN_H) return false;
+    if (el.tagName === 'VIDEO' && el.muted && el.loop && !el.controls) return false;
+    if (Number.isFinite(el.duration) && el.duration > 0 && el.duration < 20) return false;
+    return true;
+  };
+
+  // Is there anything to download for this element? The tab's captured media, or a direct src.
+  let mediaCache = { at: 0, list: [], best: null };
+  const fetchMedia = () =>
+    new Promise((resolve) => {
+      if (performance.now() - mediaCache.at < 4000) return resolve(mediaCache);
+      chrome.runtime.sendMessage({ type: 'GET_MEDIA' }, (reply) => {
+        const list = !chrome.runtime.lastError && reply && reply.media ? reply.media : [];
+        mediaCache = { at: performance.now(), list, best: reply && reply.best };
+        resolve(mediaCache);
+      });
+    });
+  const directSrc = (el) => {
+    const s = el && (el.currentSrc || el.src);
+    return s && /^https?:/i.test(s) ? s : '';
   };
 
   const place = () => {
     if (!current || !current.isConnected) return hide();
     const r = current.getBoundingClientRect();
-    if (r.width < 160 || r.height < 90 || r.bottom < 0 || r.top > innerHeight) return hide();
-    btn.style.display = 'flex';
-    btn.style.top = `${Math.max(8, r.top + 10)}px`;
-    btn.style.left = `${Math.min(innerWidth - 110, Math.max(8, r.right - 108))}px`;
+    if (r.width < MIN_W || r.height < MIN_H || r.bottom < 0 || r.top > innerHeight) return hide();
+    bar.style.display = 'flex';
+    bar.style.top = `${Math.max(8, r.top + 10)}px`;
+    bar.style.left = `${Math.min(innerWidth - 140, Math.max(8, r.right - 138))}px`;
+    requestAnimationFrame(() => bar.classList.add('on'));
   };
 
   const hide = () => {
     clearTimeout(hideTimer);
-    btn.style.display = 'none';
+    bar.classList.remove('on');
+    bar.style.display = 'none';
     menu.style.display = 'none';
     current = null;
     host.setAttribute('data-nexdrop', 'hidden');
@@ -216,11 +318,19 @@
     }, ms);
   };
 
-  const show = (el) => {
-    if (!settings.videoButton || !settings.autoIntercept) return;
+  let showSeq = 0;
+  const show = async (el) => {
+    if (dismissed || !settings.videoButton || !settings.autoIntercept || ignored(location.href)) return;
+    if (current === el && bar.style.display === 'flex') return armHide(2500);
+    const seq = ++showSeq;
+    const { list } = await fetchMedia();
+    if (seq !== showSeq) return;
+    // Nothing captured and no usable address: no button (it would only say "play it first").
+    if (!list.length && !directSrc(el)) return;
+    attach();
     current = el;
     place();
-    if (btn.style.display === 'flex') host.setAttribute('data-nexdrop', 'visible');
+    if (bar.style.display === 'flex') host.setAttribute('data-nexdrop', 'visible');
     armHide(2500);
   };
 
@@ -228,29 +338,37 @@
     menu.style.display = 'none';
     armHide(2500);
     chrome.runtime.sendMessage({ type: 'SEND_MEDIA', url: entry.url, page: location.href }, (reply) => {
-      flash(reply && reply.success ? 'Sent to Nexdrop' : 'Nexdrop isn’t running');
+      flash(!chrome.runtime.lastError && reply && reply.success ? 'Sent to Nexdrop' : 'Nexdrop isn’t running');
     });
   };
 
-  btn.addEventListener('click', (e) => {
+  closeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    dismissed = true;
+    hide();
+  });
+
+  btn.addEventListener('click', async (e) => {
     e.stopPropagation();
     e.preventDefault();
     const el = current;
-    chrome.runtime.sendMessage({ type: 'GET_MEDIA' }, (reply) => {
-      const media = !chrome.runtime.lastError && reply && reply.media ? reply.media : [];
-      const direct = el && (el.currentSrc || el.src);
-      const fallback = direct && /^https?:/i.test(direct) ? [{ kind: 'file', url: direct, size: 0 }] : [];
-      const list = media.length ? media : fallback;
+    mediaCache.at = 0; // fresh list: the player may have loaded a better quality meanwhile
+    const { list: media, best } = await fetchMedia();
+    const direct = directSrc(el);
+    const list = media.length ? media : direct ? [{ kind: 'file', url: direct, size: 0 }] : [];
 
-      if (list.length === 0) return flash('Play the video first', 2400);
-      // One obvious choice (a single entry, or a stream and nothing big beside it): send it. Otherwise let the user pick.
-      const bigFiles = list.filter((m) => m.kind === 'file' && m.size >= 5 * 1048576);
-      const best = reply && reply.best;
-      if (list.length === 1) return sendEntry(list[0]);
-      if (best && best.kind === 'stream' && bigFiles.length === 0) return sendEntry(best);
-      // Several candidates: let the user pick.
-      menu.innerHTML = '';
-      list.forEach((m) => {
+    if (list.length === 0) return flash('Play the video first', 2400);
+    // One obvious choice (a single entry, or a stream and nothing big beside it): send it.
+    const bigFiles = list.filter((m) => m.kind === 'file' && m.size >= 5 * 1048576);
+    if (list.length === 1) return sendEntry(list[0]);
+    if (best && best.kind === 'stream' && bigFiles.length === 0) return sendEntry(best);
+    if (bigFiles.length === 1 && !list.some((m) => m.kind === 'stream')) return sendEntry(bigFiles[0]);
+    // Several real candidates: let the user pick, biggest first.
+    menu.innerHTML = '';
+    [...list]
+      .sort((a, b) => (b.kind === 'stream') - (a.kind === 'stream') || (b.size || 0) - (a.size || 0))
+      .forEach((m) => {
         const item = document.createElement('button');
         item.className = 'item';
         item.innerHTML = '<span class="tag"></span><span class="name"></span><span class="size"></span>';
@@ -263,64 +381,62 @@
         });
         menu.appendChild(item);
       });
-      const r = btn.getBoundingClientRect();
-      menu.style.display = 'block';
-      menu.style.top = `${r.bottom + 6}px`;
-      menu.style.left = `${Math.max(8, Math.min(innerWidth - 350, r.right - 240))}px`;
-    });
+    const r = bar.getBoundingClientRect();
+    menu.style.display = 'block';
+    menu.style.top = `${r.bottom + 6}px`;
+    menu.style.left = `${Math.max(8, Math.min(innerWidth - 350, r.right - 240))}px`;
   });
 
-  // Players cover their video with their own layers, so the pointer is never
-  // "over the video" as far as events go; test the pointer against the video boxes instead.
-  const media = new Set();
-  const scan = () => document.querySelectorAll('video, audio').forEach((el) => media.add(el));
-  scan();
-  new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true });
+  // Players cover their video with their own layers, so the pointer is never "over the
+  // video" as far as events go. Look at everything under the pointer instead (cheap, and
+  // nothing has to watch the page for changes).
+  const mediaUnder = (x, y) => {
+    for (const el of document.elementsFromPoint(x, y)) {
+      if (el === host) return null;
+      if ((el.tagName === 'VIDEO' || el.tagName === 'AUDIO') && worthy(el)) return el;
+    }
+    return null;
+  };
 
   let lastMove = 0;
   let lastX = -1;
   let lastY = -1;
+  let trailing = 0;
+  const pointerAt = (x, y) => {
+    // Browsers sometimes repeat pointer events while the pointer rests (a repaint, a scroll).
+    // Only real movement counts, otherwise the button would never go away.
+    if (Math.abs(x - lastX) < 3 && Math.abs(y - lastY) < 3) return;
+    lastX = x;
+    lastY = y;
+    lastMove = performance.now();
+    const el = mediaUnder(x, y);
+    if (el) return void show(el);
+    if (!overOverlay && current) armHide(700);
+  };
   document.addEventListener(
     'pointermove',
     (e) => {
-      const now = performance.now();
-      if (now - lastMove < 90) return;
-      // Browsers sometimes repeat pointer events while the pointer rests (a repaint, a scroll).
-      // Only real movement counts, otherwise the button would never go away.
-      if (Math.abs(e.clientX - lastX) < 3 && Math.abs(e.clientY - lastY) < 3) return;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      lastMove = now;
-      for (const el of media) {
-        if (!el.isConnected) {
-          media.delete(el);
-          continue;
-        }
-        const r = el.getBoundingClientRect();
-        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom && r.width >= 160 && r.height >= 90) {
-          return show(el);
-        }
+      if (dismissed || e.pointerType === 'touch') return;
+      const wait = 120 - (performance.now() - lastMove);
+      clearTimeout(trailing);
+      // At most every 120 ms, but the last position always counts (where the pointer stopped).
+      if (wait > 0) {
+        const { clientX, clientY } = e;
+        trailing = setTimeout(() => pointerAt(clientX, clientY), wait);
+        return;
       }
-      if (!overOverlay && current) armHide(900);
+      pointerAt(e.clientX, e.clientY);
     },
     { passive: true },
   );
-  // Playing a video shows the button for a moment even if the pointer is elsewhere.
-  document.addEventListener(
-    'play',
-    (e) => {
-      if (e.target instanceof HTMLMediaElement) {
-        media.add(e.target);
-        show(e.target);
-        armHide(3500);
-      }
-    },
-    true,
-  );
-  addEventListener('scroll', () => current && btn.style.display === 'flex' && place(), { passive: true, capture: true });
+  addEventListener('scroll', () => current && bar.style.display === 'flex' && place(), { passive: true, capture: true });
   addEventListener('resize', () => current && place());
   document.addEventListener('click', (e) => {
     if (!e.composedPath().includes(host)) menu.style.display = 'none';
   });
-  document.addEventListener('fullscreenchange', attach);
+  document.addEventListener('keydown', (e) => e.key === 'Escape' && menu.style.display === 'block' && (menu.style.display = 'none'));
+  document.addEventListener('fullscreenchange', () => {
+    attach();
+    if (current) place();
+  });
 })();

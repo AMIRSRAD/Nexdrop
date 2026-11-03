@@ -335,6 +335,31 @@ struct ManyRequest {
     /// "selection": the user picked these, so all are preselected. "page": preselect only files.
     #[serde(default)]
     mode: Option<String>,
+    /// The same links with the text they had on the page (newer extensions send this).
+    #[serde(default)]
+    items: Vec<ManyItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManyItem {
+    url: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// A file name from a link's text, when the address itself doesn't name a file
+/// ("download.php?id=3" whose link says "Setup-2.1.exe"). Only text that looks like a
+/// file name is used ("Download" or "Click here" is not one).
+fn name_from_text(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 140 || t.contains(['/', '\\']) {
+        return None;
+    }
+    let ext = std::path::Path::new(t).extension()?.to_str()?.to_ascii_lowercase();
+    if ext.len() > 5 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || categorize_extension(&ext) == "other" {
+        return None;
+    }
+    Some(crate::engine::probe::sanitize_filename(t))
 }
 
 /// A link as the multi-download window lists it (name, type), or `None` if it isn't http(s).
@@ -363,15 +388,28 @@ fn handle_download_many(body: &[u8], app: &AppHandle) -> Reply {
         Ok(r) => r,
         Err(e) => return Reply::error("400 Bad Request", &format!("Invalid JSON: {e}")),
     };
+    let texts: HashMap<&str, &str> = req.items.iter().filter_map(|i| Some((i.url.as_str(), i.text.as_deref()?))).collect();
     let mut seen = std::collections::HashSet::new();
-    let links: Vec<GrabbedLink> = req
+    let mut links: Vec<GrabbedLink> = req
         .urls
         .iter()
         .take(MAX_MANY * 2)
-        .filter_map(|u| grabbed_link(u))
+        .filter_map(|u| {
+            let mut link = grabbed_link(u)?;
+            if link.category == "other" {
+                if let Some(name) = texts.get(u.as_str()).and_then(|t| name_from_text(t)) {
+                    link.extension = std::path::Path::new(&name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    link.category = categorize_extension(&link.extension);
+                    link.filename = name;
+                }
+            }
+            Some(link)
+        })
         .filter(|l| seen.insert(l.url.clone()))
         .take(MAX_MANY)
         .collect();
+    // Files first (in page order), then everything else.
+    links.sort_by_key(|l| l.category == "other");
     if links.is_empty() {
         return Reply::error("400 Bad Request", "No downloadable links were found");
     }
@@ -586,11 +624,11 @@ fn is_downloadable_extension(ext: &str) -> bool {
 
 fn categorize_extension(ext: &str) -> String {
     match ext {
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso" | "dmg" => "compressed".to_string(),
-        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "ts" | "m3u8" => "videos".to_string(),
-        "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a" => "music".to_string(),
-        "exe" | "msi" | "apk" | "deb" | "rpm" => "programs".to_string(),
-        "pdf" | "epub" | "docx" | "xlsx" | "pptx" | "csv" => "documents".to_string(),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "cab" | "iso" | "img" | "dmg" => "compressed".to_string(),
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "mpg" | "mpeg" | "ts" | "m3u8" => "videos".to_string(),
+        "mp3" | "flac" | "wav" | "aac" | "ogg" | "opus" | "m4a" | "wma" => "music".to_string(),
+        "exe" | "msi" | "msix" | "apk" | "deb" | "rpm" | "pkg" | "appimage" => "programs".to_string(),
+        "pdf" | "epub" | "mobi" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "rtf" | "csv" => "documents".to_string(),
         _ => "other".to_string(),
     }
 }
@@ -598,6 +636,16 @@ fn categorize_extension(ext: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_text_names_a_file_only_when_it_looks_like_one() {
+        assert_eq!(name_from_text("Setup-2.1.exe").as_deref(), Some("Setup-2.1.exe"));
+        assert_eq!(name_from_text("  Movie (2024).mkv ").as_deref(), Some("Movie (2024).mkv"));
+        assert_eq!(name_from_text("Download"), None);
+        assert_eq!(name_from_text("Click here."), None);
+        assert_eq!(name_from_text("version 2.1"), None, "a number is not an extension");
+        assert_eq!(name_from_text("../../etc/passwd.zip"), None);
+    }
 
     #[test]
     fn links_get_names_and_categories_the_interface_understands() {

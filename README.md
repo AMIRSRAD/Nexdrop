@@ -50,7 +50,11 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 - Downloads your browser starts are handed to Nexdrop with your login cookies. Hold Alt on a
   link to keep the browser's own handling.
 - A Download button over videos finds streams and video files the page loaded; the toolbar
-  icon lists them.
+  icon lists them. It only shows while the pointer is on a real video (not background loops
+  or short clips) and only when there is something to download; × hides it for the page.
+- Right-click: "Download all N files on this page" (files only, other links tucked away in
+  the list) and "Download N selected links". Links without a file name in their address are
+  named from their text.
 - Setup is guided from inside the app and can be re-run any time (Settings > Browser).
 
 ![Browser setup](docs/screenshots/connect-browsers.png)

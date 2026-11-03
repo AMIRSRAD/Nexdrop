@@ -87,15 +87,19 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
   });
   const [catFilter, setCatFilter] = useState<string>('all');
   const [query, setQuery] = useState('');
+  // From "download all files": the page's other links (pages, menus) stay out of the way.
+  const otherCount = useMemo(() => (links ?? []).filter((l) => categoryMeta(l.category).id === 'other').length, [links]);
+  const [showOther, setShowOther] = useState(() => !(initialLinks && preselect === 'files' && initialLinks.some((l) => l.category !== 'other')));
 
   const visibleLinks = useMemo(
     () =>
       (links ?? []).filter((l) => {
         if (catFilter !== 'all' && categoryMeta(l.category).id !== catFilter) return false;
+        if (catFilter === 'all' && !showOther && categoryMeta(l.category).id === 'other') return false;
         const q = query.trim().toLowerCase();
         return !q || l.filename.toLowerCase().includes(q) || l.url.toLowerCase().includes(q);
       }),
-    [links, catFilter, query],
+    [links, catFilter, query, showOther],
   );
   const availableCats = useMemo(() => new Set((links ?? []).map((l) => categoryMeta(l.category).id)), [links]);
 
@@ -348,6 +352,15 @@ const AddMultipleBody: React.FC<Omit<AddMultipleDialogProps, 'open'>> = ({ initi
                       </div>
                     );
                   })}
+                  {catFilter === 'all' && otherCount > 0 && otherCount < (links ?? []).length && (
+                    <button
+                      type="button"
+                      onClick={() => setShowOther((v) => !v)}
+                      className="mt-1 flex h-8 w-full items-center justify-center rounded-md text-[12px] text-fg-3 hover:bg-hover hover:text-fg-2"
+                    >
+                      {showOther ? 'Hide other links' : `Show ${otherCount} other link${otherCount === 1 ? '' : 's'} (pages, not files)`}
+                    </button>
+                  )}
                 </div>
               </div>
             )}

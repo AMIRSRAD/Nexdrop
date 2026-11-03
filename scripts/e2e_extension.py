@@ -108,16 +108,20 @@ class Site(http.server.BaseHTTPRequestHandler):
               <a href="#top">top</a> <a href="/other.html">ordinary page</a> <a href="mailto:a@b.c">mail</a>
               <div id=picked>Pick these: <a href="/files/song-one.mp3">song one</a> and <a href="/files/song-two.mp3">song two</a>
                  plus plain text https://example.com/files/doc.pdf here</div>
-              <p>Not these: <a href="/files/outside.zip">outside</a></p>"""
+              <p>Not these: <a href="/files/outside.zip">outside</a> <a href="/get?id=5">Setup-2.1.exe</a> <a href="/blob/x" download="report-final.pdf">report</a> <a href="/about">About us</a></p>"""
             self.send(200, 'text/html', page)
         elif path == '/video.html':
             page = b"""<!doctype html><title>My Holiday Video</title><body style="margin:0">
-              <video id=v src="/files/clip.mp4" width=640 height=360 muted loop style="display:block"></video>
+              <video id=v src="/files/clip.mp4" width=640 height=360 muted style="display:block"></video>
               <script>fetch('/stream/master.m3u8?token=1').catch(()=>{});</script>"""
+            self.send(200, 'text/html', page)
+        elif path == '/decor.html':
+            page = b"""<!doctype html><title>Landing</title><body style="margin:0">
+              <video id=v src="/files/clip.mp4" width=640 height=360 muted loop autoplay style="display:block"></video><div id=away style="height:300px">x</div>"""
             self.send(200, 'text/html', page)
         elif path == '/plainvideo.html':
             page = b"""<!doctype html><title>Plain Clip Page</title><body style="margin:0">
-              <video id=v src="/files/clip.mp4" width=640 height=360 muted loop style="display:block"></video><div id=away style="height:300px">nothing here</div>"""
+              <video id=v src="/files/clip.mp4" width=640 height=360 muted style="display:block"></video><div id=away style="height:300px">nothing here</div>"""
             self.send(200, 'text/html', page)
         elif path == '/dl/movie':
             # A slow attachment, like a real download: still arriving when the browser announces it.
@@ -351,7 +355,9 @@ def run_browser(kind, site_base, download_dir):
         extension_call(driver, kind, find_tab, 'page')
         got = wait_for(lambda: many_posts(n), timeout=8)
         names = sorted(u.rsplit('/', 1)[-1] for u in (got[0].get('urls', []) if got else []))
-        check(f'{kind}: grab-all sends every link on the page, without in-page anchors or mail links', names == ['other.html', 'outside.zip', 'song-one.mp3', 'song-two.mp3'], names)
+        check(f'{kind}: download-all sends only the page files (no pages, anchors or mail links)', names == ['get?id=5', 'outside.zip', 'song-one.mp3', 'song-two.mp3', 'x'], names)
+        texts = {i.get('url', '').rsplit('/', 1)[-1]: i.get('text') for i in (got[0].get('items', []) if got else [])}
+        check(f'{kind}: each link comes with its text (to name it)', texts.get('get?id=5') == 'Setup-2.1.exe' and texts.get('x') == 'report-final.pdf', texts)
 
         # ---- the video button stays out of the way: it hides when the pointer rests or leaves
         driver.get(site_base + '/plainvideo.html')
@@ -368,6 +374,30 @@ def run_browser(kind, site_base, download_dir):
         check(f'{kind}: and comes back when the pointer moves again', wait_for(lambda: state() == 'visible', timeout=3) is True, state())
         ActionChains(driver).move_to_element(driver.find_element(By.ID, 'away')).perform()
         check(f'{kind}: and goes away when the pointer leaves the video', wait_for(lambda: state() == 'hidden', timeout=4) is True, state())
+
+        # ---- not over-showing: decorative clips get no button, playing alone shows nothing, × hides it
+        driver.get(site_base + '/decor.html')
+        time.sleep(2)
+        video = driver.find_element(By.ID, 'v')
+        ActionChains(driver).move_to_element(video).pause(0.2).move_by_offset(30, 20).perform()
+        time.sleep(1.5)
+        check(f'{kind}: a muted looping background clip gets no button', state() == 'hidden', state())
+        driver.get(site_base + '/plainvideo.html')
+        time.sleep(1.5)
+        video = driver.find_element(By.ID, 'v')
+        ActionChains(driver).move_to_element(driver.find_element(By.ID, 'away')).perform()
+        driver.execute_script('arguments[0].play().catch(()=>{})', video)
+        time.sleep(1.5)
+        check(f'{kind}: a video starting to play does not pop the button up by itself', state() == 'hidden', state())
+        ActionChains(driver).move_to_element(video).pause(0.2).move_by_offset(30, 20).perform()
+        wait_for(lambda: state() == 'visible', timeout=3)
+        size = video.size
+        # The × sits at the right end of the button.
+        ActionChains(driver).move_to_element_with_offset(video, size['width'] // 2 - 22, -size['height'] // 2 + 24).pause(0.3).click().perform()
+        time.sleep(0.5)
+        ActionChains(driver).move_by_offset(-40, 30).pause(0.3).move_by_offset(20, 10).perform()
+        time.sleep(1)
+        check(f'{kind}: the × hides the button for the rest of the page', state() == 'hidden', state())
 
         # ---- app not running: the browser keeps its download
         global BRIDGE_UP
