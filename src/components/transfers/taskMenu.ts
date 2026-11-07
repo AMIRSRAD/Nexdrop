@@ -1,4 +1,4 @@
-import { Copy, ExternalLink, FolderOpen, Info, Link2, Pause, Play, Radio, RotateCw, Square, Terminal, Trash } from 'lucide-react';
+import { ArrowDown, ArrowDownToLine, ArrowUp, ArrowUpToLine, Copy, ExternalLink, FolderOpen, Info, Link2, Pause, Play, Radio, RotateCw, Square, Terminal, Trash, Zap } from 'lucide-react';
 import type { DownloadTask, QueueInfo } from '../../types/download';
 import type { MenuItem } from '../ui/Menu';
 
@@ -19,6 +19,10 @@ export interface TaskHandlers {
   focus: (id: string) => void;
   contextMenu: (task: DownloadTask, x: number, y: number) => void;
   refreshLink: (task: DownloadTask) => void;
+  reorder: (ids: string[], action: 'next' | 'top' | 'bottom' | 'up' | 'down') => void;
+  startNow: (id: string) => void;
+  /** What is dragged when this row is: the selection if it is part of it, else just the row. */
+  dragIds: (id: string) => string[];
 }
 
 export function canPause(t: DownloadTask) {
@@ -26,6 +30,13 @@ export function canPause(t: DownloadTask) {
 }
 export function canResume(t: DownloadTask) {
   return t.status === 'paused' || t.status === 'scheduled';
+}
+/** Waiting (or paused) in a queue: its place in line can be changed. */
+export function canReorder(t: DownloadTask) {
+  return t.status === 'queued' || t.status === 'paused' || t.status === 'scheduled';
+}
+export function canStartNow(t: DownloadTask) {
+  return t.status === 'queued' || t.status === 'paused' || t.status === 'scheduled' || t.status === 'failed' || t.status === 'canceled';
 }
 export function canRetry(t: DownloadTask) {
   return t.status === 'failed' || t.status === 'canceled';
@@ -50,6 +61,17 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
     if (canResume(task))
       items.push({ label: task.status === 'scheduled' ? 'Start now' : 'Resume', icon: Play, shortcut: 'Space', onSelect: () => h.resume(task.id) });
     if (canRetry(task)) items.push({ label: 'Retry', icon: RotateCw, onSelect: () => h.retry(task.id) });
+    if (task.kind !== 'torrent' && canStartNow(task)) items.push({ label: 'Download now', icon: Zap, hint: 'ignores the queue limit', onSelect: () => h.startNow(task.id) });
+    if (canReorder(task)) {
+      items.push(
+        { separator: true },
+        { label: 'Download next', icon: ArrowUpToLine, shortcut: 'Alt+Home', onSelect: () => h.reorder([task.id], 'next') },
+        { label: 'Move up', icon: ArrowUp, shortcut: 'Alt+↑', onSelect: () => h.reorder([task.id], 'up') },
+        { label: 'Move down', icon: ArrowDown, shortcut: 'Alt+↓', onSelect: () => h.reorder([task.id], 'down') },
+        { label: 'Move to the end', icon: ArrowDownToLine, shortcut: 'Alt+End', onSelect: () => h.reorder([task.id], 'bottom') },
+        { separator: true },
+      );
+    }
     if ((task.kind ?? 'http') === 'http') items.push({ label: 'Refresh link…', icon: Link2, onSelect: () => h.refreshLink(task) });
     items.push({ label: 'Show in folder', icon: FolderOpen, onSelect: () => h.reveal(task.id) });
   }

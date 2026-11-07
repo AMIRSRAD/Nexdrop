@@ -618,6 +618,18 @@ pub async fn test_proxy_cmd(
     Ok(crate::engine::client::test_proxy(&mode, url.as_deref(), username.as_deref().unwrap_or(""), password.as_deref().unwrap_or("")).await)
 }
 
+/// Moves downloads in their queue's line: "next", "top", "bottom", "up" or "down".
+#[tauri::command]
+pub async fn reorder_downloads_cmd(state: State<'_, AppState>, ids: Vec<String>, action: String) -> Result<(), String> {
+    state.reorder_downloads(ids, &action).await
+}
+
+/// Starts a download right now, whatever its queue allows.
+#[tauri::command]
+pub async fn start_download_now_cmd(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.start_download_now(&id).await
+}
+
 /// A download's activity log, oldest first.
 #[tauri::command]
 pub async fn get_download_log_cmd(state: State<'_, AppState>, id: String) -> Result<Vec<crate::db::models::LogEntry>, String> {

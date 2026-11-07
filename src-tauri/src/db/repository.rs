@@ -16,7 +16,7 @@ const TASK_COLUMNS: &str = "id, url, final_url, filename, destination_path, temp
     checksum_md5, user_agent, referer, mirrors, min_chunk_size,
     proxy_mode, custom_proxy_url, antivirus_status,
     expected_checksum, custom_headers,
-    kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id";
+    kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id, queue_order";
 
 /// Header maps hold cookies and tokens, so they are encrypted before they hit the disk.
 fn encode_headers(headers: &std::collections::HashMap<String, String>) -> Option<String> {
@@ -151,6 +151,7 @@ impl Repository {
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_bytes BLOB", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN torrent_started INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE downloads ADD COLUMN queue_id TEXT NOT NULL DEFAULT 'main'", []);
+        let _ = conn.execute("ALTER TABLE downloads ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_info_hash ON downloads(info_hash)", []);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS queues (
@@ -175,6 +176,19 @@ impl Repository {
     }
 
     pub fn save_download(conn: &Connection, task: &DownloadTask) -> Result<()> {
+        // A new download goes to the end of its queue's line, even when several arrive in the same second.
+        let order = if task.queue_order != 0 {
+            task.queue_order
+        } else {
+            let existing: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(CASE WHEN queue_order = 0 THEN created_at * 1000 ELSE queue_order END), 0) FROM downloads WHERE queue_id = ?1 AND id != ?2",
+                    params![task.queue_id, task.id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            task.created_at.saturating_mul(1000).max(existing + 1)
+        };
         conn.execute(
             "INSERT INTO downloads (
                 id, url, final_url, filename, destination_path, temp_path,
@@ -185,7 +199,7 @@ impl Repository {
                 checksum_md5, user_agent, referer, mirrors, min_chunk_size,
                 proxy_mode, custom_proxy_url, antivirus_status,
                 expected_checksum, custom_headers,
-                kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id
+                kind, info_hash, uploaded_bytes, seeding, torrent_files, queue_id, queue_order
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
@@ -194,7 +208,7 @@ impl Repository {
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32, ?33,
                 ?34, ?35,
-                ?36, ?37, ?38, ?39, ?40, ?41
+                ?36, ?37, ?38, ?39, ?40, ?41, ?42
             )
             ON CONFLICT(id) DO UPDATE SET
                 final_url = excluded.final_url,
@@ -276,6 +290,7 @@ impl Repository {
                 if task.seeding { 1 } else { 0 },
                 if task.torrent_files.is_empty() { None } else { serde_json::to_string(&task.torrent_files).ok() },
                 task.queue_id,
+                order,
             ],
         )?;
 
@@ -531,6 +546,7 @@ let status_str: String = row.get(8)?;
                 .unwrap_or(None)
                 .filter(|q| !q.is_empty())
                 .unwrap_or_else(|| crate::db::models::MAIN_QUEUE_ID.to_string()),
+            queue_order: row.get::<_, Option<i64>>(41).unwrap_or(None).filter(|o| *o != 0).unwrap_or_else(|| row.get::<_, i64>(19).unwrap_or(0).saturating_mul(1000)),
         })
     }
 
@@ -564,6 +580,24 @@ let status_str: String = row.get(8)?;
     pub fn delete_queue(conn: &Connection, id: &str, fallback: &str) -> Result<()> {
         conn.execute("UPDATE downloads SET queue_id = ?1 WHERE queue_id = ?2", params![fallback, id])?;
         conn.execute("DELETE FROM queues WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The waiting line of one queue: unfinished downloads in the order they will start.
+    pub fn queue_line(conn: &Connection, queue_id: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM downloads WHERE queue_id = ?1 AND status IN ('queued', 'paused', 'scheduled', 'downloading')
+             ORDER BY CASE WHEN queue_order = 0 THEN created_at * 1000 ELSE queue_order END, created_at, id",
+        )?;
+        let rows = stmt.query_map(params![queue_id], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Rewrites a queue's order from `line` (first = starts first).
+    pub fn set_queue_line(conn: &Connection, line: &[String]) -> Result<()> {
+        for (i, id) in line.iter().enumerate() {
+            conn.execute("UPDATE downloads SET queue_order = ?1 WHERE id = ?2", params![(i as i64 + 1) * 1000, id])?;
+        }
         Ok(())
     }
 
@@ -921,6 +955,7 @@ mod tests {
             seeding: false,
             torrent_files: vec![],
             queue_id: "main".to_string(),
+            queue_order: 0,
         };
 
         // 1. Save
@@ -1012,6 +1047,45 @@ mod tests {
         Repository::delete_queue(&conn, "night", "main").unwrap();
         assert_eq!(Repository::get_download(&conn, "t1").unwrap().unwrap().queue_id, "main");
         assert_eq!(Repository::list_queues(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_queue_line_follows_the_order_set_for_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        Repository::create_tables(&conn).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let mut t = sample_task(&format!("o{i}"));
+            t.created_at = 1000 + i;
+            t.status = DownloadStatus::Queued;
+            Repository::save_download(&conn, &t).unwrap();
+            ids.push(t.id.clone());
+        }
+        assert_eq!(Repository::queue_line(&conn, "main").unwrap(), ids, "in the order added");
+        let moved = vec![ids[3].clone(), ids[0].clone(), ids[1].clone(), ids[2].clone()];
+        Repository::set_queue_line(&conn, &moved).unwrap();
+        assert_eq!(Repository::queue_line(&conn, "main").unwrap(), moved);
+        assert_eq!(Repository::get_download(&conn, &ids[3]).unwrap().unwrap().queue_order, 1000);
+        // Saving a task again (e.g. when it finishes) keeps its place.
+        let mut again = Repository::get_download(&conn, &ids[0]).unwrap().unwrap();
+        again.queue_order = 0;
+        Repository::save_download(&conn, &again).unwrap();
+        assert_eq!(Repository::get_download(&conn, &ids[0]).unwrap().unwrap().queue_order, 2000);
+    }
+
+    #[test]
+    fn downloads_added_in_the_same_second_keep_the_order_they_were_added() {
+        let conn = Connection::open_in_memory().unwrap();
+        Repository::create_tables(&conn).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let mut t = sample_task(&format!("z{}", 5 - i)); // ids sort the other way round
+            t.created_at = 5000;
+            t.status = DownloadStatus::Queued;
+            Repository::save_download(&conn, &t).unwrap();
+            ids.push(t.id.clone());
+        }
+        assert_eq!(Repository::queue_line(&conn, "main").unwrap(), ids);
     }
 
     #[test]
@@ -1181,6 +1255,7 @@ mod tests {
             seeding: false,
             torrent_files: vec![],
             queue_id: "main".to_string(),
+            queue_order: 0,
         }
     }
 }

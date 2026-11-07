@@ -66,6 +66,8 @@ export interface DownloadTask {
   kind?: 'http' | 'torrent' | 'stream';
   /** The queue this download belongs to. */
   queue_id?: string;
+  /** Place in its queue's waiting line (smaller starts first). */
+  queue_order?: number;
   /** Live only: what a download at 100% is doing before it is kept. */
   phase?: 'verifying' | 'repairing';
   info_hash?: string;

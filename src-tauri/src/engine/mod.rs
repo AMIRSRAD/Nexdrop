@@ -4,6 +4,7 @@ pub mod client;
 pub mod downloader;
 pub mod fileio;
 pub mod manager;
+pub mod order;
 pub mod probe;
 pub mod queues;
 pub mod ranges;

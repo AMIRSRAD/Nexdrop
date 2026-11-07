@@ -175,6 +175,7 @@ fn task(url: &str, dir: &std::path::Path, name: &str, variant: Option<&str>) -> 
         seeding: false,
         torrent_files: vec![],
         queue_id: "main".into(),
+        queue_order: 0,
     }
 }
 

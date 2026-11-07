@@ -17,6 +17,8 @@ interface QueueSidebarProps {
   startable: Set<string>;
   onStart: (id: string) => void;
   onStop: (id: string) => void;
+  /** Downloads were dropped on a queue: move them there. */
+  onDropIds: (ids: string[], queueId: string) => void;
   onEdit: () => void;
   onNew: () => void;
   onCollapse: () => void;
@@ -95,6 +97,7 @@ export const QueueSidebar: React.FC<QueueSidebarProps> = (p) => {
                 e.preventDefault();
                 setMenu({ q, pos: { x: e.clientX, y: e.clientY } });
               }}
+              onDropIds={(ids) => p.onDropIds(ids, q.id)}
               action={
                 isRunning ? (
                   <ActionButton icon={Square} label={`Stop ${q.name}`} onClick={() => p.onStop(q.id)} />
@@ -121,9 +124,31 @@ const Row: React.FC<{
   tone?: 'run' | 'wait' | 'idle';
   onClick: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
+  onDropIds?: (ids: string[]) => void;
   action?: React.ReactNode;
-}> = ({ active, icon: Icon, name, count, sub, tone, onClick, onContextMenu, action }) => (
+}> = ({ active, icon: Icon, name, count, sub, tone, onClick, onContextMenu, onDropIds, action }) => {
+  const [over, setOver] = useState(false);
+  const DRAG = 'application/x-nexdrop-downloads';
+  return (
   <div
+    onDragOver={(e) => {
+      if (!onDropIds || !e.dataTransfer.types.includes(DRAG)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      setOver(true);
+    }}
+    onDragLeave={() => setOver(false)}
+    onDrop={(e) => {
+      setOver(false);
+      if (!onDropIds || !e.dataTransfer.types.includes(DRAG)) return;
+      e.preventDefault();
+      try {
+        const ids = JSON.parse(e.dataTransfer.getData(DRAG));
+        if (Array.isArray(ids) && ids.length) onDropIds(ids);
+      } catch {
+        /* not ours */
+      }
+    }}
     role="button"
     tabIndex={0}
     aria-pressed={active}
@@ -137,7 +162,7 @@ const Row: React.FC<{
     onContextMenu={onContextMenu}
     className={cn(
       'group relative flex cursor-default items-center gap-2.5 rounded-lg px-2.5 py-2 outline-none transition-colors duration-100 focus-visible:shadow-[0_0_0_1.5px_var(--accent)]',
-      active ? 'bg-accent-soft' : 'hover:bg-hover',
+      over ? 'bg-accent-soft shadow-[inset_0_0_0_1.5px_var(--accent)]' : active ? 'bg-accent-soft' : 'hover:bg-hover',
     )}
   >
     <Icon size={15} className={cn('shrink-0', active ? 'text-accent' : 'text-fg-3')} />
@@ -163,7 +188,8 @@ const Row: React.FC<{
       count > 0 && <span className="text-[11.5px] text-fg-3 tabular">{count}</span>
     )}
   </div>
-);
+  );
+};
 
 const ActionButton: React.FC<{ icon: React.ComponentType<{ size?: number }>; label: string; onClick: () => void }> = ({ icon: Icon, label, onClick }) => (
   <button

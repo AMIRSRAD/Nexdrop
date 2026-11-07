@@ -223,6 +223,7 @@ fn make_task(url: &str, dir: &Path, len: usize, name: &str, connections: usize) 
         seeding: false,
         torrent_files: vec![],
         queue_id: "main".to_string(),
+        queue_order: 0,
     }
 }
 

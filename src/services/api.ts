@@ -620,7 +620,7 @@ export const api = {
     }
     return {
       browsers: [
-        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.4.2' },
+        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.5.0' },
         { id: 'firefox', name: 'Mozilla Firefox', family: 'firefox', installed: true, connected: false, ever_connected: false },
       ],
       signed_firefox: false,
@@ -671,6 +671,23 @@ export const api = {
     }
     const set = new Set(ids);
     mockDownloads = mockDownloads.map((t) => (set.has(t.id) ? { ...t, queue_id: queueId } : t));
+  },
+
+  /** Moves downloads inside their queue: 'next', 'top', 'bottom', 'up' or 'down'. */
+  async reorderDownloads(ids: string[], action: 'next' | 'top' | 'bottom' | 'up' | 'down'): Promise<void> {
+    if (isTauri()) {
+      return await invoke('reorder_downloads_cmd', { ids, action });
+    }
+    const first = Math.min(...mockDownloads.map((d) => d.queue_order ?? d.created_at)) - 1;
+    mockDownloads = mockDownloads.map((t) => (ids.includes(t.id) && (action === 'next' || action === 'top') ? { ...t, queue_order: first } : t));
+  },
+
+  /** Starts a download right now, whatever its queue allows. */
+  async startDownloadNow(id: string): Promise<void> {
+    if (isTauri()) {
+      return await invoke('start_download_now_cmd', { id });
+    }
+    mockDownloads = mockDownloads.map((t) => (t.id === id ? { ...t, status: 'downloading' } : t));
   },
 
   async startQueue(id: string): Promise<void> {
@@ -731,7 +748,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '1.4.2' };
+    return { name: 'Nexdrop', version: '1.5.0' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */

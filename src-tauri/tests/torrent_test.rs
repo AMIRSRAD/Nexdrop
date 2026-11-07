@@ -138,6 +138,7 @@ fn task_for(probe: &TorrentProbe, dest: &Path, selected: &[usize]) -> DownloadTa
         seeding: false,
         torrent_files: files,
         queue_id: "main".to_string(),
+        queue_order: 0,
     }
 }
 

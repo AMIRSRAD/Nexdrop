@@ -17,6 +17,7 @@ import { plural } from './utils/format';
 import { useToast } from './components/ui/Toast';
 import { Menu, type MenuItem } from './components/ui/Menu';
 import { QueueSidebar } from './components/shell/QueueSidebar';
+import { QueuePlaceContext } from './hooks/useQueues';
 import { checkForUpdate, checkIsDue, installUpdate } from './hooks/useUpdater';
 import { RefreshLinkDialog } from './components/dialogs/RefreshLinkDialog';
 import { TitleBar } from './components/shell/TitleBar';
@@ -24,7 +25,7 @@ import { FilterBar } from './components/shell/FilterBar';
 import { StatusBar } from './components/shell/StatusBar';
 import { TransferList, type SortKey, type SortState } from './components/transfers/TransferList';
 import { EmptyState } from './components/transfers/EmptyState';
-import { buildTaskMenu, canPause, canResume, canRetry, type TaskHandlers } from './components/transfers/taskMenu';
+import { buildTaskMenu, canPause, canReorder, canResume, canRetry, canStartNow, type TaskHandlers } from './components/transfers/taskMenu';
 import { AddDownloadDialog } from './components/dialogs/AddDownloadDialog';
 import { AddMultipleDialog, type AddMultipleTab } from './components/dialogs/AddMultipleDialog';
 import { AddTorrentDialog } from './components/dialogs/AddTorrentDialog';
@@ -181,6 +182,8 @@ export default function App() {
   const [category, setCategory] = useState<FileCategory>('all');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<SortState>({ key: 'added', dir: 'desc' });
+  // The same selection, readable from handlers that must not change identity.
+  const selectionRef = useRef<Set<string>>(new Set());
 
   const statusCounts = useMemo(() => {
     const counts = Object.fromEntries(STATUS_FILTERS.map((f) => [f.id, 0])) as Record<StatusFilter, number>;
@@ -218,6 +221,24 @@ export default function App() {
     [refreshQueues, toast],
   );
 
+  // Waiting downloads in the order they will start, per queue: "Next up", "#3 in line".
+  const queuePlaces = useMemo(() => {
+    const byQueue = new Map<string, DownloadTask[]>();
+    for (const d of downloads) {
+      if (d.status !== 'queued') continue;
+      const q = d.queue_id ?? 'main';
+      if (!byQueue.has(q)) byQueue.set(q, []);
+      byQueue.get(q)!.push(d);
+    }
+    const places = new Map<string, number>();
+    for (const list of byQueue.values()) {
+      list
+        .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || (a.queue_order ?? a.created_at * 1000) - (b.queue_order ?? b.created_at * 1000) || a.created_at - b.created_at)
+        .forEach((d, i) => places.set(d.id, i + 1));
+    }
+    return places;
+  }, [downloads]);
+
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
     const list = downloads.filter(
@@ -244,13 +265,27 @@ export default function App() {
           return d.created_at;
       }
     };
+    // Looking at one queue with the default sort: show it as it runs (running, waiting in line,
+    // paused, then the rest), so moving a download up or down is visible.
+    if (queueFilter !== 'all' && sort.key === 'added' && sort.dir === 'desc') {
+      const rank = (d: DownloadTask) => (d.status === 'downloading' ? 0 : d.status === 'queued' ? 1 : d.status === 'paused' || d.status === 'scheduled' ? 2 : 3);
+      const order = (d: DownloadTask) => d.queue_order ?? d.created_at * 1000;
+      return list.sort((a, b) => {
+        const ra = rank(a);
+        const rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        if (ra === 1) return (queuePlaces.get(a.id) ?? 0) - (queuePlaces.get(b.id) ?? 0);
+        if (ra <= 2) return order(a) - order(b);
+        return b.created_at - a.created_at;
+      });
+    }
     return list.sort((a, b) => {
       const va = val(a);
       const vb = val(b);
       if (typeof va === 'string' && typeof vb === 'string') return va.localeCompare(vb) * dir;
       return ((va as number) - (vb as number)) * dir || b.created_at - a.created_at;
     });
-  }, [downloads, status, category, queueFilter, search, sort]);
+  }, [downloads, status, category, queueFilter, search, sort, queuePlaces]);
 
   const onSort = useCallback(
     (key: SortKey) =>
@@ -260,6 +295,7 @@ export default function App() {
 
   /* ── selection, focus, expansion ─────────────────── */
   const [selection, setSelection] = useState<Set<string>>(new Set());
+  selectionRef.current = selection;
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const visibleRef = useRef(visible);
@@ -335,14 +371,40 @@ export default function App() {
       focus: (id) => setFocusedId(id),
       contextMenu: (task, x, y) => setMenu({ id: task.id, x, y }),
       refreshLink: (task) => setRefreshTask(task),
+      reorder: (ids, action) => {
+        api
+          .reorderDownloads(ids, action)
+          .then(() => {
+            refreshQueues();
+            actions.refresh();
+          })
+          .catch((err) => toast.show({ tone: 'error', title: "Couldn't change the order", description: errText(err) }));
+      },
+      startNow: (id) => {
+        api
+          .startDownloadNow(id)
+          .then(() => {
+            refreshQueues();
+            actions.refresh();
+          })
+          .catch((err) => toast.show({ tone: 'error', title: "Couldn't start the download", description: errText(err) }));
+      },
+      dragIds: (id) => (selectionRef.current.has(id) ? [...selectionRef.current] : [id]),
     }),
     [actions, toast, refreshQueues],
   );
+
+  // Latest values for the global keyboard handler.
+  const handlersRef = useRef<TaskHandlers | null>(null);
+  handlersRef.current = handlers;
+  const focusedRef = useRef(focusedId);
+  focusedRef.current = focusedId;
 
   const menuTask = menu ? downloads.find((d) => d.id === menu.id) : undefined;
 
   /* ── bulk actions ────────────────────────────────── */
   const selectedTasks = useMemo(() => downloads.filter((d) => selection.has(d.id)), [downloads, selection]);
+  const reorderable = useMemo(() => selectedTasks.filter(canReorder).map((t) => t.id), [selectedTasks]);
   const bulkCan = useMemo(
     () => ({
       pause: selectedTasks.some(canPause),
@@ -512,6 +574,15 @@ export default function App() {
         e.preventDefault();
         setSettingsView((v) => ({ ...v, open: false }));
         requestAnimationFrame(() => searchRef.current?.focus());
+      } else if (e.altKey && !typing && ['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+        // Alt+Up/Down moves the selected (or focused) waiting download in its queue; Alt+Home first, Alt+End last.
+        const ids = (selectionRef.current.size ? [...selectionRef.current] : focusedRef.current ? [focusedRef.current] : []).filter((id) =>
+          downloadsRef.current.some((d) => d.id === id && canReorder(d)),
+        );
+        if (ids.length) {
+          e.preventDefault();
+          handlersRef.current?.reorder(ids, e.key === 'ArrowUp' ? 'up' : e.key === 'ArrowDown' ? 'down' : e.key === 'Home' ? 'top' : 'bottom');
+        }
       } else if (e.key === 'Escape' && !typing) {
         if (settingsView.open) setSettingsView((v) => ({ ...v, open: false }));
         else if (selection.size) setSelection(new Set());
@@ -621,6 +692,7 @@ export default function App() {
 
   return (
     <QueuesContext.Provider value={queues}>
+    <QueuePlaceContext.Provider value={queuePlaces}>
           <div
       className="flex h-full flex-col bg-canvas text-fg"
       onDragEnter={(e) => {
@@ -685,6 +757,7 @@ export default function App() {
             startable={queueCounts.startable}
             onStart={(id) => queueAction((q) => api.startQueue(q), id)}
             onStop={(id) => queueAction((q) => api.stopQueue(q), id)}
+            onDropIds={(ids, queueId) => handlers.moveToQueue(ids, queueId)}
             onEdit={() => setSettingsView({ open: true, section: 'scheduler' })}
             onNew={() => setSettingsView({ open: true, section: 'scheduler' })}
             onCollapse={() => showQueuePanel(false)}
@@ -718,6 +791,10 @@ export default function App() {
               queues={queues}
               queuePanelHidden={!queuePanel}
               onShowQueuePanel={() => showQueuePanel(true)}
+              canBulkNow={selectedTasks.filter((t) => t.kind !== 'torrent').filter(canStartNow).length > 1}
+              onBulkNow={() => selectedTasks.filter((t) => t.kind !== 'torrent').filter(canStartNow).forEach((t) => handlers.startNow(t.id))}
+              canBulkNext={reorderable.length > 0}
+              onBulkNext={() => handlers.reorder(reorderable, 'next')}
               onBulkMove={(queueId) => {
                 handlers.moveToQueue([...selection], queueId);
                 setSelection(new Set());
@@ -852,6 +929,7 @@ export default function App() {
       <BrowserSetupDialog open={browserSetupOpen} onClose={() => setBrowserSetupOpen(false)} integration={browserData} />
       <StatsDialog open={statsOpen} onClose={() => setStatsOpen(false)} downloads={downloads} history={history} peak={peak} speed={totalSpeed} />
       </div>
+    </QueuePlaceContext.Provider>
     </QueuesContext.Provider>
   );
 }

@@ -132,6 +132,7 @@ async fn bench(mib: usize, uneven: bool, label: &str) {
         seeding: false,
         torrent_files: vec![],
         queue_id: "main".to_string(),
+        queue_order: 0,
     };
 
     let (_tx, rx) = watch::channel(false);

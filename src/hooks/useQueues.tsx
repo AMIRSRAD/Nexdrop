@@ -36,6 +36,10 @@ export function useQueues() {
   return { queues, refresh };
 }
 
+/** Where each waiting download stands in its queue (1 = starts next). */
+export const QueuePlaceContext = createContext<Map<string, number>>(new Map());
+export const useQueuePlace = (id: string) => useContext(QueuePlaceContext).get(id);
+
 /** Lets rows know whether their queue is waiting for its schedule, without threading props through the list. */
 export const QueuesContext = createContext<QueueInfo[]>([]);
 export const useQueueInfos = () => useContext(QueuesContext);

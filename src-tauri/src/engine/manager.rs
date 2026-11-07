@@ -442,6 +442,7 @@ impl DownloadManager {
             seeding: false,
             torrent_files: vec![],
             queue_id,
+            queue_order: 0,
         };
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -576,6 +577,7 @@ impl DownloadManager {
             seeding: false,
             torrent_files: vec![],
             queue_id: self.valid_queue_id(req.queue_id.as_deref()),
+            queue_order: 0,
         };
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         Repository::save_download(&conn, &task).map_err(|e| e.to_string())?;
@@ -738,6 +740,7 @@ impl DownloadManager {
             seeding: false,
             torrent_files: files,
             queue_id,
+            queue_order: 0,
         };
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
@@ -1380,7 +1383,7 @@ impl DownloadManager {
 
         // Filter queued tasks, sorted by priority DESC, created_at ASC
         let mut queued: Vec<&DownloadTask> = all.iter().filter(|t| t.status == DownloadStatus::Queued).collect();
-        queued.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.created_at.cmp(&b.created_at)));
+        queued.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.queue_order.cmp(&b.queue_order)).then_with(|| a.created_at.cmp(&b.created_at)));
 
         let mut started = 0;
         for task in queued {
@@ -1746,6 +1749,52 @@ impl DownloadManager {
         Repository::update_status(&conn, id, DownloadStatus::Queued, None, None, now).map_err(|e| e.to_string())?;
         let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
         self.process_queue().await;
+        Ok(())
+    }
+
+    /// Moves downloads within their queue's waiting line (see `order::reorder`).
+    pub async fn reorder_downloads(self: &Arc<Self>, ids: Vec<String>, action: &str) -> Result<(), String> {
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        let mut by_queue: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for id in &ids {
+            if let Some(task) = Repository::get_download(&conn, id).map_err(|e| e.to_string())? {
+                by_queue.entry(task.queue_id).or_default().insert(id.clone());
+            }
+        }
+        for (queue_id, selected) in by_queue {
+            let line = Repository::queue_line(&conn, &queue_id).map_err(|e| e.to_string())?;
+            let moved = crate::engine::order::reorder(&line, &selected, action);
+            if moved != line {
+                Repository::set_queue_line(&conn, &moved).map_err(|e| e.to_string())?;
+            }
+        }
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({}));
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
+        // A different "next" may now fit a free slot.
+        self.process_queue().await;
+        Ok(())
+    }
+
+    /// "Download now": starts this download right away, even if its queue is closed or
+    /// full (the other downloads keep running), and puts it first in line.
+    pub async fn start_download_now(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let conn = self.get_db_conn().map_err(|e| e.to_string())?;
+        let task = Repository::get_download(&conn, id).map_err(|e| e.to_string())?.ok_or("Download not found")?;
+        if matches!(task.status, DownloadStatus::Completed | DownloadStatus::Downloading) {
+            return Ok(());
+        }
+        self.retries_used.lock().remove(id);
+        let now = chrono::Utc::now().timestamp();
+        Repository::update_status(&conn, id, DownloadStatus::Queued, None, None, now).map_err(|e| e.to_string())?;
+        self.scheduler_paused.lock().retain(|t| t != id);
+        let line = Repository::queue_line(&conn, &task.queue_id).map_err(|e| e.to_string())?;
+        let moved = crate::engine::order::reorder(&line, &std::collections::HashSet::from([id.to_string()]), "top");
+        let _ = Repository::set_queue_line(&conn, &moved);
+        if let Some(fresh) = Repository::get_download(&conn, id).map_err(|e| e.to_string())? {
+            self.start_download(fresh);
+        }
+        let _ = self.app_handle.emit("download-status-changed", serde_json::json!({ "id": id }));
+        let _ = self.app_handle.emit("queues-changed", serde_json::json!({}));
         Ok(())
     }
 

@@ -20,6 +20,9 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
   (simultaneous downloads, shared speed cap), automatic retry, and a "when finished" action
   (quit, sleep, hibernate, shut down, lock, or run a program).
 - Start now / Stop for any queue; downloads outside their schedule wait and say when they start.
+- Manage the line like IDM: **Download next**, move up / down / to the end (menu, or Alt+Up / Down / Home /
+  End), **Download now** to start one beside a full queue, and drag downloads onto a queue in the side
+  panel. Waiting downloads show "Next up" or "#3 in line"; the order survives restarts.
 - In the New download panel, pick the queue and press **Add to queue** to line a download up without
   starting it; it runs when that queue starts.
 

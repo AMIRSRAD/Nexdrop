@@ -8,7 +8,7 @@ import { cn } from '../../lib/cn';
 import { Checkbox } from '../ui/Field';
 import { IconButton } from '../ui/Button';
 import { FileTile } from './FileTile';
-import { useQueueInfos, whenText } from '../../hooks/useQueues';
+import { useQueueInfos, useQueuePlace, whenText } from '../../hooks/useQueues';
 import { ProgressTrack } from './ProgressTrack';
 import { TransferDetails } from './TransferDetails';
 import { canPause, canResume, canRetry, type TaskHandlers } from './taskMenu';
@@ -47,6 +47,13 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
       >
         <div
           data-row-id={task.id}
+          draggable={!done}
+          onDragStart={(e) => {
+            if (done) return;
+            const ids = h.dragIds(task.id);
+            e.dataTransfer.setData('application/x-nexdrop-downloads', JSON.stringify(ids));
+            e.dataTransfer.effectAllowed = 'move';
+          }}
           tabIndex={focused ? 0 : -1}
           role="row"
           aria-selected={selected}
@@ -200,6 +207,15 @@ const Subline: React.FC<{ task: DownloadTask }> = ({ task }) => {
   const host = hostOf(task.url);
   const queues = useQueueInfos();
   const queue = task.status === 'queued' && queues.length > 0 ? queues.find((q) => q.id === (task.queue_id ?? 'main')) : undefined;
+  const place = useQueuePlace(task.id);
+  if (queue && queue.open && place) {
+    return (
+      <div className="flex min-w-0 items-center gap-1.5 text-[12px]">
+        <span className={cn('shrink-0 font-medium', place === 1 ? 'text-accent' : 'text-fg-3')}>{place === 1 ? 'Next up' : `#${place} in line`}</span>
+        <span className="truncate text-fg-3">· {host}</span>
+      </div>
+    );
+  }
   if (queue && !queue.open) {
     return (
       <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-warning">

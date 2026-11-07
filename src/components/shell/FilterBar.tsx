@@ -1,5 +1,5 @@
 import React from 'react';
-import { ChevronDown, Layers, ListOrdered, PanelLeftOpen, Pause, Play, RotateCw, Search, Trash, X } from 'lucide-react';
+import { ArrowUpToLine, ChevronDown, Layers, ListOrdered, PanelLeftOpen, Pause, Play, RotateCw, Search, Trash, X, Zap } from 'lucide-react';
 import { CATEGORIES, STATUS_FILTERS, categoryMeta, type StatusFilter } from '../../lib/meta';
 import type { FileCategory, QueueInfo } from '../../types/download';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
@@ -28,6 +28,12 @@ interface FilterBarProps {
   queuePanelHidden: boolean;
   onShowQueuePanel: () => void;
   onBulkMove: (queueId: string) => void;
+  /** Put the selected waiting downloads first in their queue. */
+  onBulkNext: () => void;
+  canBulkNext: boolean;
+  /** Start the selected downloads together, right now. */
+  onBulkNow: () => void;
+  canBulkNow: boolean;
 }
 
 export const FilterBar: React.FC<FilterBarProps> = (p) => {
@@ -61,6 +67,16 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
           {p.bulkCan.retry && (
             <Button size="sm" variant="ghost" icon={RotateCw} onClick={p.onBulkRetry}>
               Retry
+            </Button>
+          )}
+          {p.canBulkNow && (
+            <Button size="sm" variant="ghost" icon={Zap} onClick={p.onBulkNow}>
+              Download now
+            </Button>
+          )}
+          {p.canBulkNext && (
+            <Button size="sm" variant="ghost" icon={ArrowUpToLine} onClick={p.onBulkNext}>
+              Download next
             </Button>
           )}
           {multiQueue && (

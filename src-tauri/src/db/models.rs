@@ -193,6 +193,9 @@ pub struct DownloadTask {
     /// The queue this download belongs to (`"main"` unless the user made more).
     #[serde(default = "default_queue_id")]
     pub queue_id: String,
+    /// Place in the queue's waiting line (smaller goes first); 0 = in the order added.
+    #[serde(default)]
+    pub queue_order: i64,
 }
 
 pub fn default_kind() -> String {

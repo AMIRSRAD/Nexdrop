@@ -133,6 +133,8 @@ pub fn run() {
             get_network_adapters_cmd,
             get_download_log_cmd,
             test_proxy_cmd,
+            reorder_downloads_cmd,
+            start_download_now_cmd,
             existing_file_cmd,
             refresh_link_cmd,
             open_author_link_cmd,

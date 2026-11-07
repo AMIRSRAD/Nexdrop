@@ -1,6 +1,6 @@
 [package]
 name = "nexdrop"
-version = "1.4.2"
+version = "1.5.0"
 description = "Nexdrop - Modern Internet Download Manager"
 authors = ["AmirSRAD"]
 homepage = "https://amirsrad.ir"

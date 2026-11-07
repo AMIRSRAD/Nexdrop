@@ -351,6 +351,7 @@ fn task(url: &str, final_url: &str, total: usize, connections: usize, resumable:
         seeding: false,
         torrent_files: vec![],
         queue_id: "main".to_string(),
+        queue_order: 0,
     }
 }
 
