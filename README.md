@@ -42,6 +42,13 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 
 ![Queues](docs/screenshots/queues.png)
 
+**Links to a page with a Download button**
+- Paste a link that turns out to be a web page (a file host where you must press a button) and
+  press **Find the download**. Nexdrop opens the page in its own view, presses the download
+  button (waiting out a countdown, skipping "Install our app" style buttons), and takes the file
+  the page starts, with the page and cookies it needs. If the page needs a person (a check, an
+  unusual button) the view opens for you to finish. It only runs when you press the button.
+
 **Streaming video (HLS and DASH)**
 - Paste a `.m3u8` or `.mpd` link, pick a quality, and Nexdrop downloads the segments in
   parallel (AES-128 supported), resumes from the last whole segment, and joins separate video

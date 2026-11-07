@@ -618,6 +618,20 @@ pub async fn test_proxy_cmd(
     Ok(crate::engine::client::test_proxy(&mode, url.as_deref(), username.as_deref().unwrap_or(""), password.as_deref().unwrap_or("")).await)
 }
 
+/// "Find the download" for a link that is a web page with a download button: opens the page in
+/// Nexdrop's own browser view, presses the button and returns the file the page starts.
+#[tauri::command]
+pub async fn resolve_page_cmd(app: tauri::AppHandle, url: String) -> Result<crate::resolver::ResolvedPage, String> {
+    crate::resolver::resolve(&app, &url).await
+}
+
+/// Stops a "Find the download" in progress.
+#[tauri::command]
+pub async fn cancel_resolve_cmd() -> Result<(), String> {
+    crate::resolver::cancel();
+    Ok(())
+}
+
 /// Moves downloads in their queue's line: "next", "top", "bottom", "up" or "down".
 #[tauri::command]
 pub async fn reorder_downloads_cmd(state: State<'_, AppState>, ids: Vec<String>, action: String) -> Result<(), String> {

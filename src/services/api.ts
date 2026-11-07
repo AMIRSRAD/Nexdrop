@@ -620,7 +620,7 @@ export const api = {
     }
     return {
       browsers: [
-        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.5.0' },
+        { id: 'edge', name: 'Microsoft Edge', family: 'chromium', installed: true, connected: true, ever_connected: true, last_seen_secs_ago: 40, version: '1.6.0' },
         { id: 'firefox', name: 'Mozilla Firefox', family: 'firefox', installed: true, connected: false, ever_connected: false },
       ],
       signed_firefox: false,
@@ -671,6 +671,19 @@ export const api = {
     }
     const set = new Set(ids);
     mockDownloads = mockDownloads.map((t) => (set.has(t.id) ? { ...t, queue_id: queueId } : t));
+  },
+
+  /** "Find the download" for a web page with a download button: opens the page, presses the button, returns the file it starts. */
+  async resolvePage(url: string): Promise<{ url: string; referer: string; user_agent: string; cookie?: string | null; needed_user: boolean }> {
+    if (isTauri()) {
+      return await invoke('resolve_page_cmd', { url });
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+    return { url: 'https://cdn.example.com/files/movie-480p.mp4?sig=abc', referer: url, user_agent: 'Mozilla/5.0', cookie: null, needed_user: false };
+  },
+
+  async cancelResolve(): Promise<void> {
+    if (isTauri()) await invoke('cancel_resolve_cmd');
   },
 
   /** Moves downloads inside their queue: 'next', 'top', 'bottom', 'up' or 'down'. */
@@ -748,7 +761,7 @@ export const api = {
     if (isTauri()) {
       return await invoke<{ name: string; version: string }>('get_app_info_cmd');
     }
-    return { name: 'Nexdrop', version: '1.5.0' };
+    return { name: 'Nexdrop', version: '1.6.0' };
   },
 
   /** Cancels a pending "sleep / shut down when finished" countdown. */

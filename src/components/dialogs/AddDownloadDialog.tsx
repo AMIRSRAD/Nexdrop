@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ChevronRight, ClipboardPaste, Download, Film, Folder, Link2, ListPlus, TriangleAlert, Terminal, Zap } from 'lucide-react';
+import { ChevronRight, ClipboardPaste, Download, Film, Folder, Globe, Link2, ListPlus, TriangleAlert, Terminal, Zap } from 'lucide-react';
 import { api } from '../../services/api';
 import type { AddDownloadRequest, AppSettings, BrowserRequest, DownloadTask, QueueInfo, StreamProbe, UrlProbeResult } from '../../types/download';
 import { formatBytes, formatDuration } from '../../utils/format';
@@ -191,6 +191,32 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
 
   const result = probe.kind === 'ok' ? probe.result : null;
 
+  // A web page instead of a file ("Download" button on it): only when asked, Nexdrop opens it,
+  // presses the button and takes the file the page starts.
+  const isPage = !!result && !stream && /html|xhtml/i.test(result.mime_type ?? '');
+  const [finding, setFinding] = useState<{ state: 'idle' | 'working' | 'error'; message?: string }>({ state: 'idle' });
+  useEffect(() => setFinding({ state: 'idle' }), [url]);
+  const findDownload = async () => {
+    setFinding({ state: 'working' });
+    try {
+      const r = await api.resolvePage(url.trim());
+      // The file's address takes the place of the page's; the page and its login travel along.
+      setReferer(r.referer);
+      setUserAgent(r.user_agent);
+      setCustomHeaders(r.cookie ? { Cookie: r.cookie } : {});
+      filenameTouched.current = false;
+      setFilename('');
+      setCurlNote(r.needed_user ? 'Found it after you finished on the page' : 'Found it on the page');
+      setUrl(r.url);
+      setFinding({ state: 'idle' });
+    } catch (err) {
+      const message = errText(err);
+      setFinding(message === 'Cancelled' ? { state: 'idle' } : { state: 'error', message });
+    }
+  };
+  // Closing the window while it searches stops the search.
+  useEffect(() => () => void api.cancelResolve().catch(() => {}), []);
+
   // The same link is already in the list?
   const duplicate = url.trim() ? existing.find((d) => d.url === url.trim() || d.final_url === url.trim()) : undefined;
 
@@ -354,6 +380,38 @@ const AddDownloadForm: React.FC<Omit<AddDownloadDialogProps, 'open'>> = ({ initi
             </div>
           </div>
         </div>
+
+        {/* A web page, not a file: offer to find its download button (never automatic) */}
+        {isPage && (
+          <div className="rounded-lg bg-surface-2 p-3 shadow-[inset_0_0_0_1px_var(--line)]">
+            <div className="flex items-center gap-3">
+              <Globe size={16} className="shrink-0 text-fg-3" />
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] font-medium text-fg">This is a web page, not a file</div>
+                <div className="text-[12px] text-fg-3">
+                  {finding.state === 'working'
+                    ? 'Looking for the download… a window opens if the page needs you to finish something.'
+                    : 'If it has a Download button, Nexdrop can open the page, press it and take the file.'}
+                </div>
+              </div>
+              {finding.state === 'working' ? (
+                <Button size="sm" variant="ghost" onClick={() => api.cancelResolve().catch(() => {})}>
+                  Cancel
+                </Button>
+              ) : (
+                <Button size="sm" variant="primary" onClick={findDownload}>
+                  Find the download
+                </Button>
+              )}
+            </div>
+            {finding.state === 'error' && (
+              <div className="mt-2 flex items-start gap-1.5 text-[12px] text-danger">
+                <TriangleAlert size={12} className="mt-px shrink-0" />
+                <span>{finding.message}</span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Quality (streaming video only) */}
         {stream && (

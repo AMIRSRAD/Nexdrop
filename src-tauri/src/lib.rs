@@ -10,6 +10,7 @@ pub mod tray;
 pub mod util;
 pub mod browsers;
 pub mod network;
+pub mod resolver;
 pub mod resting;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,6 +135,8 @@ pub fn run() {
             get_download_log_cmd,
             test_proxy_cmd,
             reorder_downloads_cmd,
+            resolve_page_cmd,
+            cancel_resolve_cmd,
             start_download_now_cmd,
             existing_file_cmd,
             refresh_link_cmd,
