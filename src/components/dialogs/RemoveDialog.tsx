@@ -22,6 +22,10 @@ export const RemoveDialog: React.FC<{
   }, [open]);
 
   const single = tasks.length === 1 ? tasks[0] : null;
+  // Only finished downloads have a file of the user's. The rest only have temporary data,
+  // which is always removed with them: nothing to ask about.
+  const finished = tasks.filter((t) => t.status === 'completed');
+  const unfinished = tasks.length - finished.length;
   const active = tasks.filter((t) => t.status === 'downloading' || t.status === 'queued').length;
 
   return (
@@ -55,7 +59,7 @@ export const RemoveDialog: React.FC<{
               onClose();
             }}
           >
-            {deleteFiles ? 'Remove and delete' : 'Remove'}
+            {deleteFiles && finished.length > 0 ? 'Remove and delete' : 'Remove'}
           </Button>
         </>
       }
@@ -66,13 +70,22 @@ export const RemoveDialog: React.FC<{
             {active === tasks.length && single ? 'This download is in progress and will be stopped.' : `${plural(active, 'download')} in progress will be stopped.`}
           </p>
         )}
-        <label className="flex cursor-default items-start gap-2.5 rounded-lg bg-surface-2 p-3 shadow-[inset_0_0_0_1px_var(--line)]">
-          <Checkbox checked={deleteFiles} onChange={setDeleteFiles} className="mt-0.5" label="Also delete files" />
-          <span onClick={() => setDeleteFiles((v) => !v)}>
-            <span className="block text-[13px] font-medium text-fg">Also delete {single ? 'the file' : 'the files'} from disk</span>
-            <span className="block text-[12px] text-fg-3">Includes any partially downloaded data. This can’t be undone.</span>
-          </span>
-        </label>
+        {finished.length > 0 && (
+          <label className="flex cursor-default items-start gap-2.5 rounded-lg bg-surface-2 p-3 shadow-[inset_0_0_0_1px_var(--line)]">
+            <Checkbox checked={deleteFiles} onChange={setDeleteFiles} className="mt-0.5" label="Also delete files" />
+            <span onClick={() => setDeleteFiles((v) => !v)}>
+              <span className="block text-[13px] font-medium text-fg">
+                Also delete {finished.length === 1 ? 'the file' : `the ${finished.length} finished files`} from disk
+              </span>
+              <span className="block text-[12px] text-fg-3">This can’t be undone.</span>
+            </span>
+          </label>
+        )}
+        {unfinished > 0 && (
+          <p className="text-[12px] text-fg-3">
+            {unfinished === 1 ? 'Its partly downloaded data' : 'Their partly downloaded data'} is removed with {unfinished === 1 ? 'it' : 'them'}.
+          </p>
+        )}
       </div>
     </Dialog>
   );

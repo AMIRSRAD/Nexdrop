@@ -176,6 +176,28 @@ def main():
         names = sorted(n for n in os.listdir(target_dir) if n.startswith('clip'))
         check('keep both: a second copy gets its own name', names == ['clip (1).mp4', 'clip.mp4'], names)
 
+        # ---- removing an unfinished download: its temporary data always goes, no question asked
+        r = ui.invoke('add_download_cmd', {'req': {'url': f'{base}/e/slow/movie.mp4', 'destination_path': dest + '_rm', 'connections': 2}})
+        rid = (r.get('ok') or {}).get('id')
+        wait(lambda: task(rid).get('downloaded_bytes', 0) > 300_000, 20)
+        ui.invoke('pause_download_cmd', {'id': rid})
+        wait(lambda: task(rid).get('status') == 'paused', 10)
+        rm_dir = task(rid).get('destination_path', '')
+        partial = lambda: [f for f in (os.listdir(rm_dir) if os.path.isdir(rm_dir) else []) if 'movie' in f]
+        had = partial()
+        ui.invoke('delete_download_cmd', {'id': rid, 'deleteFile': False})
+        time.sleep(1)
+        check('remove: a download with partial data on disk', bool(had), had)
+        check('remove: its partial data is deleted even though "delete files" was off', partial() == [], partial())
+        # a finished file is kept unless asked
+        r = ui.invoke('add_download_cmd', {'req': {'url': f'{base}/c/clip.mp4', 'destination_path': dest + '_rm', 'filename': 'keepme.mp4'}})
+        kid = (r.get('ok') or {}).get('id')
+        wait(lambda: task(kid).get('status') == 'completed', 30)
+        kept = os.path.join(task(kid).get('destination_path', ''), task(kid).get('filename', ''))
+        ui.invoke('delete_download_cmd', {'id': kid, 'deleteFile': False})
+        time.sleep(0.5)
+        check('remove: a finished file stays on disk when only removed from the list', os.path.exists(kept), kept)
+
         # ---- proxy test: a dead proxy reports an error instead of hanging
         t0 = time.time()
         pt = ui.invoke('test_proxy_cmd', {'mode': 'custom', 'url': 'socks5://127.0.0.1:9', 'username': '', 'password': ''}).get('ok') or {}
@@ -192,6 +214,7 @@ def main():
             if os.path.exists(b):
                 shutil.copy2(b, DB + ext)
         shutil.rmtree(dest, ignore_errors=True)
+        shutil.rmtree(dest + '_rm', ignore_errors=True)
         print('database restored', flush=True)
 
     failed = [n for n, passed in results if not passed]

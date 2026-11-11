@@ -1883,10 +1883,15 @@ impl DownloadManager {
 
         let conn = self.get_db_conn().map_err(|e| e.to_string())?;
         if let Ok(Some(task)) = Repository::get_download(&conn, id) {
+            // A download that isn't finished has no file of the user's yet, only temporary data:
+            // that always goes. A finished file is only deleted when asked.
+            let delete_file = delete_file || task.status != DownloadStatus::Completed;
             if task.kind == "torrent" {
                 self.remove_torrent(&task, delete_file).await;
             } else if delete_file {
-                let _ = std::fs::remove_file(Path::new(&task.destination_path).join(&task.filename));
+                if task.status == DownloadStatus::Completed {
+                    let _ = std::fs::remove_file(Path::new(&task.destination_path).join(&task.filename));
+                }
                 remove_partial_files(&task);
             }
         }
