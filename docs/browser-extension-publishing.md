@@ -19,12 +19,13 @@ Each time you release:
 
 1. Raise `version` in `extensions/nexdrop-browser-extension/manifest.json`
    (Mozilla refuses a version it has already seen).
-2. In a terminal:
+2. Put the keys where the script finds them, either in a git-ignored `.env.amo` file in the repo root
+   (`AMO_JWT_ISSUER=...` and `AMO_JWT_SECRET=...`, one per line) or as environment variables, then in a
+   terminal:
    ```
-   set AMO_JWT_ISSUER=user:12345:67
-   set AMO_JWT_SECRET=your-secret
    python scripts/sign_firefox.py
    ```
+   Keep the secret out of chat and git; if it ever leaks, generate new credentials on the same page.
    Node.js must be installed. After a few minutes the signed file appears at
    `extensions/signed/nexdrop-firefox.xpi`.
 3. Rebuild the installer (`bash scripts/release.sh`). It bundles the signed file.
@@ -45,13 +46,13 @@ Nexdrop's first-run setup opens the extensions page for you, shows the folder, a
 tells you when the connection is working. Nothing has to be signed.
 
 If you later want one-click installs for everyone, publish the `chromium` package
-(`release/extension/nexdrop-chromium-<version>.zip`) to the Chrome Web Store and
+(`release/<app version>/extension/nexdrop-chromium-<extension version>.zip`; the extension has its own version number, set in its `manifest.json`) to the Chrome Web Store and
 Edge Add-ons, as *unlisted* if you don't want a public page.
 
 ## Building the packages
 
 ```
-python scripts/package_extension.py release/extension
+python scripts/package_extension.py release/<app version>/extension
 ```
 writes clean per-browser folders and zips (the sources carry both browsers' keys
-so the folder also loads directly during development).
+so the folder also loads directly during development). `bash scripts/release.sh` does this for you.

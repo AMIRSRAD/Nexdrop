@@ -1,5 +1,11 @@
 # Nexdrop Backend Review
 
+> **A snapshot from 2026-10-18, kept as history.** Most of what it lists has since been fixed (the
+> phase tables below show the first two rounds); the current state is in `README.md`, `ROADMAP.md`
+> and `ENGINE_REPORT.md`. Details that have changed since: up to 16 connections open at once (not 8),
+> retries and mirrors work as described in `ENGINE_REPORT.md`, and saved logins are encrypted and
+> applied to requests.
+
 **Scope:** everything except the interface. That covers the Rust engine (`src-tauri/src/**`), the SQLite layer, the Tauri commands, the browser bridge server, the scheduler, the tray, the IPC contract with the frontend, and the browser extension.
 **Goals measured against:** (1) the fastest possible downloads, (2) safe downloads, (3) torrent support, (4) code that is free of bugs and performance problems.
 **Date:** 2026-10-18. Line numbers refer to the current `main`.

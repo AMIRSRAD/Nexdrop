@@ -1,5 +1,7 @@
 # Complete Guide to IDM Settings & Features and Nexdrop Implementation Plan
 
+> This is the original analysis and plan. What has been built, and what hasn't, is tracked in `ROADMAP.md`.
+
 This document provides a comprehensive analysis of **Internet Download Manager (IDM)**'s settings, tabs, architecture, and feature set, alongside the concrete implementation plan for **Nexdrop**.
 
 ---

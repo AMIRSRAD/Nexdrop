@@ -19,7 +19,9 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 - [x] Per-queue "when finished" action: nothing, quit Nexdrop, sleep, hibernate, shut down, lock, or run a program
 - [x] Cancelable countdown before sleep / hibernate / shut down
 - [x] Per-queue automatic retry of failed downloads (count and delay)
-- [x] Queue filter in the list (shown only once more than one queue exists)
+- [x] Queues always in view: a side panel lists them with what each is doing, filters the list, and starts / stops a queue in place
+- [x] Manage the line like IDM: Download next, move up / down / to the end (menu, Alt+arrows), Download now past a full queue, drag downloads onto a queue; "Next up" / "#N in line" labels; the order survives restarts
+- [x] Bulk actions: Clear completed, Retry all, Pause all, Resume all (a button on the matching tab, and a ⋯ menu), Remove failed
 - [x] Existing scheduler settings migrate into the Main queue
 - [x] Add-dialog scheduling ("download later") keeps working
 
@@ -55,10 +57,13 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 - [x] Videos and PDFs you click download instead of opening in the tab
 - [x] Download button over playing videos, finding HLS/DASH streams and video files the page loaded, with a picker when there are several
 - [x] Panel listing the videos and files on the current page (toolbar popup, with a badge count)
+- [x] Video button only over real videos (no muted loops or short clips), only when something can be downloaded, and a × to hide it for the page
+- [x] Right-click: "Download all N files on this page" (file links only) and "Download N selected links", shown only when they apply; links named from their text
+- [x] "Find the download": a link that is a web page with a Download button (file hosts); Nexdrop opens it in its own view, presses the button and takes the file (only when pressed)
 - [x] Firefox support (same package; verified in real Firefox and Edge by `scripts/e2e_extension.py`)
 - [x] First-run setup: Nexdrop finds Chrome, Edge, Brave and Firefox, opens each one's extensions page, shows what to click and waits until the browser connects
 - [x] The app shows which browsers are connected (Settings > Browser, status bar nudge until one is set up)
-- [ ] Get the Firefox extension signed by Mozilla (unlisted): create AMO API keys and run `python scripts/sign_firefox.py` (see docs/browser-extension-publishing.md); the installer then offers a one-click add-on
+- [x] The Firefox extension is signed by Mozilla (unlisted) with `python scripts/sign_firefox.py` (see docs/browser-extension-publishing.md); the installer bundles the signed add-on
 - [ ] Publish the extension to the Chrome Web Store, Edge Add-ons and Mozilla Add-ons (needed for one-click install and for Firefox to keep it after restarts)
 - [ ] POST-based downloads (forms that return a file)
 - [ ] Start Nexdrop automatically when the browser sends a download and it isn't running
@@ -67,7 +72,7 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 
 - [x] "Refresh link": paste a new link onto a failed or expired download and resume it
 - [x] Automatic retry of failed downloads (see Queues)
-- [ ] Re-fetch an expired link from the page it came from (extension)
+- [ ] Re-fetch an expired link from the page it came from (extension; "Find the download" does this by hand today)
 
 ## 6. Download dialogs and prompts
 
@@ -102,3 +107,17 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 - [ ] Speed-limit toggle in the tray
 - [ ] Per-event sounds
 - [ ] More languages (UI strings extracted first)
+
+## 11. Reliability, safety and upkeep (done)
+
+- [x] Every finished download of 16 MiB or more is checked against the server before it is kept; wrong parts are downloaded again ("Verifying…" in the list)
+- [x] Ranges are cut on 4 MiB boundaries and mid-slice requests are avoided (a CDN bug that shifted data), see ENGINE_REPORT.md
+- [x] Activity log per download and "Copy diagnostics"
+- [x] Add multiple returns at once: links are checked in the background, appear in order, failures are reported by address
+- [x] Removing an unfinished download always removes its temporary data, without asking
+- [x] Signed updates from GitHub releases, offered inside the app (Settings → About)
+- [x] Light when idle: low memory while hidden in the tray, no polling while hidden, cheap background checks
+- [x] Network adapters: use one connection or several at once (Settings → Connections)
+- [x] About page and licence
+- [ ] Windows installer code signing (SmartScreen still warns)
+- [ ] macOS and Linux builds tested on real machines (they are built and unit-tested in CI only)

@@ -1,6 +1,7 @@
 # Nexdrop
 
-A fast, safe, modern download manager for Windows, built with Tauri 2 (Rust) and React.
+A fast, safe, modern download manager for Windows (macOS and Linux builds are in preview), built with
+Tauri 2 (Rust) and React.
 Multi-connection acceleration, a real scheduler with queues, streaming-video downloads,
 torrents, and a browser extension that catches downloads and videos like IDM does.
 
@@ -75,8 +76,9 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 ![Browser setup](docs/screenshots/connect-browsers.png)
 
 **Also**: BitTorrent and magnet links with file selection, Mark of the Web on downloads,
-checksum verification, saved site logins (encrypted), proxy support, system tray with
-live status, start with Windows, and a single clean interface that stays out of the way.
+checksum verification, saved site logins (encrypted), file-exists and duplicate-link handling,
+"Refresh link" for expired downloads, a per-server connection limit, system tray with live
+status, start with Windows, and a single clean interface that stays out of the way.
 
 ## Light when idle
 
@@ -96,13 +98,17 @@ background checks read only the few rows they need instead of the whole download
 Run `Nexdrop_<version>_x64-setup.exe`. It installs for the current user, needs no admin
 rights, and Nexdrop offers to connect your browsers the first time it starts.
 
+- **Updates** are offered inside the app (Settings → About) and are signed; installing always asks first.
+- **macOS and Linux** preview builds (`.dmg`, `.AppImage`, `.deb`) are produced by the GitHub Actions
+  build on every push. They compile and pass the unit tests but haven't been run on real machines
+  yet, and some Windows-specific parts (start with Windows, browser detection) are not there.
 - **Firefox** gets a Mozilla-signed add-on (one click, permanent).
 - **Chrome / Edge / Brave** load the extension from Nexdrop's folder; the setup window opens
   the extensions page and shows the folder. Developer mode has to be switched on by you.
 
 ## Build from source
 
-Needs Node 20+, pnpm, Rust 1.85+ and the MSVC build tools (WebView2 ships with Windows).
+Needs Node 22, pnpm, Rust 1.90+ and the MSVC build tools (WebView2 ships with Windows).
 Use a Git Bash shell on Windows so the native dependencies find the MSVC environment.
 
 ```bash
@@ -111,8 +117,12 @@ pnpm tauri dev                 # run it
 bash scripts/release.sh        # build the installer into release/<version>/
 ```
 
-`release/<version>/` gets `installer/` (the setup exe), `build/` (the app) and `extension/`
-(per-browser extension packages).
+`release.sh` signs the update with a key that stays on your machine (`.env.updater.key` and
+`.env.updater`, git-ignored; create them with `pnpm tauri signer generate`, and put the public key in
+`src-tauri/tauri.conf.json`). Without them it refuses to build, because an unsigned build can't be
+offered as an update. `release/<version>/` gets `installer/` (the setup exe, its `.sig` and the
+`latest.json` the updater reads; upload all three to the GitHub release), `build/` (the app) and
+`extension/` (per-browser extension packages).
 
 ## Tests
 
@@ -121,24 +131,36 @@ cd src-tauri && cargo test --release     # unit + integration tests
 cargo test --release --test network_lab -- --ignored --nocapture --test-threads=1
 ```
 
-End-to-end scripts in `scripts/` drive the real app and real browsers:
-`e2e_release.py` (install, launch, tray, uninstall), `e2e_queues.py`, `e2e_streams.py`,
-`e2e_bridge.py`, `e2e_extension.py` (Edge and Firefox), `e2e_browser_connect.py`,
-`verify_streams.py` (decodes downloaded videos).
+End-to-end scripts in `scripts/` drive the real app (close Nexdrop first; each backs up and restores
+your database) and real browsers:
+
+- App: `e2e_release.py` (install, launch, tray, uninstall), `e2e_queues.py`, `e2e_queue_order.py`
+  (reordering, Download now), `e2e_bulk.py` (Add multiple), `e2e_features.py` (refresh link, replace,
+  removing unfinished downloads, proxy test), `e2e_resolver.py` (Find the download),
+  `e2e_many_links.py` (the browser's links window), `e2e_streams.py`, `e2e_bridge.py`,
+  `e2e_browser_connect.py`.
+- Browsers: `e2e_extension.py` (Edge and Firefox), `e2e_video_button.py`, `verify_signed_xpi.py`.
+- Tools: `verify_streams.py` (decodes downloaded videos), `bench_vs_idm.py` (timing against an
+  installed IDM on a local server), `measure_idle.ps1` (idle CPU and memory), `find_shifted.py` and
+  `repair_parts.py` (find and repair files damaged by a CDN's slice bug, see `ENGINE_REPORT.md`).
 
 ## Project map
 
 ```
 src/                  React 19 + TypeScript + Tailwind interface
-src-tauri/src/engine  download engine, queues, scheduler, streams (HLS/DASH), torrents
+src-tauri/src/engine  download engine, queues and their order, scheduler, streams (HLS/DASH), torrents
+src-tauri/src/resolver.rs   "Find the download" (pages with a Download button)
+src-tauri/src/network.rs    network adapters for multi-connection downloads
 src-tauri/src/browsers.rs   browser detection and extension connection status
+src-tauri/tests/      integration tests and the network lab (a server that misbehaves on purpose)
 extensions/           browser extension (+ signed/ for the Mozilla-signed Firefox build)
 scripts/              release, signing, packaging and end-to-end test scripts
 docs/                 publishing guide and screenshots
 ```
 
 More: `ROADMAP.md` (what's done and what's next), `ENGINE_REPORT.md` (speed and reliability
-measurements), `docs/browser-extension-publishing.md` (signing and store publishing).
+measurements and the engine's history), `docs/browser-extension-publishing.md` (signing and store
+publishing), `BACKEND_REVIEW.md` (the October 2026 code review, kept as history).
 
 ---
 

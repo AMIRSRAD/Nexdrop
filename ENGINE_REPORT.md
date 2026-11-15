@@ -85,9 +85,9 @@ the engine reaches the cap of every connection it opens.
 
 ## Not done / next candidates
 
-- `max_connections_per_server` is still a setting that nothing reads.
 - No automatic re-queue after a download fails for good, for example after
-  10 minutes offline. The user retries manually.
+  10 minutes offline. Queues can retry failed downloads a set number of times
+  (Settings → Queues); beyond that the user retries manually.
 - No duplicate-request "endgame" for the last slow range. Work stealing plus
   the stall rule cover the measured cases.
 
@@ -112,3 +112,38 @@ are downloaded as streams: `src-tauri/src/engine/stream/`.
 - **Refused with a reason:** live streams, DRM, and SAMPLE-AES.
 - **Tests:** `tests/stream_test.rs` (10 scenarios), `scripts/e2e_streams.py`
   (the real app, 15 checks), `tests/stream_real.rs` (real internet streams).
+
+## Since this report was first written
+
+**Connections per server is enforced** (`max_connections_per_server`, default 16). The count is shared by
+every download from the same host, so several downloads from one site can't open 8 each. A download
+that has more than its fair share steps aside when another one is waiting for a connection. The lab
+test `lab_connections_per_server_are_shared` checks it.
+
+**Slice-based CDNs and corrupted files.** Some CDNs (nginx slice caching) answer a range that starts
+inside one of their 4 MiB slices with the data of the *next* slice, under a header that claims the
+requested start. Whole stretches of a finished file then hold correct data in the wrong place, and
+archives report "checksum error" or "corrupt header". Real downloads were hit by this. What the engine
+does now:
+
+- Pieces and work-stealing cuts land on 4 MiB boundaries, so most requests never start mid-slice.
+- A finished file of 16 MiB or more is scanned offline for the bug's fingerprint (a copy of the next
+  slice's first 4 KiB inside the slice before it), compared against the server at samples on slice
+  boundaries and at the start of every response that began mid-slice, and any wrong response is
+  downloaded again (up to three times, then the download fails with a clear message).
+- A host caught doing this is only asked for whole slices from then on.
+- Lab tests: `lab_slice_cdn_is_never_corrupt` (a server that mangles every mid-slice range, sometimes
+  cut short, on a flaky link) and `lab_ranges_start_on_slice_boundaries`.
+- `scripts/find_shifted.py` and `scripts/repair_parts.py` find and repair files downloaded by older versions.
+
+**Several network adapters.** Each selected adapter gets its own client bound to its address, ranges
+spread over them, and a range moves to the next adapter when one stops answering. Only the source
+address is bound; with a single real internet link this can't be shown to add speeds, only that the
+connections leave from the chosen address (`a_client_bound_to_an_address_connects_from_it`).
+
+**Proxies.** Custom proxies can be HTTP or SOCKS5 with a login (`socks5h`, so names resolve through the
+proxy); a proxy address that can't be used blocks the download instead of falling back to a direct
+connection. Tested against a real SOCKS5 server that requires a login.
+
+**Idle cost.** Hidden in the tray the whole app plus WebView2 uses about 135 MB and about 0.35% of one
+core; with the window open about 380 MB. `scripts/measure_idle.ps1` measures it.
