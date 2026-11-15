@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowUpToLine, ChevronDown, Layers, ListOrdered, PanelLeftOpen, Pause, Play, RotateCw, Search, Trash, X, Zap } from 'lucide-react';
+import { ArrowUpToLine, ChevronDown, Ellipsis, Eraser, Layers, ListOrdered, PanelLeftOpen, Pause, Play, RotateCw, Search, Trash, X, Zap } from 'lucide-react';
 import { CATEGORIES, STATUS_FILTERS, categoryMeta, type StatusFilter } from '../../lib/meta';
 import type { FileCategory, QueueInfo } from '../../types/download';
 import { Menu, useDropdown, type MenuItem } from '../ui/Menu';
@@ -34,10 +34,23 @@ interface FilterBarProps {
   /** Start the selected downloads together, right now. */
   onBulkNow: () => void;
   canBulkNow: boolean;
+  /** Actions on the whole list (not the selection). Counts are what each would act on. */
+  all: {
+    running: number;
+    paused: number;
+    completed: number;
+    failed: number;
+    onPauseAll: () => void;
+    onResumeAll: () => void;
+    onClearCompleted: () => void;
+    onRetryFailed: () => void;
+    onRemoveFailed: () => void;
+  };
 }
 
 export const FilterBar: React.FC<FilterBarProps> = (p) => {
   const typeMenu = useDropdown('end');
+  const moreMenu = useDropdown('end');
   const moveMenu = useDropdown('end');
   const multiQueue = p.queues.length > 1;
 
@@ -100,6 +113,28 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
     );
   }
 
+  // Buttons where they make sense: the tab you are on offers its own bulk action;
+  // everything else is in the ⋯ menu.
+  const a = p.all;
+  const tabAction =
+    p.status === 'completed' && a.completed > 0
+      ? { label: 'Clear completed', icon: Eraser, run: a.onClearCompleted }
+      : p.status === 'failed' && a.failed > 0
+        ? { label: 'Retry all', icon: RotateCw, run: a.onRetryFailed }
+        : p.status === 'active' && a.running > 0
+          ? { label: 'Pause all', icon: Pause, run: a.onPauseAll }
+          : p.status === 'paused' && a.paused > 0
+            ? { label: 'Resume all', icon: Play, run: a.onResumeAll }
+            : null;
+  const moreItems: MenuItem[] = [
+    { label: 'Pause all', icon: Pause, onSelect: a.onPauseAll, disabled: a.running === 0, hint: a.running ? String(a.running) : undefined },
+    { label: 'Resume all', icon: Play, onSelect: a.onResumeAll, disabled: a.paused === 0, hint: a.paused ? String(a.paused) : undefined },
+    { separator: true },
+    { label: 'Clear completed…', icon: Eraser, onSelect: a.onClearCompleted, disabled: a.completed === 0, hint: a.completed ? String(a.completed) : undefined },
+    { label: 'Retry all failed', icon: RotateCw, onSelect: a.onRetryFailed, disabled: a.failed === 0, hint: a.failed ? String(a.failed) : undefined },
+    { label: 'Remove failed…', icon: Trash, onSelect: a.onRemoveFailed, disabled: a.failed === 0, hint: a.failed ? String(a.failed) : undefined },
+  ];
+
   const activeCategory = p.category === 'all' ? null : categoryMeta(p.category);
   const typeItems: MenuItem[] = [
     { label: 'All types', icon: Layers, onSelect: () => p.onCategory('all'), checked: p.category === 'all', hint: String(p.categoryCounts.all ?? 0) },
@@ -161,6 +196,11 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
       </nav>
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
+        {tabAction && (
+          <Button size="sm" variant="secondary" icon={tabAction.icon} onClick={tabAction.run}>
+            {tabAction.label}
+          </Button>
+        )}
         <button
           type="button"
           onClick={typeMenu.open}
@@ -174,6 +214,16 @@ export const FilterBar: React.FC<FilterBarProps> = (p) => {
           <ChevronDown size={13} className="opacity-70" />
         </button>
         <Menu position={typeMenu.position} onClose={typeMenu.close} items={typeItems} minWidth={190} />
+        <button
+          type="button"
+          onClick={moreMenu.open}
+          title="More actions"
+          aria-label="More actions"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-fg-2 transition-colors hover:bg-hover hover:text-fg"
+        >
+          <Ellipsis size={16} />
+        </button>
+        <Menu position={moreMenu.position} onClose={moreMenu.close} items={moreItems} minWidth={210} />
 
         <div className="relative">
           <Search size={14} className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-fg-3" />

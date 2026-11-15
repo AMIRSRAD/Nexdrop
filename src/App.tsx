@@ -416,6 +416,10 @@ export default function App() {
 
   const activeIds = downloads.filter(canPause).map((d) => d.id);
   const pausedIds = downloads.filter((d) => d.status === 'paused').map((d) => d.id);
+  // Finished (not torrents still being shared), failed or canceled: what the bulk buttons act on.
+  const clearableIds = downloads.filter((d) => d.status === 'completed' && !(d.kind === 'torrent' && d.seeding)).map((d) => d.id);
+  const failedIds = downloads.filter((d) => d.status === 'failed' || d.status === 'canceled').map((d) => d.id);
+  const failedRetryableIds = downloads.filter((d) => d.status === 'failed').map((d) => d.id);
 
   /* ── routing pasted / dropped / typed text ───────── */
   const routeText = useCallback(
@@ -791,6 +795,18 @@ export default function App() {
               queues={queues}
               queuePanelHidden={!queuePanel}
               onShowQueuePanel={() => showQueuePanel(true)}
+              all={{
+                running: activeIds.length,
+                paused: pausedIds.length,
+                completed: clearableIds.length,
+                failed: failedIds.length,
+                onPauseAll: () => actions.pause(activeIds),
+                onResumeAll: () => actions.resume(pausedIds),
+                // Finished downloads leave the list (their files stay unless the dialog says otherwise).
+                onClearCompleted: () => setRemoveIds(clearableIds),
+                onRetryFailed: () => actions.retry(failedRetryableIds),
+                onRemoveFailed: () => setRemoveIds(failedIds),
+              }}
               canBulkNow={selectedTasks.filter((t) => t.kind !== 'torrent').filter(canStartNow).length > 1}
               onBulkNow={() => selectedTasks.filter((t) => t.kind !== 'torrent').filter(canStartNow).forEach((t) => handlers.startNow(t.id))}
               canBulkNext={reorderable.length > 0}

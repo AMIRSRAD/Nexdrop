@@ -26,6 +26,11 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 - In the New download panel, pick the queue and press **Add to queue** to line a download up without
   starting it; it runs when that queue starts.
 
+**Bulk actions where you need them**
+- The tab you are on offers its own button: **Clear completed** (Completed), **Retry all** (Failed),
+  **Pause all** (Active), **Resume all** (Paused). The ⋯ menu next to the filters has all of them
+  with counts, plus **Remove failed**. Clearing asks once and keeps files unless you say otherwise.
+
 **Safe and in view**
 - Queues are always on screen in a side panel: pick one to see its downloads, start or stop it in place.
 - Every big download is checked against the server before it is kept ("Verifying…"); parts a server
