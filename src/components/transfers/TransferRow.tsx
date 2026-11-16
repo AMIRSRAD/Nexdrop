@@ -33,8 +33,8 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
       h.focus(task.id);
       if (e.ctrlKey || e.metaKey) return h.toggleSelect(task.id);
       if (e.shiftKey) return h.toggleSelect(task.id, true);
-      if (selectionMode) return h.toggleSelect(task.id);
-      h.toggleExpand(task.id);
+      // Like a file manager: a click selects the row; details open on double-click, Enter or the menu.
+      h.selectOnly(task.id);
     };
 
     return (
@@ -47,9 +47,10 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
       >
         <div
           data-row-id={task.id}
-          draggable={!done}
+          // Selected rows can be dragged onto a queue; dragging anything else draws a selection box.
+          draggable={!done && selected}
           onDragStart={(e) => {
-            if (done) return;
+            if (done || !selected) return;
             const ids = h.dragIds(task.id);
             e.dataTransfer.setData('application/x-nexdrop-downloads', JSON.stringify(ids));
             e.dataTransfer.effectAllowed = 'move';
@@ -59,14 +60,14 @@ export const TransferRow: React.FC<TransferRowProps> = React.memo(
           aria-selected={selected}
           aria-expanded={expanded}
           onClick={onRowClick}
-          onDoubleClick={() => (done ? h.open(task.id) : undefined)}
+          onDoubleClick={() => (done ? h.open(task.id) : h.toggleExpand(task.id))}
           onContextMenu={(e) => {
             e.preventDefault();
             h.focus(task.id);
             h.contextMenu(task, e.clientX, e.clientY);
           }}
           className={cn(
-            'nx-grid group relative h-[58px] outline-none',
+            'nx-grid group relative h-[58px] outline-none select-none',
             !selected && 'hover:bg-hover',
             'focus-visible:shadow-[inset_2px_0_0_var(--accent)]',
           )}

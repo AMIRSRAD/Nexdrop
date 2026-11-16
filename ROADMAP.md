@@ -21,6 +21,7 @@ Status: `[x]` done, `[ ]` to do, `[~]` partly done.
 - [x] Per-queue automatic retry of failed downloads (count and delay)
 - [x] Queues always in view: a side panel lists them with what each is doing, filters the list, and starts / stops a queue in place
 - [x] Manage the line like IDM: Download next, move up / down / to the end (menu, Alt+arrows), Download now past a full queue, drag downloads onto a queue; "Next up" / "#N in line" labels; the order survives restarts
+- [x] The list behaves like a file manager: resizable columns (remembered), click to select, drag a box to select several, details on double-click / Enter / menu
 - [x] Bulk actions: Clear completed, Retry all, Pause all, Resume all (a button on the matching tab, and a ⋯ menu), Remove failed
 - [x] Existing scheduler settings migrate into the Main queue
 - [x] Add-dialog scheduling ("download later") keeps working

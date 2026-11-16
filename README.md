@@ -27,6 +27,12 @@ torrents, and a browser extension that catches downloads and videos like IDM doe
 - In the New download panel, pick the queue and press **Add to queue** to line a download up without
   starting it; it runs when that queue starts.
 
+**A list that works like a file manager**
+- Drag the column edges to resize them (double-click an edge to reset; widths are remembered).
+- A click selects a row; drag a box over rows to select several (Ctrl adds), Shift-click selects a range,
+  and dragging selected rows onto a queue moves them. Details open on double-click, Enter or the row
+  menu, and close when you click another row or press Esc.
+
 **Bulk actions where you need them**
 - The tab you are on offers its own button: **Clear completed** (Completed), **Retry all** (Failed),
   **Pause all** (Active), **Resume all** (Paused). The ⋯ menu next to the filters has all of them

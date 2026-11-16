@@ -15,6 +15,8 @@ export interface TaskHandlers {
   requestRemove: (ids: string[]) => void;
   moveToQueue: (ids: string[], queueId: string) => void;
   toggleExpand: (id: string) => void;
+  /** A plain click: this row becomes the selection. */
+  selectOnly: (id: string) => void;
   toggleSelect: (id: string, range?: boolean) => void;
   focus: (id: string) => void;
   contextMenu: (task: DownloadTask, x: number, y: number) => void;
@@ -76,7 +78,7 @@ export function buildTaskMenu(task: DownloadTask, h: TaskHandlers, expanded: boo
     items.push({ label: 'Show in folder', icon: FolderOpen, onSelect: () => h.reveal(task.id) });
   }
   items.push(
-    { label: expanded ? 'Hide details' : 'Details', icon: Info, onSelect: () => h.toggleExpand(task.id) },
+    { label: expanded ? 'Hide details' : 'Details', icon: Info, shortcut: task.status === 'completed' ? 'Shift+Enter' : 'Double-click', onSelect: () => h.toggleExpand(task.id) },
     { separator: true },
     ...(queues.length > 1 && task.status !== 'completed'
       ? [

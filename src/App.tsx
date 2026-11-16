@@ -340,6 +340,12 @@ export default function App() {
       startSeeding: (id) => actions.startSeeding(id).catch((err) => toast.show({ tone: 'error', title: "Couldn't start sharing", description: errText(err) })),
       requestRemove: (ids) => setRemoveIds(ids),
       toggleExpand: (id) => setExpandedId((cur) => (cur === id ? null : id)),
+      selectOnly: (id) => {
+        setSelection(new Set([id]));
+        anchorRef.current = id;
+        // Details belong to the row they were opened on: clicking another row closes them.
+        setExpandedId((cur) => (cur === id ? cur : null));
+      },
       toggleSelect: (id, range) => {
         setSelection((prev) => {
           const next = new Set(prev);
@@ -837,6 +843,11 @@ export default function App() {
                 focusedId={focusedId}
                 selection={selection}
                 onSelectAll={selectAll}
+                onSelectMany={(ids) => setSelection(new Set(ids))}
+                onClearSelection={() => {
+                  setSelection(new Set());
+                  setExpandedId(null);
+                }}
                 handlers={handlers}
               />
             )}
