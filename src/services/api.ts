@@ -294,6 +294,10 @@ export const api = {
     }
     // Browser mock probe
     const filename = url.split('/').filter(Boolean).pop()?.split('?')[0] || 'file.bin';
+    // A link like https://host/file/123 is a page with a Download button, not a file.
+    if (/\/file\/\d+/.test(url)) {
+      return { url, filename, total_bytes: 0, resumable: false, mime_type: 'text/html', category: 'other', default_destination: mockSettings.default_destination };
+    }
     return {
       url,
       filename,
